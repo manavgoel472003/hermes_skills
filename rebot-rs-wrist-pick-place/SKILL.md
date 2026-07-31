@@ -1,7 +1,7 @@
 ---
 name: rebot-rs-wrist-pick-place
-description: Detect, preplan, pick, lift, drop, and home with a reBot RS arm and wrist RealSense. Use for camera-only detection checks, camera-only open-jaw calibration, or the hardware-verified fixed marker pick/place workflow. Do not use the unverified RPY bottle-pick extension.
-version: 0.1.0
+description: Detect, segment, preplan, image-size, pick, verify, drop, and home with a reBot RS arm and wrist RealSense. Use for camera-only detection checks, camera-only open-jaw calibration, or the hardware-verified dynamic marker pick/place workflow.
+version: 0.2.0
 author: Manav Goel
 metadata:
   hermes:
@@ -69,24 +69,50 @@ REBOT_WRIST_FAR_MM=250 \
 The successful result explicitly says the arm and gripper were not connected,
 read, enabled, or commanded.
 
-## Hardware-verified fixed marker pick/place
+## Hardware-verified dynamic marker pick/place
 
 Only run after live detection is stable and the operator explicitly requests the
 physical pick:
 
 ```bash
-REBOT_WS_X_MAX=0.480 \
+REBOT_DYNAMIC_GRASP=1 \
+REBOT_ENABLE_LOCATE_ANYTHING=1 \
+REBOT_VISION_BACKEND=grounded_sam2 \
+REBOT_VISION_PRIMARY=0 \
+REBOT_GROUNDING_DINO_MODEL=IDEA-Research/grounding-dino-base \
+REBOT_SAM2_MODEL=facebook/sam2.1-hiera-small \
+REBOT_VISION_DTYPE=float32 \
+REBOT_WS_X_MAX=0.490 \
 REBOT_WRIST_NEAR_MM=60 \
 REBOT_WRIST_FAR_MM=600 \
 REBOT_WRIST_PICK_CLOSER_MM=4 \
-REBOT_WRIST_PICK_TARGET_TOL_MM=10 \
+REBOT_WRIST_PICK_TARGET_Y_OFFSET_MM=8 \
+REBOT_WRIST_PICK_TARGET_TOL_MM=20 \
+REBOT_WRIST_RIGID_FIT_MAX_ERROR=0.15 \
+REBOT_DYNAMIC_SLOT_TOL_MM=6 \
+REBOT_DYNAMIC_REMEASURE_MAX_DELTA_MM=6 \
+REBOT_DYNAMIC_CLOSE_STEP_DEG=15 \
 REBOT_WRIST_PICK_OPEN_BEFORE_END_M=0.040 \
+REBOT_WRIST_JAW_LONG_AXIS_CAMERA_DEG=-90 \
+REBOT_WRIST_GRASP_MAX_YAW_DELTA_DEG=10 \
+REBOT_WRIST_GRASP_YAW_MEASUREMENT_SLOP_DEG=0.5 \
+REBOT_WRIST_GRASP_RPY_STEP_DEG=2 \
+REBOT_WRIST_GRASP_FINAL_APPROACH_MM=40 \
+REBOT_WRIST_GRASP_MIN_FEATURE_PROMINENCE_MM=25 \
 REBOT_GRIPPER_SIZE_MARGIN_MM=0 \
-REBOT_GRIPPER_SIZE_COMPRESSION_MM=1 \
+REBOT_GRIPPER_SIZE_COMPRESSION_MM=3 \
+REBOT_DYNAMIC_MICRO_LIFT_M=0.015 \
+REBOT_DYNAMIC_HOLD_TOL_MM=6 \
+REBOT_DYNAMIC_RETRY_CLOSE_DEG=5 \
+REBOT_DYNAMIC_MAX_RETRIES=3 \
 REBOT_LOCAL_IK_POS_TOL_M=0.004 \
+REBOT_ARM_SPEED_M_S=0.018 \
+REBOT_ARM_MIN_MOVE_S=0.833333 \
+REBOT_ARM_ANGULAR_SPEED_RAD_S=0.18 \
+REBOT_JOINT_VLIM=0.30 \
 /home/manav/miniconda3/envs/rebot_rs/bin/python \
   -m arm_agent.wrist_servo \
-  --fixed-pick-place "blue marker" --run --live
+  --fixed-pick-place "blue marker with white body" --run --live
 ```
 
 Expected planning evidence:
@@ -94,19 +120,23 @@ Expected planning evidence:
 - `fit_rigid_camera_geometry` passes.
 - `preplan_reachable_grasp` passes.
 - `prevalidate_complete_approach` passes before approach motion begins.
-- The gripper plan reports 1 mm planned position compression.
+- GPU semantic vision identifies and segments the complete object, while stable
+  color/depth tracking—not a changing whole-object box—drives the Jacobian.
+- `fit_rigid_camera_geometry` reports an error no greater than 0.15.
+- `dynamic_endpoint_width` confirms the between-jaws measurement.
+- `image_controlled_slow_close` reaches the bounded image-derived aperture.
 - No camera checkpoint or camera steering alters the preplanned trajectory.
-- Post-lift vision confirms that the object moved rigidly with the wrist.
+- Post-lift vision follows the semantic body grasp region rather than a cap that
+  may pivot while held.
 - The object is released over the taught drop zone and home is verified.
 
 ## New-object policy
 
-Detection success is not proof that the complete object geometry is safe.
-The current green-cap bottle trial can detect and approach the cap, but a lateral
-cap approach topples the bottle. Do not retry it using larger tolerances,
-additional depth, or stronger closing. A bottle needs a separately implemented
-and hardware-validated, tightly clamped RPY/posture planner that accounts for the
-bottle body and approaches the cap along a stable direction.
+Detection success is not proof that the complete object geometry is safe. The
+planner ranks local body cross-sections and permits at most 10 degrees of
+IK-validated wrist yaw, but it has no force/contact signal. Do not respond to a
+failed novel-object grasp by bypassing fit, jaw-slot, endpoint-width, workspace,
+or visual-hold gates.
 
 ## Failure handling
 

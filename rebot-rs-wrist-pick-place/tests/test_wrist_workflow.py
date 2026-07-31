@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -12,11 +13,105 @@ from arm_agent import wrist_sim
 
 
 class WristWorkflowTest(TestCase):
+    def test_dynamic_pick_refuses_before_preflight_without_any_jaw_span(self):
+        from arm_agent import gripper_model as gm
+
+        with (
+            patch.object(ws, "DYNAMIC_GRASP_ENABLED", True),
+            patch.dict(os.environ, {"REBOT_ENABLE_LOCATE_ANYTHING": "1"}),
+            patch.object(gm, "describe", return_value={
+                "calibrated_mm": False,
+            }),
+            patch.object(ws.A, "preflight",
+                         side_effect=AssertionError("must refuse before arm access")),
+        ):
+            result = ws.fixed_pick_and_place("object", dry=True)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("known 150deg jaw span", result["reason"])
+
+    def test_wrist_eye_continuously_streams_from_one_locked_camera(self):
+        class Camera:
+            def __init__(self):
+                self.frames = 0
+                self.closed = False
+
+            def frame(self):
+                self.frames += 1
+                return (
+                    np.zeros((10, 10, 3), dtype=np.uint8),
+                    np.ones((10, 10), dtype=np.float32) * 200.0,
+                    (100.0, 100.0, 5.0, 5.0),
+                )
+
+            def close(self):
+                self.closed = True
+
+        camera = Camera()
+        viz = SimpleNamespace(
+            _stream=object(),
+            show=lambda *_args, **_kwargs: None,
+        )
+        eye = ws.WristEye(_camera=camera)
+        with patch.object(ws, "_VIZ", viz):
+            self.assertTrue(eye.start_live_feed())
+            time.sleep(0.08)
+            # A synchronous detector read safely shares the same frame lock.
+            eye.frame()
+            eye.close()
+
+        self.assertGreater(camera.frames, 2)
+        self.assertTrue(camera.closed)
+        self.assertIsNone(eye._live_thread)
+
+    def test_dry_geometry_preview_does_not_read_arm_rpy(self):
+        det = SimpleNamespace(
+            source="depth:object", uv=(100.0, 100.0), z_mm=250.0,
+            min_width_mm=18.0, max_width_mm=40.0, area_px=500.0,
+            p_cam_mm=(0.0, 0.0, 250.0), box=(80, 80, 120, 120),
+            info={"long_axis_deg": 0.0},
+        )
+        geometry = SimpleNamespace(
+            ok=True, reason="safe", grasp_detection=det,
+            summary=lambda: {"ok": True},
+        )
+        eye = SimpleNamespace(
+            frame=lambda: (
+                np.zeros((10, 10, 3), dtype=np.uint8),
+                np.ones((10, 10), dtype=np.float32) * 250.0,
+                (100.0, 100.0, 5.0, 5.0),
+            ),
+            object=lambda *_args, **_kwargs: (det, {}),
+            close=lambda: None,
+        )
+        with (
+            patch.object(ws, "load_tcp", return_value=(0.0, 0.0, 70.0)),
+            patch.object(ws, "load_drop_zone", return_value=(0.30, 0.0, 0.10)),
+            patch.object(ws.A, "preflight",
+                         return_value=ws.A.MoveResult(True, "ik_ready")),
+            patch.object(ws.A, "ee_rpy",
+                         side_effect=AssertionError("dry mode read arm RPY")),
+            patch.object(ws.A, "check_ik",
+                         return_value=ws.A.MoveResult(True, "ik_ok")),
+            patch.object(ws, "_plan_scene_grasp_geometry",
+                         return_value=geometry) as plan_geometry,
+            patch.object(ws, "_plan_aperture",
+                         return_value={"ok": True, "reason": "fits"}),
+        ):
+            result = ws.fixed_pick_and_place(
+                "object", dry=True, eye=eye
+            )
+
+        self.assertTrue(result["ok"], result["reason"])
+        self.assertEqual(
+            plan_geometry.call_args.kwargs["current_rpy"],
+            (0.0, 0.0, 0.0),
+        )
+
     def test_aperture_closes_to_detected_width_without_extra_margin(self):
         det = SimpleNamespace(min_width_mm=18.5, max_width_mm=28.0)
 
         with (
-            patch.dict(os.environ, {"REBOT_GRIPPER_MM_PER_RAD": "19.099"}),
             patch.object(ws, "SIZE_SAFETY_MARGIN_MM", 0.0),
             patch.object(ws, "SIZE_COMPRESSION_MM", 0.0),
         ):
@@ -30,7 +125,6 @@ class WristWorkflowTest(TestCase):
         det = SimpleNamespace(min_width_mm=18.5, max_width_mm=28.0)
 
         with (
-            patch.dict(os.environ, {"REBOT_GRIPPER_MM_PER_RAD": "19.099"}),
             patch.object(ws, "SIZE_SAFETY_MARGIN_MM", 0.0),
             patch.object(ws, "SIZE_COMPRESSION_MM", 1.0),
         ):
@@ -41,11 +135,41 @@ class WristWorkflowTest(TestCase):
         self.assertEqual(plan["planned_compression_mm"], 1.0)
         self.assertIn("1.0mm planned position compression", plan["reason"])
 
+    def test_aperture_supports_two_mm_position_compression(self):
+        det = SimpleNamespace(min_width_mm=18.5, max_width_mm=28.0)
+
+        with (
+            patch.object(ws, "SIZE_SAFETY_MARGIN_MM", 0.0),
+            patch.object(ws, "SIZE_COMPRESSION_MM", 2.0),
+        ):
+            plan = ws._plan_aperture(det)
+
+        self.assertTrue(plan["ok"], plan["reason"])
+        self.assertAlmostEqual(plan["grasp_mm"], 16.5,
+                               delta=ws.SIZE_TARGET_TOL_MM)
+        self.assertEqual(plan["planned_compression_mm"], 2.0)
+        self.assertIn("2.0mm planned position compression", plan["reason"])
+
+    def test_aperture_caps_position_compression_at_three_mm(self):
+        det = SimpleNamespace(min_width_mm=18.5, max_width_mm=28.0)
+
+        with (
+            patch.object(ws, "SIZE_SAFETY_MARGIN_MM", 0.0),
+            patch.object(ws, "SIZE_COMPRESSION_MM", 20.0),
+        ):
+            plan = ws._plan_aperture(det)
+
+        self.assertTrue(plan["ok"], plan["reason"])
+        self.assertAlmostEqual(plan["grasp_mm"], 15.5,
+                               delta=ws.SIZE_TARGET_TOL_MM)
+        self.assertEqual(plan["planned_compression_mm"], 3.0)
+        self.assertIn("3.0mm planned position compression", plan["reason"])
+
     def test_rigid_camera_jacobian_removes_finite_difference_shear(self):
         measured = np.array([
-            [150.0, 1000.0, -150.0],
-            [-200.0, 50.0, 950.0],
-            [-1100.0, 50.0, 300.0],
+            [30.0, 1000.0, -20.0],
+            [-40.0, 20.0, 980.0],
+            [-1010.0, 20.0, 40.0],
         ])
 
         rigid, detail = ws._rigid_camera_jacobian(measured)
@@ -54,7 +178,42 @@ class WristWorkflowTest(TestCase):
         metric = rigid.T @ rigid
         self.assertTrue(np.allclose(metric, np.eye(3) * 1_000_000.0,
                                     atol=1e-6))
-        self.assertLess(detail["rigid_fit_relative_error"], 0.35)
+        self.assertLess(detail["rigid_fit_relative_error"], 0.15)
+
+    def test_rigid_camera_jacobian_refuses_unstable_detector_boxes(self):
+        # This matches the scale of the failed whole-object-box run: one axis
+        # measured only ~446mm/m and produced a 0.334 rigid-fit error.
+        measured = np.diag([1151.0, 931.0, 445.9])
+
+        rigid, detail = ws._rigid_camera_jacobian(measured)
+
+        self.assertIsNone(rigid)
+        self.assertIn("do not fit a rigid camera", detail["reason"])
+
+    def test_feature_endpoint_preserves_offset_from_grasp_region(self):
+        feature = SimpleNamespace(p_cam_mm=(30.0, 10.0, 200.0))
+        grasp = SimpleNamespace(p_cam_mm=(5.0, 15.0, 210.0))
+        expected, offset = ws._feature_target_for_grasp_target(
+            np.array([4.0, 32.0, 65.0]), feature, grasp
+        )
+
+        self.assertTrue(np.allclose(offset, [25.0, -5.0, -10.0]))
+        self.assertTrue(np.allclose(expected, [29.0, 27.0, 55.0]))
+
+    def test_positive_pick_target_y_offset_raises_jaws_and_is_bounded(self):
+        with patch.object(ws, "FIXED_PICK_TARGET_Y_OFFSET_MM", 8.0):
+            adjusted, applied = ws._apply_pick_target_y_offset(
+                np.array([3.9, 31.7, 69.0])
+            )
+        self.assertEqual(applied, 8.0)
+        self.assertTrue(np.allclose(adjusted, [3.9, 39.7, 69.0]))
+
+        with patch.object(ws, "FIXED_PICK_TARGET_Y_OFFSET_MM", 100.0):
+            adjusted, applied = ws._apply_pick_target_y_offset(
+                np.array([3.9, 31.7, 69.0])
+            )
+        self.assertEqual(applied, 15.0)
+        self.assertTrue(np.allclose(adjusted, [3.9, 46.7, 69.0]))
 
     def test_fixed_pick_place_sizes_grasp_releases_and_homes_in_sim(self):
         world = wrist_sim.SimWorld(
@@ -70,7 +229,6 @@ class WristWorkflowTest(TestCase):
             with patch.dict(os.environ, {
                 "REBOT_WRIST_TCP": tcp,
                 "REBOT_WRIST_DROP": "0.275,-0.187,0.059",
-                "REBOT_GRIPPER_MM_PER_RAD": "19.099",
             }):
                 ws.install_backend(
                     arm=arm,
@@ -155,6 +313,83 @@ class WristWorkflowTest(TestCase):
             delta = np.abs(np.asarray(waypoint) - previous)
             self.assertLessEqual(float(np.max(delta)), 0.009 * 0.70 + 1e-9)
             previous = np.asarray(waypoint)
+
+    def test_bounded_rpy_plan_uses_two_degree_ik_checked_steps(self):
+        checked = []
+
+        def check_ik(x, y, z, roll, pitch, yaw):
+            checked.append((x, y, z, roll, pitch, yaw))
+            return ws.A.MoveResult(True, "ik_ok", (x, y, z))
+
+        with (
+            patch.object(ws.A, "ee_pos", lambda: [0.30, 0.0, 0.25]),
+            patch.object(ws.A, "ee_rpy", lambda: [0.0, 0.0, 0.0]),
+            patch.object(ws.A, "check_ik", check_ik),
+            patch.object(ws, "GEOMETRY_MAX_YAW_DELTA_DEG", 10.0),
+            patch.object(ws, "GEOMETRY_RPY_STEP_DEG", 2.0),
+        ):
+            plan, reason = ws._plan_rpy_trajectory(
+                (0.0, 0.0, np.deg2rad(8.0))
+            )
+
+        self.assertIsNotNone(plan, reason)
+        self.assertEqual(len(plan), 4)
+        self.assertEqual(len(checked), 4)
+        self.assertAlmostEqual(np.rad2deg(plan[-1][2]), 8.0)
+
+    def test_bounded_rpy_plan_refuses_orientation_beyond_clamp(self):
+        with (
+            patch.object(ws.A, "ee_pos", lambda: [0.30, 0.0, 0.25]),
+            patch.object(ws.A, "ee_rpy", lambda: [0.0, 0.0, 0.0]),
+            patch.object(ws.A, "check_ik",
+                         side_effect=AssertionError("IK should not be called")),
+            patch.object(ws, "GEOMETRY_MAX_YAW_DELTA_DEG", 10.0),
+        ):
+            plan, reason = ws._plan_rpy_trajectory(
+                (0.0, 0.0, np.deg2rad(12.0))
+            )
+
+        self.assertIsNone(plan)
+        self.assertIn("exceeds", reason)
+
+    def test_clearance_and_axial_legs_are_validated_as_one_chain(self):
+        checked_paths = []
+
+        def check_path(waypoints, *_rpy):
+            checked_paths.append(list(waypoints))
+            return ws.A.MoveResult(True, "path_ok", waypoints[-1])
+
+        start = (0.30, 0.0, 0.25)
+        pregrasp = (0.34, 0.01, 0.21)
+        endpoint = (0.37, 0.02, 0.18)
+        rpy = (0.0, 0.0, 0.1)
+        with (
+            patch.object(ws.A, "ee_pos", lambda: list(start)),
+            patch.object(ws.A, "ee_rpy", lambda: list(rpy)),
+            patch.object(ws.A, "check_ik_path", check_path),
+            patch.object(ws.A, "X_MIN", 0.15),
+            patch.object(ws.A, "X_MAX", 0.49),
+            patch.object(ws.A, "Y_MIN", -0.24),
+            patch.object(ws.A, "Y_MAX", 0.24),
+            patch.object(ws.A, "Z_MIN", 0.01),
+            patch.object(ws.A, "Z_MAX", 0.30),
+        ):
+            first, first_reason = ws._plan_fixed_approach_trajectory(
+                pregrasp, fixed_rpy=rpy, validate_ik=False
+            )
+            second, second_reason = ws._plan_fixed_approach_trajectory(
+                endpoint, start_m=pregrasp, fixed_rpy=rpy,
+                validate_ik=False,
+            )
+            self.assertIsNotNone(first, first_reason)
+            self.assertIsNotNone(second, second_reason)
+            combined = first + second
+            ok, reason = ws._validate_fixed_waypoints(combined, rpy)
+
+        self.assertTrue(ok, reason)
+        self.assertEqual(len(checked_paths), 1)
+        self.assertEqual(checked_paths[0], combined)
+        self.assertEqual(combined[-1], endpoint)
 
     def test_fixed_trajectory_accepts_exact_decimal_workspace_margin(self):
         with (

@@ -1,7 +1,7 @@
 # reBot RS wrist-camera pick/place
 
 This is the known-good source snapshot for the fixed, preplanned RS wrist-camera
-pick/place workflow developed and hardware-tested on 2026-07-30.
+pick/place workflow developed and hardware-tested through 2026-07-31.
 
 ## Verified hardware outcome
 
@@ -9,16 +9,24 @@ pick/place workflow developed and hardware-tested on 2026-07-30.
 - A noisy measured camera Jacobian was projected onto a rigid translation model.
 - Deterministic continuation IK prevalidated the complete Cartesian route without
   random seed branches.
-- The gripper opened at a preplanned waypoint, closed to detected width minus
-  1 mm, lifted the marker, released it over the taught drop zone, and homed.
+- Grounding DINO Base identifies the requested whole object and SAM 2.1 Small
+  supplies its mask; stable color/depth tracking drives motion geometry.
+- The object is checked for jaw fit before motion and measured again between the
+  open jaws at the final endpoint.
+- The gripper closes through slow bounded position ramps to the image-derived
+  width, then performs a 15 mm visual verification lift.
+- A noisy camera Jacobian is refused above a 0.15 rigid-fit error instead of
+  being allowed to create a shallow or sideways endpoint.
 - Ctrl+C and failure recovery freeze before opening/homing.
+- If the first emergency jaw-open is interrupted, recovery retries it at home.
 - Motor disable is refused unless home is independently verified.
 
-## Known limitation
+## Safety boundary
 
-A green bottle cap is detectable, but the current translation-only approach can
-topple the bottle body. Constrained RPY/posture planning for bottle geometry is
-future work and is deliberately not included in this known-good baseline.
+There is no validated force/contact signal. Closing is image-sized and
+position-only, with immutable 15–150 degree command limits. Novel fragile or
+unstable objects still require supervised trials; detection is not proof that an
+object can be safely grasped.
 
 ## Source layout
 
@@ -39,4 +47,4 @@ From the robot workspace:
 python -m unittest discover -s tests
 ```
 
-The baseline passed 37 tests before publication.
+The snapshot passed 64 tests before publication.

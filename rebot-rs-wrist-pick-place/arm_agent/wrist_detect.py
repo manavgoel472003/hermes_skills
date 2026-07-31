@@ -1,9 +1,9 @@
 """Object detection for the wrist (eye-in-hand) RGB-D camera.
 
-Colour first, VLM second.  On this table a generous HSV band plus a depth gate is
-both faster and more reliable than a 3B grounding model, and it needs no GPU -- so
-it is the primary detector and ``LocateAnything`` is the open-vocabulary fallback
-for names that are not a colour ("the sponge", "the cable").
+Named objects use a purpose-built Grounding DINO detector when GPU vision is
+enabled; SAM 2.1 supplies their whole-object masks.  A generous HSV band plus a
+depth gate remains the fast deterministic fallback and the default when GPU
+vision is disabled.
 
 The depth gate is what makes this trustworthy on a *wrist* camera.  An eye-in-hand
 view is dominated by two things a top-down view never contains: the gripper's own
@@ -81,6 +81,131 @@ def _metric_size(w_px: float, h_px: float, z_mm: float,
     a = abs(w_px) * z_mm / max(1e-6, fx)
     b = abs(h_px) * z_mm / max(1e-6, fy)
     return (min(a, b), max(a, b))
+
+
+def rect_geometry(contour: np.ndarray) -> dict[str, Any]:
+    """Return stable image-plane geometry for a segmented grasp region.
+
+    OpenCV's rectangle angle changes convention when width and height swap.
+    ``long_axis_deg`` is normalized modulo 180 degrees, which is the symmetry a
+    parallel-jaw gripper actually cares about.
+    """
+    (cu, cv), (rw, rh), angle = cv2.minAreaRect(contour)
+    long_axis = float(angle if rw >= rh else angle + 90.0)
+    long_axis = ((long_axis + 90.0) % 180.0) - 90.0
+    area = float(cv2.contourArea(contour))
+    perimeter = float(cv2.arcLength(contour, True))
+    circularity = (
+        4.0 * np.pi * area / (perimeter * perimeter)
+        if perimeter > 1e-6 else 0.0
+    )
+    return {
+        "rect_center_uv": [round(float(cu), 2), round(float(cv), 2)],
+        "rect_size_px": [round(float(rw), 2), round(float(rh), 2)],
+        "long_axis_deg": round(long_axis, 2),
+        "circularity": round(float(circularity), 3),
+    }
+
+
+def local_cross_section_width_mm(
+    component: np.ndarray,
+    centre_uv: tuple[float, float],
+    long_axis_deg: float,
+    z_mm: float,
+    intr: Intrinsics,
+) -> float | None:
+    """Width through the actual grasp centre, perpendicular to the long axis.
+
+    A global minimum-area rectangle uses the widest transverse part anywhere on
+    an object. That is wrong for a marker with a wide cap when the jaws will
+    close around its narrower body. Measure a thin central slice instead, using
+    robust endpoints to ignore isolated RealSense/morphology pixels.
+    """
+    ys, xs = np.nonzero(component > 0)
+    if xs.size < 20:
+        return None
+    theta = np.deg2rad(float(long_axis_deg))
+    long_vec = np.array([np.cos(theta), np.sin(theta)], dtype=float)
+    short_vec = np.array([-np.sin(theta), np.cos(theta)], dtype=float)
+    points = np.column_stack((xs.astype(float), ys.astype(float)))
+    rel = points - np.asarray(centre_uv, dtype=float)
+    along = rel @ long_vec
+    across = rel @ short_vec
+    long_span = float(np.ptp(along))
+    half_slice_px = max(2.0, 0.06 * long_span)
+    local = across[np.abs(along) <= half_slice_px]
+    if local.size < 12:
+        return None
+    lo, hi = np.percentile(local, [1.0, 99.0])
+    width_px = float(hi - lo)
+    if not np.isfinite(width_px) or width_px <= 1.0:
+        return None
+    fx, fy, _, _ = intr
+    mm_per_short_px = float(z_mm) * float(np.hypot(
+        short_vec[0] / max(1e-6, fx),
+        short_vec[1] / max(1e-6, fy),
+    ))
+    width_mm = width_px * mm_per_short_px
+    return width_mm if np.isfinite(width_mm) and width_mm > 0 else None
+
+
+def cross_section_profile(
+    component: np.ndarray,
+    contour: np.ndarray,
+    z_mm: float,
+    intr: Intrinsics,
+) -> list[dict[str, Any]]:
+    """Sample grasp candidates along an object's medial long axis."""
+    geometry = rect_geometry(contour)
+    centre = np.asarray(geometry["rect_center_uv"], dtype=float)
+    theta = np.deg2rad(float(geometry["long_axis_deg"]))
+    long_vec = np.array([np.cos(theta), np.sin(theta)], dtype=float)
+    short_vec = np.array([-np.sin(theta), np.cos(theta)], dtype=float)
+    ys, xs = np.nonzero(component > 0)
+    if xs.size < 30:
+        return []
+    points = np.column_stack((xs.astype(float), ys.astype(float)))
+    rel = points - centre
+    along = rel @ long_vec
+    across = rel @ short_vec
+    lo_long, hi_long = np.percentile(along, [1.0, 99.0])
+    half_span = max(1.0, 0.5 * float(hi_long - lo_long))
+    candidates: list[dict[str, Any]] = []
+    for fraction in (-0.32, -0.16, 0.0, 0.16, 0.32):
+        station = float(fraction * half_span)
+        half_slice = max(2.0, 0.05 * (2.0 * half_span))
+        section = np.abs(along - station) <= half_slice
+        local_across = across[section]
+        if local_across.size < 12:
+            continue
+        edge_lo, edge_hi = np.percentile(local_across, [1.0, 99.0])
+        cross_mid = 0.5 * float(edge_lo + edge_hi)
+        uv = centre + long_vec * station + short_vec * cross_mid
+        width = local_cross_section_width_mm(
+            component, (float(uv[0]), float(uv[1])),
+            float(geometry["long_axis_deg"]), z_mm, intr,
+        )
+        if width is None:
+            continue
+        clearance_fraction = max(0.0, 1.0 - abs(float(fraction)))
+        candidates.append({
+            "uv": [round(float(uv[0]), 2), round(float(uv[1]), 2)],
+            "width_mm": round(float(width), 2),
+            "axis_fraction": float(fraction),
+            "end_clearance_fraction": round(clearance_fraction, 3),
+        })
+    widths = [float(item["width_mm"]) for item in candidates]
+    for index, item in enumerate(candidates):
+        neighbours = widths[max(0, index - 1):min(len(widths), index + 2)]
+        stability = max(neighbours) - min(neighbours) if neighbours else 0.0
+        item["width_variation_mm"] = round(float(stability), 2)
+        item["score"] = round(
+            2.0 * float(item["end_clearance_fraction"])
+            - 0.08 * float(stability)
+            - 0.15 * abs(float(item["axis_fraction"])),
+            3,
+        )
+    return candidates
 
 
 def deproject(u: float, v: float, z_mm: float, intr: Intrinsics) -> tuple[float, float, float]:
@@ -161,13 +286,14 @@ def detect_color(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, 
     z = float(np.median(values))
     # minAreaRect gives the object's true minor/major extents, not the axis-aligned
     # box: a diagonal object would otherwise look far wider than it is.
-    (_, _), (rw, rh), angle = cv2.minAreaRect(best)
+    (_, _), (rw, rh), _ = cv2.minAreaRect(best)
     min_mm, max_mm = _metric_size(rw, rh, z, intr)
+    geometry = rect_geometry(best)
     return Detection(box=(x, y, x + w, y + h), uv=(float(u), float(v)), z_mm=z,
                      p_cam_mm=deproject(u, v, z, intr), source=f"color:{name}",
                      area_px=float(cv2.contourArea(best)),
                      min_width_mm=min_mm, max_width_mm=max_mm,
-                     info={"depth_px": int(values.size), "angle_deg": round(float(angle), 1)})
+                     info={"depth_px": int(values.size), **geometry})
 
 
 # Words that mean "whatever is there", rather than naming a particular object.
@@ -262,16 +388,235 @@ def segment_objects(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsic
         z = float(np.median(values))
         (_, _), (rw, rh), _ = cv2.minAreaRect(contour)
         min_mm, max_mm = _metric_size(rw, rh, z, intr)
+        geometry = rect_geometry(contour)
         patch = color_bgr[y:y + h, x:x + w].reshape(-1, 3)
         out.append(Detection(
             box=(x, y, x + w, y + h), uv=(float(u), float(v)), z_mm=z,
             p_cam_mm=deproject(u, v, z, intr), source="depth:object",
             area_px=float(cv2.contourArea(contour)),
             min_width_mm=min_mm, max_width_mm=max_mm,
-            info={"mean_bgr": [int(c) for c in patch.mean(axis=0)] if patch.size else None}))
+            info={"mean_bgr": [int(c) for c in patch.mean(axis=0)]
+                  if patch.size else None, **geometry}))
     return out
 
 
+def segment_target_envelope(
+    color_bgr: np.ndarray,
+    depth_mm: np.ndarray,
+    intr: Intrinsics,
+    target: Detection,
+    *,
+    near_mm: float = NEAR_MM,
+    far_mm: float = FAR_MM,
+    nearer_slop_mm: float = 20.0,
+    farther_span_mm: float = 120.0,
+) -> Detection | None:
+    """Grow a full object envelope outward from a detected visual feature.
+
+    A table-plane segmenter can intentionally exclude tall objects. Conversely,
+    choosing any 2-D box that contains a colored cap can associate distant
+    background. This seed-based path admits only depth-connected pixels near the
+    target surface, so a cap can lead into its body but not into the far table.
+    """
+    h, w = depth_mm.shape[:2]
+    x1, y1, x2, y2 = target.box
+    bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+    pad_x = max(40, 3 * bw)
+    pad_y = max(60, 5 * bh)
+    rx1, ry1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+    rx2, ry2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
+    z0 = float(target.z_mm)
+    valid = (
+        (depth_mm >= max(float(near_mm), z0 - float(nearer_slop_mm)))
+        & (depth_mm <= min(float(far_mm), z0 + float(farther_span_mm)))
+    )
+    roi = np.zeros((h, w), np.uint8)
+    roi[ry1:ry2, rx1:rx2] = 255
+    mask = (valid.astype(np.uint8) * 255) & roi
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
+    )
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (mask > 0).astype(np.uint8), connectivity=8
+    )
+    if count <= 1:
+        return None
+    seed = np.zeros((h, w), np.uint8)
+    seed[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = 1
+    overlaps = [
+        int(np.count_nonzero((labels == label) & (seed > 0)))
+        for label in range(1, count)
+    ]
+    if not overlaps or max(overlaps) == 0:
+        return None
+    label = int(np.argmax(overlaps)) + 1
+    component = (labels == label).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(
+        component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(contour))
+    if area < max(20.0, 0.5 * float(target.area_px)):
+        return None
+    moments = cv2.moments(contour)
+    if moments["m00"] <= 0:
+        return None
+    u = float(moments["m10"] / moments["m00"])
+    v = float(moments["m01"] / moments["m00"])
+    values = depth_mm[(component > 0) & valid]
+    if values.size < 10:
+        return None
+    z = float(np.median(values))
+    x, y, rw_box, rh_box = cv2.boundingRect(contour)
+    (_, _), (rw, rh), _ = cv2.minAreaRect(contour)
+    min_mm, max_mm = _metric_size(rw, rh, z, intr)
+    geometry = rect_geometry(contour)
+    local_width_mm = local_cross_section_width_mm(
+        component, (u, v), float(geometry["long_axis_deg"]), z, intr
+    )
+    return Detection(
+        box=(x, y, x + rw_box, y + rh_box),
+        uv=(u, v), z_mm=z, p_cam_mm=deproject(u, v, z, intr),
+        source="depth:target_envelope", area_px=area,
+        min_width_mm=min_mm, max_width_mm=max_mm,
+        info={
+            "seed_source": target.source,
+            "depth_span_mm": [
+                round(float(np.min(values)), 1),
+                round(float(np.max(values)), 1),
+            ],
+            "global_min_width_mm": round(float(min_mm), 2),
+            "local_grasp_width_mm": (
+                None if local_width_mm is None
+                else round(float(local_width_mm), 2)
+            ),
+            "cross_section_candidates": cross_section_profile(
+                component, contour, z, intr
+            ),
+            **geometry,
+        },
+    )
+
+
+def segment_semantic_envelope(
+    color_bgr: np.ndarray,
+    depth_mm: np.ndarray,
+    intr: Intrinsics,
+    semantic_box: Detection,
+    identifier: Detection,
+    *,
+    near_mm: float = NEAR_MM,
+    far_mm: float = FAR_MM,
+) -> Detection | None:
+    """RGB foreground mask inside a semantic whole-object box.
+
+    This handles low objects whose depth is indistinguishable from the table.
+    The semantic model supplies only a tight box; GrabCut supplies the contour,
+    while the original color/VLM identifier is a definite foreground seed.
+    """
+    h, w = color_bgr.shape[:2]
+    x1, y1, x2, y2 = semantic_box.box
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w, int(x2)), min(h, int(y2))
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return None
+    pad_x = max(4, int(0.10 * (x2 - x1)))
+    pad_y = max(4, int(0.06 * (y2 - y1)))
+    rx1, ry1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+    rx2, ry2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
+    ix1, iy1, ix2, iy2 = identifier.box
+    # A grounded SAM backend supplies a true promptable object mask.  Retain the
+    # deterministic GrabCut path as a fallback for cached LocateAnything users.
+    from .local_vision import segment_box as segment_local_box
+    component = segment_local_box(
+        color_bgr, (x1, y1, x2, y2)
+    )
+    segmentation_source = "sam2.1"
+    if component is None:
+        segmentation_source = "grabcut"
+        mask = np.full((h, w), cv2.GC_BGD, dtype=np.uint8)
+        mask[ry1:ry2, rx1:rx2] = cv2.GC_PR_BGD
+        mask[y1:y2, x1:x2] = cv2.GC_PR_FGD
+        mask[max(0, iy1):min(h, iy2), max(0, ix1):min(w, ix2)] = cv2.GC_FGD
+        bg_model = np.zeros((1, 65), np.float64)
+        fg_model = np.zeros((1, 65), np.float64)
+        try:
+            cv2.grabCut(color_bgr, mask, None, bg_model, fg_model, 5,
+                        cv2.GC_INIT_WITH_MASK)
+        except cv2.error:
+            return None
+        component = np.where(
+            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0
+        ).astype(np.uint8)
+    # Never let foreground escape the semantic model's padded object region.
+    roi = np.zeros_like(component)
+    roi[ry1:ry2, rx1:rx2] = 255
+    component &= roi
+    component = cv2.morphologyEx(
+        component, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
+    )
+    count, labels, _, _ = cv2.connectedComponentsWithStats(
+        (component > 0).astype(np.uint8), connectivity=8
+    )
+    if count <= 1:
+        return None
+    seed = np.zeros_like(component)
+    seed[max(0, iy1):min(h, iy2), max(0, ix1):min(w, ix2)] = 1
+    overlaps = [
+        int(np.count_nonzero((labels == label) & (seed > 0)))
+        for label in range(1, count)
+    ]
+    label = int(np.argmax(overlaps)) + 1 if overlaps and max(overlaps) else int(
+        1 + np.argmax([np.count_nonzero(labels == value)
+                       for value in range(1, count)])
+    )
+    component = (labels == label).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(
+        component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(contour))
+    if area < max(30.0, 0.4 * float(identifier.area_px)):
+        return None
+    moments = cv2.moments(contour)
+    if moments["m00"] <= 0:
+        return None
+    u = float(moments["m10"] / moments["m00"])
+    v = float(moments["m01"] / moments["m00"])
+    valid = depth_gate(depth_mm, near_mm, far_mm)
+    values = depth_mm[(component > 0) & valid]
+    if values.size < 10:
+        return None
+    # The nearer half suppresses table pixels retained around a flush object.
+    cutoff = float(np.percentile(values, 60.0))
+    object_values = values[values <= cutoff]
+    z = float(np.median(object_values if object_values.size >= 10 else values))
+    x, y, bw, bh = cv2.boundingRect(contour)
+    (_, _), (rw, rh), _ = cv2.minAreaRect(contour)
+    min_mm, max_mm = _metric_size(rw, rh, z, intr)
+    geometry = rect_geometry(contour)
+    profile = cross_section_profile(component, contour, z, intr)
+    local_width = local_cross_section_width_mm(
+        component, (u, v), float(geometry["long_axis_deg"]), z, intr
+    )
+    return Detection(
+        box=(x, y, x + bw, y + bh), uv=(u, v), z_mm=z,
+        p_cam_mm=deproject(u, v, z, intr),
+        source="rgbd:semantic_envelope", area_px=area,
+        min_width_mm=min_mm, max_width_mm=max_mm,
+        info={
+            "semantic_box": list(semantic_box.box),
+            "segmentation_source": segmentation_source,
+            "identifier_source": identifier.source,
+            "local_grasp_width_mm": local_width,
+            "cross_section_candidates": profile,
+            **geometry,
+        },
+    )
 def detect_any(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, *,
                near_mm: float = NEAR_MM, far_mm: float = FAR_MM,
                max_width_mm: float | None = None) -> tuple[Detection | None, dict[str, Any]]:
@@ -323,17 +668,24 @@ def detect_vlm(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics,
     u, v = (x1 + x2) / 2.0, (y1 + y2) / 2.0
     # Only an axis-aligned box is available here, so the extents are an upper bound.
     min_mm, max_mm = _metric_size(x2 - x1, y2 - y1, z, intr)
+    backend = str(result.get("backend") or "locate_anything")
     return Detection(box=(x1, y1, x2, y2), uv=(u, v), z_mm=z,
-                     p_cam_mm=deproject(u, v, z, intr), source="locate_anything",
+                     p_cam_mm=deproject(u, v, z, intr), source=backend,
                      area_px=float((x2 - x1) * (y2 - y1)),
                      min_width_mm=min_mm, max_width_mm=max_mm,
-                     info={"confidence": result.get("confidence"), "box_axis_aligned": True})
+                     info={"confidence": result.get("confidence"),
+                           "detector_backend": backend,
+                           "box_axis_aligned": True})
 
 
 def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, description: str,
            *, near_mm: float = NEAR_MM, far_mm: float = FAR_MM,
            allow_vlm: bool = True) -> tuple[Detection | None, dict[str, Any]]:
-    """Locate ``description`` in a wrist RGB-D frame. Colour first, VLM fallback.
+    """Locate ``description`` in a wrist RGB-D frame.
+
+    With GPU vision enabled, Grounding DINO is primary for named objects so a
+    colored cap cannot silently stand in for the whole requested object.  The
+    inexpensive color/depth detector remains the deterministic fallback.
 
     Returns ``(detection | None, why)`` where ``why`` records what each detector
     did, so a failure is explainable to the planner instead of just empty.
@@ -347,6 +699,21 @@ def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, descri
                                         far_mm=far_mm, max_width_mm=gm.max_aperture_mm())
         why.update(generic_why)
         return found, why
+    vision_enabled = os.getenv(
+        "REBOT_ENABLE_LOCATE_ANYTHING", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    vision_primary = os.getenv(
+        "REBOT_VISION_PRIMARY", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if allow_vlm and vision_enabled and vision_primary:
+        found = detect_vlm(
+            color_bgr, depth_mm, intr, description,
+            near_mm=near_mm, far_mm=far_mm,
+        )
+        why["semantic_result"] = found.source if found else "not found"
+        if found is not None:
+            why["used"] = found.source
+            return found, why
     name = color_of(description)
     why["color_word"] = name
     if name is not None:
@@ -358,7 +725,8 @@ def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, descri
     if not allow_vlm:
         why["used"] = None
         return None, why
-    found = detect_vlm(color_bgr, depth_mm, intr, description, near_mm=near_mm, far_mm=far_mm)
+    found = detect_vlm(color_bgr, depth_mm, intr, description,
+                       near_mm=near_mm, far_mm=far_mm)
     why["used"] = found.source if found else None
     if found is None:
         why["vlm_result"] = "not found (or LocateAnything disabled)"

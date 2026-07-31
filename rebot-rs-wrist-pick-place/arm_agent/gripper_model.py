@@ -140,6 +140,110 @@ def save_calibration(mm_per_rad: float, detail: dict[str, Any] | None = None) ->
     return CALIB_FILE
 
 
+def _curve_points(calib: dict[str, Any] | None = None) -> list[tuple[float, float]]:
+    """Validated ``(angle_rad, aperture_mm)`` points, including closed zero."""
+    calib = load_calibration() if calib is None else calib
+    if not calib or not isinstance(calib.get("points"), list):
+        return []
+    points: list[tuple[float, float]] = []
+    for item in calib["points"]:
+        try:
+            rad = float(item["angle_rad"])
+            mm = float(item["aperture_mm"])
+        except (KeyError, TypeError, ValueError):
+            return []
+        if not (math.isfinite(rad) and math.isfinite(mm) and mm >= 0):
+            return []
+        points.append((rad, mm))
+    points.append((float(CLOSE_RAD), 0.0))
+    points = sorted(set(points), key=lambda pair: pair[0])
+    if len(points) < 2:
+        return []
+    direction = 1.0 if OPEN_RAD >= CLOSE_RAD else -1.0
+    ordered = sorted(points, key=lambda pair: direction * (pair[0] - CLOSE_RAD))
+    if any(ordered[i + 1][1] <= ordered[i][1]
+           for i in range(len(ordered) - 1)):
+        return []
+    return ordered
+
+
+def _interp(x: float, points: list[tuple[float, float]], *, inverse: bool = False
+            ) -> float:
+    pairs = [(b, a) for a, b in points] if inverse else list(points)
+    pairs.sort(key=lambda pair: pair[0])
+    if x <= pairs[0][0]:
+        lo, hi = pairs[0], pairs[1]
+    elif x >= pairs[-1][0]:
+        lo, hi = pairs[-2], pairs[-1]
+    else:
+        lo, hi = pairs[0], pairs[-1]
+        for left, right in zip(pairs, pairs[1:]):
+            if left[0] <= x <= right[0]:
+                lo, hi = left, right
+                break
+    span = hi[0] - lo[0]
+    if abs(span) <= 1e-9:
+        return float(lo[1])
+    return float(lo[1] + (x - lo[0]) * (hi[1] - lo[1]) / span)
+
+
+def add_calibration_point(angle_deg: float, aperture_mm_value: float) -> dict[str, Any]:
+    """Add a ruler-measured empty-jaw point; this never commands the gripper."""
+    angle_rad = math.radians(float(angle_deg))
+    if not HARD_MIN_RAD <= angle_rad <= HARD_MAX_RAD:
+        return {"ok": False, "reason": f"angle must be within the hard "
+                f"{HARD_MIN_DEG:.0f}-{HARD_MAX_DEG:.0f}deg command limits"}
+    if not math.isfinite(aperture_mm_value) or aperture_mm_value <= 0:
+        return {"ok": False, "reason": "aperture must be a positive millimetre value"}
+
+    old = load_calibration() or {}
+    raw_points = list(old.get("points") or [])
+    # Seed a legacy one-point calibration from its original measured span, not
+    # from arbitrary values extrapolated by the old linear model.
+    if not raw_points:
+        detail = old.get("detail") if isinstance(old.get("detail"), dict) else {}
+        try:
+            legacy_rad = float(detail["measured_rad"])
+            legacy_mm = float(detail["aperture_mm"])
+            raw_points.append({"angle_rad": legacy_rad,
+                               "aperture_mm": legacy_mm})
+        except (KeyError, TypeError, ValueError):
+            pass
+    raw_points = [
+        item for item in raw_points
+        if abs(float(item.get("angle_rad", 1e9)) - angle_rad) > math.radians(0.1)
+    ]
+    raw_points.append({"angle_rad": angle_rad,
+                       "aperture_mm": float(aperture_mm_value)})
+    raw_points.sort(key=lambda item: float(item["angle_rad"]))
+    trial = {"points": raw_points}
+    points = _curve_points(trial)
+    if not points:
+        return {"ok": False, "reason": "point would make the angle-to-aperture "
+                "curve non-monotonic; check the ruler measurement"}
+    CALIB_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model": "piecewise_linear",
+        "points": [
+            {"angle_rad": float(item["angle_rad"]),
+             "angle_deg": round(deg(float(item["angle_rad"])), 2),
+             "aperture_mm": float(item["aperture_mm"])}
+            for item in raw_points
+        ],
+        "close_rad": CLOSE_RAD, "close_deg": round(deg(CLOSE_RAD), 2),
+        "open_rad": OPEN_RAD, "open_deg": round(deg(OPEN_RAD), 2),
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "detail": {"method": "manual_empty_jaw_curve",
+                   "gripper_commanded": False},
+    }
+    CALIB_FILE.write_text(json.dumps(payload, indent=2))
+    return {"ok": True, "model": "piecewise_linear",
+            "point_added": {"angle_deg": round(float(angle_deg), 2),
+                            "aperture_mm": round(float(aperture_mm_value), 2)},
+            "points": payload["points"], "saved": str(CALIB_FILE),
+            "note": "calibration was saved only; no gripper command was sent"}
+
+
 def mm_per_rad() -> float | None:
     calib = load_calibration()
     if not calib:
@@ -153,6 +257,9 @@ def mm_per_rad() -> float | None:
 
 def aperture_mm(rad: float) -> float | None:
     """Jaw opening (mm) at an angle, measured from the close limit."""
+    curve = _curve_points()
+    if curve:
+        return max(0.0, _interp(float(rad), curve))
     scale = mm_per_rad()
     if scale is None:
         return None
@@ -162,10 +269,14 @@ def aperture_mm(rad: float) -> float | None:
 def rad_for_aperture(width_mm: float,
                      limit_rads: tuple[float, float] | None = None) -> float | None:
     """Angle that opens the jaws to ``width_mm``, clamped to the limits."""
+    close_rad, open_rad = limit_rads or (CLOSE_RAD, OPEN_RAD)
+    curve = _curve_points()
+    if curve:
+        return clamp_rad(_interp(float(width_mm), curve, inverse=True),
+                         (close_rad, open_rad))
     scale = mm_per_rad()
     if scale is None:
         return None
-    close_rad, open_rad = limit_rads or (CLOSE_RAD, OPEN_RAD)
     direction = 1.0 if open_rad >= close_rad else -1.0
     return clamp_rad(close_rad + direction * float(width_mm) / scale,
                      (close_rad, open_rad))
@@ -179,9 +290,8 @@ def max_aperture_mm(limit_rads: tuple[float, float] | None = None) -> float | No
     earlier, so compute aperture at the clamped open target instead.
     """
     close_rad, open_rad = limit_rads or (CLOSE_RAD, OPEN_RAD)
-    scale = mm_per_rad()
     commanded_open = clamp_rad(open_rad, (close_rad, open_rad))
-    return None if scale is None else abs(scale * (commanded_open - close_rad))
+    return aperture_mm(commanded_open)
 
 
 def fit_from_grasp(object_width_mm: float, contact_rad: float) -> dict[str, Any]:
@@ -250,4 +360,11 @@ def describe() -> dict[str, Any]:
     if scale is not None:
         out["mm_per_rad"] = round(scale, 3)
         out["max_aperture_mm"] = round(max_aperture_mm() or 0.0, 1)
+    curve = _curve_points()
+    if curve:
+        out["aperture_model"] = "piecewise_linear"
+        out["aperture_points"] = [
+            {"angle_deg": round(deg(rad), 2), "aperture_mm": round(mm, 2)}
+            for rad, mm in curve
+        ]
     return out

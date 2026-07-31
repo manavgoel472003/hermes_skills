@@ -63,6 +63,7 @@ import math
 import os
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,6 +77,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from arm_agent import arm_safe as A  # the shared, IK-verified, arm-agnostic motion gate
+from arm_agent import grasp_geometry as GG
 from arm_agent import wrist_detect as WD
 from arm_agent.depth_camera import open_depth_camera
 
@@ -134,6 +136,9 @@ FIXED_PICK_FINAL_GAP_MM = float(
 FIXED_PICK_CLOSER_MM = float(
     os.getenv("REBOT_WRIST_PICK_CLOSER_MM", "0.0")
 )
+FIXED_PICK_TARGET_Y_OFFSET_MM = float(
+    os.getenv("REBOT_WRIST_PICK_TARGET_Y_OFFSET_MM", "0.0")
+)
 FIXED_PICK_TARGET_TOL_MM = float(
     os.getenv("REBOT_WRIST_PICK_TARGET_TOL_MM", "15.0")
 )
@@ -144,6 +149,33 @@ FIXED_PICK_MAX_CORRECTION_M = float(
     os.getenv("REBOT_WRIST_PICK_MAX_CORRECTION_M", "0.050")
 )
 FIXED_PICK_LIFT_M = float(os.getenv("REBOT_WRIST_PICK_LIFT_M", "0.050"))
+DYNAMIC_GRASP_ENABLED = os.getenv("REBOT_DYNAMIC_GRASP", "0").strip().lower() \
+    in {"1", "true", "yes", "on"}
+DYNAMIC_REMEASURE_MAX_DELTA_MM = float(
+    os.getenv("REBOT_DYNAMIC_REMEASURE_MAX_DELTA_MM", "6.0")
+)
+DYNAMIC_MICRO_LIFT_M = float(os.getenv("REBOT_DYNAMIC_MICRO_LIFT_M", "0.015"))
+DYNAMIC_HOLD_TOL_MM = float(os.getenv("REBOT_DYNAMIC_HOLD_TOL_MM", "6.0"))
+DYNAMIC_SLOT_TOL_MM = float(os.getenv("REBOT_DYNAMIC_SLOT_TOL_MM", "6.0"))
+DYNAMIC_RETRY_CLOSE_MM = float(os.getenv("REBOT_DYNAMIC_RETRY_CLOSE_MM", "1.0"))
+DYNAMIC_RETRY_CLOSE_DEG = float(os.getenv("REBOT_DYNAMIC_RETRY_CLOSE_DEG", "5.0"))
+DYNAMIC_MAX_RETRIES = int(os.getenv("REBOT_DYNAMIC_MAX_RETRIES", "3"))
+DYNAMIC_CLOSE_STEP_DEG = float(os.getenv("REBOT_DYNAMIC_CLOSE_STEP_DEG", "15.0"))
+GEOMETRY_MAX_YAW_DELTA_DEG = float(
+    os.getenv("REBOT_WRIST_GRASP_MAX_YAW_DELTA_DEG", "10.0")
+)
+GEOMETRY_YAW_MEASUREMENT_SLOP_DEG = float(
+    os.getenv("REBOT_WRIST_GRASP_YAW_MEASUREMENT_SLOP_DEG", "0.5")
+)
+GEOMETRY_FINAL_APPROACH_MM = float(
+    os.getenv("REBOT_WRIST_GRASP_FINAL_APPROACH_MM", "40.0")
+)
+GEOMETRY_RPY_STEP_DEG = float(
+    os.getenv("REBOT_WRIST_GRASP_RPY_STEP_DEG", "2.0")
+)
+GEOMETRY_MIN_FEATURE_PROMINENCE_MM = float(
+    os.getenv("REBOT_WRIST_GRASP_MIN_FEATURE_PROMINENCE_MM", "25.0")
+)
 FIXED_HELD_RIGID_TOL_MM = float(
     os.getenv("REBOT_WRIST_HELD_RIGID_TOL_MM", "15.0")
 )
@@ -220,7 +252,7 @@ def _depth_inset(depth: np.ndarray, w: int = 200) -> np.ndarray:
 
 
 def annotate(color, depth=None, intr=None, *, det=None, tcp_cam=None, target_cam=None,
-             err_mm=None, note=None, title=None):
+             err_mm=None, note=None, title=None, candidates=None):
     """Draw what the wrist servo sees: object, the fixed TCP, and the hover target."""
     vis = color.copy()
     if det is not None:
@@ -230,6 +262,16 @@ def annotate(color, depth=None, intr=None, *, det=None, tcp_cam=None, target_cam
         cv2.circle(vis, p, 6, (80, 220, 80), -1)
         cv2.putText(vis, f"{det.source} {det.z_mm:.0f}mm", (b[0], max(14, b[1] - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 220, 80), 2)
+    if candidates:
+        for index, candidate in enumerate(candidates, 1):
+            try:
+                u, v = (int(round(float(value))) for value in candidate["uv"])
+                width = float(candidate["width_mm"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            cv2.circle(vis, (u, v), 7, (255, 180, 0), 2)
+            cv2.putText(vis, f"{index}:{width:.0f}mm", (u + 8, v - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 180, 0), 1)
     tgt_uv = WD.project(target_cam, intr) if (target_cam is not None and intr is not None) else None
     if tgt_uv is not None:
         t = (int(tgt_uv[0]), int(tgt_uv[1]))
@@ -348,6 +390,16 @@ def load_grasp_target() -> tuple[float, float, float] | None:
         return tuple(float(v) for v in data["object_camera_xyz_mm"])  # type: ignore[return-value]
     except Exception:  # noqa: BLE001
         return None
+
+
+def load_grasp_target_detail() -> dict[str, Any]:
+    """Non-positional camera/gripper geometry saved with the jaw-slot target."""
+    try:
+        data = json.loads(GRASP_TARGET_FILE.read_text())
+        detail = data.get("detail")
+        return detail if isinstance(detail, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def save_grasp_target(p_mm: tuple[float, float, float],
@@ -733,7 +785,9 @@ def calibrate_grasp_target(object_name: str, *,
             p,
             {"method": "manual_open_jaw_slot", "object": object_name,
              "arm_commanded": False, "gripper_commanded": False,
-             "uv": list(det.uv), "detector": det.source},
+             "uv": list(det.uv), "detector": det.source,
+             "jaw_long_axis_camera_deg":
+                 det.info.get("long_axis_deg")},
         )
         log(f"  grasp target in camera frame: "
             f"({p[0]:.1f}, {p[1]:.1f}, {p[2]:.1f}) mm")
@@ -797,16 +851,58 @@ class WristEye:
     camera_kind: str = CAMERA_KIND
     allow_vlm: bool = True
     _camera: Any = field(default=None, repr=False)
+    _frame_lock: Any = field(default_factory=threading.Lock, repr=False)
+    _live_stop: Any = field(default_factory=threading.Event, repr=False)
+    _live_thread: Any = field(default=None, repr=False)
 
     def frame(self):
-        if self._camera is None:
-            self._camera = _CAMERA_FACTORY(self.camera_kind)
-        return self._camera.frame()
+        # RealSense wait_for_frames must have exactly one caller at a time. The
+        # continuous browser feed and detector share this lock and this stream.
+        with self._frame_lock:
+            if self._camera is None:
+                self._camera = _CAMERA_FACTORY(self.camera_kind)
+            return self._camera.frame()
+
+    def start_live_feed(self) -> bool:
+        """Continuously pump this camera into MJPEG without steering motion."""
+        if _VIZ is None or getattr(_VIZ, "_stream", None) is None:
+            return False
+        if self._live_thread is not None and self._live_thread.is_alive():
+            return True
+        self._live_stop.clear()
+
+        def pump() -> None:
+            while not self._live_stop.is_set():
+                try:
+                    color, depth, intr = self.frame()
+                    _VIZ.show(
+                        color, depth, intr, tag="live", save=False,
+                        note="continuous view; motion remains preplanned",
+                    )
+                except Exception:  # noqa: BLE001 - video must never abort motion
+                    self._live_stop.wait(0.05)
+                # Yield the frame lock promptly when a safety observation needs it.
+                self._live_stop.wait(0.01)
+
+        self._live_thread = threading.Thread(
+            target=pump, name="wrist-live-feed", daemon=True
+        )
+        self._live_thread.start()
+        return True
+
+    def stop_live_feed(self) -> None:
+        self._live_stop.set()
+        thread = self._live_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._live_thread = None
 
     def close(self) -> None:
-        if self._camera is not None:
-            self._camera.close()
-            self._camera = None
+        self.stop_live_feed()
+        with self._frame_lock:
+            if self._camera is not None:
+                self._camera.close()
+                self._camera = None
 
     def object(self, description: str, color=None, depth=None, intr=None,
                *, near_mm: float | None = None, far_mm: float | None = None):
@@ -996,7 +1092,10 @@ def _plan_aperture(det: Any) -> dict[str, Any]:
     if narrow < MIN_SIZED_GRASP_MM:
         return {**base, "reason": f"object is only {narrow:.1f}mm across; below the "
                                   f"conservative {MIN_SIZED_GRASP_MM:.1f}mm minimum"}
-    compression_mm = float(np.clip(SIZE_COMPRESSION_MM, 0.0, 2.0))
+    # Position-only closing has no force/contact inference. Keep the requested
+    # undersize correction tightly bounded even when an environment value is
+    # mistyped; three millimetres is the current tested maximum.
+    compression_mm = float(np.clip(SIZE_COMPRESSION_MM, 0.0, 3.0))
     grasp_request_mm = narrow + SIZE_SAFETY_MARGIN_MM - compression_mm
     if grasp_request_mm <= 0:
         return {**base, "reason": f"computed grasp target "
@@ -1124,6 +1223,26 @@ def _home_after_interrupt(*, open_gripper: bool = True) -> dict[str, Any]:
         homed = _home()
     except BaseException as exc:
         homed = {"ok": False, "reason": f"interrupt_home_error {exc}"}
+    # A second Ctrl+C can interrupt the first jaw-open ramp while the arm still
+    # needs to finish its controlled recovery.  If home succeeded, retry the
+    # requested opening at the safe home pose instead of returning with partly
+    # closed jaws.  Each attempt is independently guarded so repeated terminal
+    # interrupts cannot skip the remainder of recovery.
+    if open_gripper and not opened.get("ok") and isinstance(homed, dict) \
+            and homed.get("ok"):
+        first_reason = str(opened.get("reason", "initial open failed"))
+        for retry_index in range(1, 3):
+            try:
+                opened = _gripper("open")
+            except BaseException as exc:
+                opened = {
+                    "ok": False,
+                    "reason": f"interrupt_gripper_open_retry_{retry_index}_error {exc}",
+                }
+            if opened.get("ok"):
+                opened["recovery_retry"] = retry_index
+                opened["initial_failure"] = first_reason
+                break
     if not isinstance(opened, dict):
         opened = {"ok": False, "reason": "interrupt gripper open returned no result"}
     if not isinstance(homed, dict):
@@ -1530,10 +1649,16 @@ def _rigid_camera_jacobian(measured: np.ndarray):
             f"{[round(float(v), 1) for v in singular_mm_per_m]}mm/m"
         ),
     }
-    if relative_fit_error > 0.35:
+    max_fit_error = float(np.clip(
+        float(os.getenv("REBOT_WRIST_RIGID_FIT_MAX_ERROR", "0.15")),
+        0.05, 0.20,
+    ))
+    detail["max_rigid_fit_relative_error"] = max_fit_error
+    if relative_fit_error > max_fit_error:
         detail["reason"] = (
             f"translation measurements do not fit a rigid camera "
-            f"(relative error={relative_fit_error:.3f})"
+            f"(relative error={relative_fit_error:.3f}, maximum "
+            f"{max_fit_error:.3f})"
         )
         return None, detail
     return rigid, detail
@@ -1543,9 +1668,12 @@ def _plan_fixed_approach_trajectory(
     endpoint_m: Any,
     *,
     cap_fraction: float | None = None,
+    start_m: Any | None = None,
+    fixed_rpy: tuple[float, float, float] | None = None,
+    validate_ik: bool = True,
 ):
     """Pre-validate a straight Cartesian waypoint trajectory without moving."""
-    start = np.asarray(A.ee_pos(), dtype=float)
+    start = np.asarray(A.ee_pos() if start_m is None else start_m, dtype=float)
     endpoint = np.asarray(endpoint_m, dtype=float)
     delta = endpoint - start
     fraction = float(np.clip(
@@ -1555,7 +1683,10 @@ def _plan_fixed_approach_trajectory(
     ))
     caps = np.array([A.MAX_XY_STEP, A.MAX_XY_STEP, A.MAX_Z_STEP]) * fraction
     count = max(1, int(math.ceil(float(np.max(np.abs(delta) / caps)))))
-    rpy = tuple(float(v) for v in A.ee_rpy())
+    rpy = (
+        tuple(float(v) for v in A.ee_rpy())
+        if fixed_rpy is None else tuple(float(v) for v in fixed_rpy)
+    )
     margin = max(0.0, APPROACH_WORKSPACE_MARGIN_M)
     lower = np.array([A.X_MIN + margin, A.Y_MIN + margin, A.Z_MIN + margin])
     upper = np.array([A.X_MAX - margin, A.Y_MAX - margin, A.Z_MAX - margin])
@@ -1574,20 +1705,95 @@ def _plan_fixed_approach_trajectory(
                 f"{margin * 1000:.0f}mm workspace margin"
             )
         waypoints.append(tuple(float(v) for v in waypoint))
-    path_checker = getattr(A, "check_ik_path", None)
-    if callable(path_checker):
-        path_ik = path_checker(waypoints, *rpy)
-        if not path_ik.ok:
-            return None, f"complete path failed continuation IK: {path_ik.reason}"
-    else:
-        for index, waypoint in enumerate(waypoints, 1):
-            ik = A.check_ik(*waypoint, *rpy)
-            if not ik.ok:
-                return None, f"waypoint {index}/{count} failed IK: {ik.reason}"
+    if not validate_ik:
+        return waypoints, (
+            f"{len(waypoints)} bounded waypoints generated; "
+            f"endpoint={endpoint.round(4).tolist()}"
+        )
+    ik_ok, ik_reason = _validate_fixed_waypoints(waypoints, rpy)
+    if not ik_ok:
+        return None, ik_reason
     return waypoints, (
         f"{len(waypoints)} fixed waypoints pre-validated; "
         f"endpoint={endpoint.round(4).tolist()}"
     )
+
+
+def _validate_fixed_waypoints(
+    waypoints: list[tuple[float, float, float]],
+    rpy: tuple[float, float, float],
+) -> tuple[bool, str]:
+    """Validate one complete waypoint chain from the current live joint seed."""
+    path_checker = getattr(A, "check_ik_path", None)
+    if callable(path_checker):
+        path_ik = path_checker(waypoints, *rpy)
+        if not path_ik.ok:
+            return False, f"complete path failed continuation IK: {path_ik.reason}"
+    else:
+        for index, waypoint in enumerate(waypoints, 1):
+            ik = A.check_ik(*waypoint, *rpy)
+            if not ik.ok:
+                return False, (
+                    f"waypoint {index}/{len(waypoints)} failed IK: {ik.reason}"
+                )
+    return True, (
+        f"complete {len(waypoints)}-waypoint chain passed deterministic "
+        "continuation IK"
+    )
+
+
+def _plan_rpy_trajectory(
+    target_rpy: tuple[float, float, float],
+    *,
+    xyz: Any | None = None,
+) -> tuple[list[tuple[float, float, float]] | None, str]:
+    """Prevalidate a stationary, finely stepped wrist reorientation."""
+    position = np.asarray(A.ee_pos() if xyz is None else xyz, dtype=float)
+    start = np.asarray(A.ee_rpy(), dtype=float)
+    target = np.asarray(target_rpy, dtype=float)
+    delta = target - start
+    max_total = math.radians(max(0.0, GEOMETRY_MAX_YAW_DELTA_DEG))
+    if float(np.max(np.abs(delta))) > max_total + 1e-9:
+        return None, (
+            f"orientation change {math.degrees(float(np.max(np.abs(delta)))):.1f}deg "
+            f"exceeds the {GEOMETRY_MAX_YAW_DELTA_DEG:.1f}deg clamp"
+        )
+    step = math.radians(float(np.clip(GEOMETRY_RPY_STEP_DEG, 0.5, 3.0)))
+    count = max(1, int(math.ceil(float(np.max(np.abs(delta))) / step)))
+    planned: list[tuple[float, float, float]] = []
+    for index in range(1, count + 1):
+        rpy = start + delta * (index / count)
+        ik = A.check_ik(*position, *rpy)
+        if not ik.ok:
+            return None, (
+                f"orientation waypoint {index}/{count} failed IK: {ik.reason}"
+            )
+        planned.append(tuple(float(v) for v in rpy))
+    return planned, (
+        f"{len(planned)} orientation waypoints prevalidated at fixed XYZ; "
+        f"target_rpy={[round(float(v), 4) for v in target]}"
+    )
+
+
+def _execute_rpy_trajectory(
+    rpy_waypoints: list[tuple[float, float, float]],
+    log: Callable[[str], None],
+) -> tuple[bool, str]:
+    """Execute a prevalidated stationary reorientation with no visual steering."""
+    for index, (roll, pitch, yaw) in enumerate(rpy_waypoints, 1):
+        xyz = tuple(float(v) for v in A.ee_pos())
+        result = A.safe_move(
+            *xyz, cur=xyz, roll=roll, pitch=pitch, yaw=yaw
+        )
+        log(
+            f"  [orientation {index}/{len(rpy_waypoints)}] "
+            f"rpy_deg=({math.degrees(roll):.1f},"
+            f"{math.degrees(pitch):.1f},{math.degrees(yaw):.1f}) "
+            f"ok={result.ok} detail={result.reason}"
+        )
+        if not result.ok:
+            return False, result.reason
+    return True, "bounded orientation trajectory completed"
 
 
 def _execute_fixed_approach_trajectory(
@@ -1637,6 +1843,100 @@ def _execute_fixed_approach_trajectory(
     return True, f"completed {len(waypoints)} fixed waypoints"
 
 
+def _plan_scene_grasp_geometry(
+    frame: tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]],
+    det: WD.Detection,
+    *,
+    current_rpy: tuple[float, float, float],
+    allow_orientation: bool = True,
+    object_name: str | None = None,
+) -> GG.GraspGeometry:
+    """Turn a target feature plus full RGB-D scene into one safe grasp proposal."""
+    from arm_agent import gripper_model as gm
+
+    max_aperture = gm.max_aperture_mm(_wrist_limits())
+    if max_aperture is None:
+        return GG.GraspGeometry(
+            False, "jaw millimetre calibration is missing", None, None, None
+        )
+    axis_raw = os.getenv("REBOT_WRIST_JAW_LONG_AXIS_CAMERA_DEG")
+    axis: float | None = None
+    if allow_orientation:
+        if axis_raw:
+            try:
+                axis = float(axis_raw)
+            except ValueError:
+                axis = None
+        else:
+            saved = load_grasp_target_detail().get(
+                "jaw_long_axis_camera_deg"
+            )
+            try:
+                axis = None if saved is None else float(saved)
+            except (TypeError, ValueError):
+                axis = None
+    color, depth, intr = frame
+    semantic_envelope = None
+    if object_name and os.getenv("REBOT_ENABLE_LOCATE_ANYTHING", "0").strip().lower() \
+            in {"1", "true", "yes", "on"}:
+        semantic_box = WD.detect_vlm(
+            color, depth, intr, f"the complete {object_name}",
+            near_mm=WD.NEAR_MM, far_mm=WD.FAR_MM,
+        )
+        if semantic_box is not None:
+            semantic_envelope = WD.segment_semantic_envelope(
+                color, depth, intr, semantic_box, det,
+                near_mm=WD.NEAR_MM, far_mm=WD.FAR_MM,
+            )
+    return GG.plan_grasp_geometry(
+        color, depth, intr, det,
+        current_rpy=current_rpy,
+        max_aperture_mm=float(max_aperture),
+        jaw_long_axis_camera_deg=axis,
+        max_yaw_delta_deg=GEOMETRY_MAX_YAW_DELTA_DEG,
+        yaw_measurement_slop_deg=GEOMETRY_YAW_MEASUREMENT_SLOP_DEG,
+        final_approach_mm=GEOMETRY_FINAL_APPROACH_MM,
+        min_feature_prominence_mm=GEOMETRY_MIN_FEATURE_PROMINENCE_MM,
+        require_axis_for_elongated=allow_orientation,
+        semantic_envelope=semantic_envelope,
+    )
+
+
+def _feature_target_for_grasp_target(
+    requested_grasp_cam: Any,
+    feature_det: WD.Detection,
+    grasp_det: WD.Detection,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Expected visual-feature location when the chosen grasp region is aligned.
+
+    A color cap may identify an object while the depth-envelope centre is the
+    safer place to grasp it. Their camera-frame offset is rigid before contact;
+    preserve that offset so the endpoint veto compares like with like.
+    """
+    feature_to_grasp = (
+        np.asarray(feature_det.p_cam_mm, dtype=float)
+        - np.asarray(grasp_det.p_cam_mm, dtype=float)
+    )
+    expected_feature = (
+        np.asarray(requested_grasp_cam, dtype=float) + feature_to_grasp
+    )
+    return expected_feature, feature_to_grasp
+
+
+def _apply_pick_target_y_offset(target_cam: Any) -> tuple[np.ndarray, float]:
+    """Apply a bounded image-vertical trim without changing calibration.
+
+    RealSense camera +Y points down in the image. Requesting the stationary
+    object slightly farther down in the image moves the camera/jaws upward
+    relative to it. Keep this as a run-time trim so TCP and the camera-only jaw
+    slot calibration remain immutable and independently inspectable.
+    """
+    offset_mm = float(np.clip(FIXED_PICK_TARGET_Y_OFFSET_MM, -15.0, 15.0))
+    adjusted = np.asarray(target_cam, dtype=float).copy()
+    adjusted[1] += offset_mm
+    return adjusted, offset_mm
+
+
 # =====================================================================================
 # SAFE APPROACH: current-view detection -> IK alignment -> home (no descent/gripper)
 # =====================================================================================
@@ -1666,6 +1966,15 @@ def servo_approach(object_name: str, *, dry: bool = False, verbose: bool = False
 
     own_eye = eye is None
     eye = eye or WristEye()
+    start_feed = getattr(eye, "start_live_feed", None)
+    continuous_feed = bool(not dry and callable(start_feed) and start_feed())
+    if continuous_feed:
+        steps.append((
+            "continuous_live_feed", True,
+            "camera frames stream throughout motion; detections cannot steer "
+            "the preplanned trajectory",
+        ))
+        log("stage=continuous_live_feed started=true camera_steering=disabled")
     try:
         if dry:
             color, depth, intr = eye.frame()
@@ -1822,6 +2131,9 @@ def servo_approach(object_name: str, *, dry: bool = False, verbose: bool = False
                        steps, homed=bool(recovery.get("homed")),
                        gripper_commanded=False, recovery=recovery)
     finally:
+        stop_feed = getattr(eye, "stop_live_feed", None)
+        if callable(stop_feed):
+            stop_feed()
         if own_eye:
             eye.close()
 
@@ -1844,6 +2156,51 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
     steps: list[tuple[str, bool, str]] = []
     log(f"stage=fixed_pick_place_start object={object_name!r} "
         f"mode={'dry' if dry else 'live'} contact_inference=false")
+
+    if DYNAMIC_GRASP_ENABLED:
+        from arm_agent import gripper_model as _dynamic_gm
+        gripper_detail = _dynamic_gm.describe()
+        measured_points = [
+            point for point in gripper_detail.get("aperture_points", [])
+            if float(point.get("angle_deg", 0.0)) >= _dynamic_gm.HARD_MIN_DEG
+        ]
+        locate_enabled = os.getenv(
+            "REBOT_ENABLE_LOCATE_ANYTHING", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not locate_enabled:
+            return _result(
+                False,
+                "dynamic grasp requires the GPU whole-object detector; "
+                "set REBOT_ENABLE_LOCATE_ANYTHING=1",
+                [("dynamic_semantic_envelope", False,
+                  "GPU semantic detection is not enabled")],
+                homed=False, object_held=False,
+            )
+        has_curve = gripper_detail.get("aperture_model") == "piecewise_linear" \
+            and len(measured_points) >= 3
+        has_single_span = bool(
+            gripper_detail.get("calibrated_mm")
+            and float(gripper_detail.get("max_aperture_mm", 0.0)) > 1.0
+        )
+        if not (has_curve or has_single_span):
+            return _result(
+                False,
+                "dynamic grasp requires either the known 150deg jaw span or a "
+                "multi-point jaw curve; no motion was attempted",
+                [("dynamic_jaw_curve", False,
+                  "no usable jaw-aperture calibration")],
+                homed=False, object_held=False,
+            )
+        steps.append((
+            "dynamic_jaw_model", True,
+            (f"piecewise curve with {len(measured_points)} measured points"
+             if has_curve else
+             "single 150deg span accepted as an uncertain initial estimate; "
+             "visual micro-lift controls bounded 5deg retries"),
+        ))
+        dynamic_has_jaw_curve = has_curve
+    else:
+        dynamic_has_jaw_curve = False
 
     tcp = load_tcp()
     drop = load_drop_zone()
@@ -1899,6 +2256,15 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
 
     own_eye = eye is None
     eye = eye or WristEye()
+    start_feed = getattr(eye, "start_live_feed", None)
+    continuous_feed = bool(not dry and callable(start_feed) and start_feed())
+    if continuous_feed:
+        steps.append((
+            "continuous_live_feed", True,
+            "camera frames stream throughout motion; detections cannot steer "
+            "the preplanned trajectory",
+        ))
+        log("stage=continuous_live_feed started=true camera_steering=disabled")
 
     def recover(reason: str, **extra: Any) -> dict[str, Any]:
         global _OBJECT_HELD
@@ -1915,9 +2281,27 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
         if dry:
             color, depth, intr = eye.frame()
             det, why = eye.object(object_name, color, depth, intr)
-            plan = _plan_aperture(det) if det is not None else None
+            geometry = (
+                _plan_scene_grasp_geometry(
+                    (color, depth, intr), det,
+                    # Dry mode must remain camera/model-only. The live workflow
+                    # reads measured RPY after connecting; the dry preview uses
+                    # the verified home orientation and never touches hardware.
+                    current_rpy=(0.0, 0.0, 0.0),
+                    object_name=object_name,
+                )
+                if det is not None else None
+            )
+            grasp_det = (
+                geometry.grasp_detection
+                if geometry is not None and geometry.ok else None
+            )
+            plan = _plan_aperture(grasp_det) if grasp_det is not None else None
             steps.append(("detect_and_size", det is not None,
                           f"{det.source} at {det.z_mm:.0f}mm" if det else str(why)))
+            if geometry is not None:
+                steps.append(("geometry_grasp_candidates", geometry.ok,
+                              geometry.reason))
             if plan is not None:
                 steps.append(("jaw_plan", bool(plan["ok"]), str(plan["reason"])))
             release_z = min(
@@ -1927,12 +2311,14 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             drop_ik = A.check_ik(float(drop[0]), float(drop[1]), release_z,
                                  0.0, 0.0, 0.0)
             steps.append(("high_drop_ik", drop_ik.ok, drop_ik.reason))
-            ok = bool(det is not None and plan and plan["ok"] and drop_ik.ok)
+            ok = bool(det is not None and geometry and geometry.ok
+                      and plan and plan["ok"] and drop_ik.ok)
             return _result(
                 ok, "dry fixed pick/place checks passed" if ok else
                 "dry fixed pick/place checks failed",
                 steps, homed=False, object_held=False,
                 jaw_plan=plan if plan and plan["ok"] else None,
+                grasp_geometry=geometry.summary() if geometry else None,
                 high_drop_xyz_m=[float(drop[0]), float(drop[1]), release_z],
             )
 
@@ -1952,6 +2338,77 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                       f"{det.source} at {det.z_mm:.0f}mm" if det else str(why)))
         if det is None:
             return recover(f"'{object_name}' not visible from the ready pose")
+        geometry = _plan_scene_grasp_geometry(
+            frame, det,
+            current_rpy=tuple(float(v) for v in A.ee_rpy()),
+            object_name=object_name,
+        )
+        steps.append(("geometry_grasp_candidates", geometry.ok,
+                      geometry.reason))
+        log(f"stage=geometry_grasp ok={geometry.ok} detail={geometry.reason}")
+        if not geometry.ok or geometry.grasp_detection is None \
+                or geometry.rpy_rad is None:
+            return recover(
+                f"no safe geometry-derived grasp: {geometry.reason}",
+                grasp_geometry=geometry.summary(),
+            )
+        grasp_geometry_summary = geometry.summary()
+        approach_rpy = tuple(float(v) for v in geometry.rpy_rad)
+        live_rpy = np.asarray(A.ee_rpy(), dtype=float)
+        rpy_delta = float(np.max(np.abs(
+            np.asarray(approach_rpy, dtype=float) - live_rpy
+        )))
+        if rpy_delta > math.radians(0.1):
+            rpy_waypoints, rpy_reason = _plan_rpy_trajectory(approach_rpy)
+            steps.append(("prevalidate_bounded_orientation",
+                          rpy_waypoints is not None, rpy_reason))
+            if rpy_waypoints is None:
+                return recover(
+                    f"bounded wrist orientation is unsafe: {rpy_reason}",
+                    grasp_geometry=grasp_geometry_summary,
+                )
+            log(f"stage=bounded_orientation_start {rpy_reason}")
+            rpy_ok, rpy_exec_reason = _execute_rpy_trajectory(
+                rpy_waypoints, log
+            )
+            steps.append(("execute_bounded_orientation",
+                          rpy_ok, rpy_exec_reason))
+            if not rpy_ok:
+                return recover(
+                    f"bounded wrist orientation failed: {rpy_exec_reason}",
+                    grasp_geometry=grasp_geometry_summary,
+                )
+            _settle(eye, note="bounded geometry orientation")
+            det_after, frame_after, why_after = _observe(eye, object_name)
+            steps.append((
+                "redetect_after_orientation",
+                det_after is not None,
+                f"{det_after.source} at {det_after.z_mm:.0f}mm"
+                if det_after else str(why_after),
+            ))
+            if det_after is None or frame_after is None:
+                return recover(
+                    "target was lost after the bounded wrist orientation",
+                    grasp_geometry=grasp_geometry_summary,
+                )
+            geometry_after = _plan_scene_grasp_geometry(
+                frame_after, det_after, current_rpy=approach_rpy,
+                allow_orientation=False,
+                object_name=object_name,
+            )
+            steps.append(("geometry_after_orientation", geometry_after.ok,
+                          geometry_after.reason))
+            if not geometry_after.ok or \
+                    geometry_after.grasp_detection is None:
+                return recover(
+                    f"grasp geometry became unsafe after orientation: "
+                    f"{geometry_after.reason}",
+                    grasp_geometry=geometry_after.summary(),
+                )
+            det = geometry_after.grasp_detection
+            grasp_geometry_summary = geometry_after.summary()
+        else:
+            det = geometry.grasp_detection
         jaw_plan = _plan_aperture(det)
         steps.append(("depth_size_and_jaw_limits", bool(jaw_plan["ok"]),
                       str(jaw_plan["reason"])))
@@ -1981,7 +2438,8 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             # accepted near-marker pose. It is safer than extrapolating from an
             # inaccurate jaw/TCP calibration and lets the fixed trajectory
             # reproduce the already-tested relationship.
-            requested_cam = fixed_visual_target.copy()
+            requested_cam, target_y_offset_mm = \
+                _apply_pick_target_y_offset(fixed_visual_target)
             closer_mm = float(np.clip(FIXED_PICK_CLOSER_MM, 0.0, 10.0))
             requested_cam[2] -= closer_mm
             minimum_target_depth = float(WD.NEAR_MM) + 2.0
@@ -1997,8 +2455,16 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 f"{closer_mm:.1f}mm closer; target depth "
                 f"{requested_cam[2]:.1f}mm",
             ))
+            steps.append((
+                "grasp_image_vertical_offset",
+                True,
+                f"camera Y {target_y_offset_mm:+.1f}mm; target Y "
+                f"{requested_cam[1]:.1f}mm (positive raises jaws relative "
+                "to the object)",
+            ))
             log("stage=fixed_grasp_target source=calibrated_open_jaw_slot "
                 f"closer_mm={closer_mm:.1f} "
+                f"target_y_offset_mm={target_y_offset_mm:+.1f} "
                 f"target_mm={requested_cam.round(1).tolist()}")
         else:
             requested_cam = tcp_cam.copy()
@@ -2021,6 +2487,34 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             return recover(
                 f"object lost before complete trajectory planning ({plan_why})"
             )
+        assert plan_frame is not None
+        plan_geometry = _plan_scene_grasp_geometry(
+            plan_frame, plan_det, current_rpy=approach_rpy,
+            allow_orientation=False,
+            object_name=object_name,
+        )
+        steps.append(("preplan_full_object_geometry", plan_geometry.ok,
+                      plan_geometry.reason))
+        if not plan_geometry.ok or plan_geometry.grasp_detection is None:
+            return recover(
+                f"full-object geometry is unsafe before motion: "
+                f"{plan_geometry.reason}",
+                grasp_geometry=plan_geometry.summary(),
+            )
+        plan_feature_det = plan_det
+        plan_det = plan_geometry.grasp_detection
+        expected_feature_cam, feature_to_grasp_cam = \
+            _feature_target_for_grasp_target(
+                requested_cam, plan_feature_det, plan_det
+            )
+        steps.append((
+            "feature_to_grasp_geometry",
+            True,
+            f"feature offset from grasp region "
+            f"{feature_to_grasp_cam.round(1).tolist()}mm; expected endpoint "
+            f"feature={expected_feature_cam.round(1).tolist()}mm",
+        ))
+        grasp_geometry_summary = plan_geometry.summary()
         planned_cam, reachability = _reachable_approach_target(
             plan_det, J, requested_cam
         )
@@ -2033,11 +2527,12 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
         exact_reason = "requested endpoint unavailable"
         if requested_endpoint_raw is not None:
             exact_waypoints, exact_reason = _plan_fixed_approach_trajectory(
-                requested_endpoint_raw
+                requested_endpoint_raw, fixed_rpy=approach_rpy
             )
             if exact_waypoints is None:
                 fine_waypoints, fine_reason = _plan_fixed_approach_trajectory(
-                    requested_endpoint_raw, cap_fraction=0.25
+                    requested_endpoint_raw, cap_fraction=0.25,
+                    fixed_rpy=approach_rpy,
                 )
                 if fine_waypoints is not None:
                     exact_waypoints = fine_waypoints
@@ -2082,10 +2577,59 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 dtype=float,
             )
             waypoints, trajectory_reason = (
-                _plan_fixed_approach_trajectory(endpoint)
+                _plan_fixed_approach_trajectory(
+                    endpoint, fixed_rpy=approach_rpy
+                )
                 if planned_target_qualified else
                 (None, exact_reason)
             )
+        if planned_target_qualified and np.all(np.isfinite(endpoint)):
+            try:
+                camera_backoff = np.array(
+                    [0.0, 0.0, float(GEOMETRY_FINAL_APPROACH_MM)],
+                    dtype=float,
+                )
+                pregrasp = endpoint + np.linalg.inv(J) @ camera_backoff
+                pre_waypoints, pre_reason = _plan_fixed_approach_trajectory(
+                    pregrasp, fixed_rpy=approach_rpy, validate_ik=False
+                )
+                axial_waypoints, axial_reason = (
+                    _plan_fixed_approach_trajectory(
+                        endpoint, start_m=pregrasp,
+                        fixed_rpy=approach_rpy,
+                        validate_ik=False,
+                    )
+                    if pre_waypoints is not None else
+                    (None, "pregrasp path unavailable")
+                )
+                if pre_waypoints is None or axial_waypoints is None:
+                    waypoints = None
+                    trajectory_reason = (
+                        f"geometry pregrasp: {pre_reason}; "
+                        f"axial final approach: {axial_reason}"
+                    )
+                else:
+                    combined = pre_waypoints + axial_waypoints
+                    chain_ok, chain_reason = _validate_fixed_waypoints(
+                        combined, approach_rpy
+                    )
+                    waypoints = combined if chain_ok else None
+                    trajectory_reason = (
+                        f"{len(pre_waypoints)} clearance waypoints then "
+                        f"{len(axial_waypoints)} camera-axial final waypoints; "
+                        f"pregrasp={pregrasp.round(4).tolist()}; "
+                        f"{chain_reason}"
+                    )
+                    reachability["pregrasp_endpoint_m"] = \
+                        pregrasp.round(4).tolist()
+                    reachability["final_approach_camera_mm"] = \
+                        camera_backoff.tolist()
+            except np.linalg.LinAlgError:
+                waypoints = None
+                trajectory_reason = (
+                    "rigid camera mapping is singular; cannot construct an "
+                    "axial final approach"
+                )
         plan_detail = (
             f"{reachability.get('reason')}; predicted residual "
             f"{planned_residual_mm:.1f}mm, limit "
@@ -2162,7 +2706,11 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
         if not ok:
             return recover(f"final fixed approach failed: {reason}")
 
-        grasp_det, _, grasp_why = _observe(eye, object_name)
+        grasp_det, grasp_frame, grasp_why = _observe(eye, object_name)
+        if grasp_frame is not None:
+            _show(*grasp_frame, tag="grasp_endpoint_before_close",
+                  det=grasp_det, target_cam=expected_feature_cam,
+                  note="endpoint gate before any jaw close")
         steps.append(("object_visible_before_close", grasp_det is not None,
                       f"{grasp_det.source} at {grasp_det.z_mm:.0f}mm"
                       if grasp_det else str(grasp_why)))
@@ -2181,10 +2729,11 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 f"predicted_residual_mm={final_residual_mm:.1f} "
                 "basis=preplanned_calibrated_open_jaw_slot")
             grasp_error = final_residual_mm
-            before_lift_cam = requested_cam.copy()
+            before_lift_cam = expected_feature_cam.copy()
         else:
             grasp_error = float(np.linalg.norm(
-                np.asarray(grasp_det.p_cam_mm, dtype=float) - requested_cam
+                np.asarray(grasp_det.p_cam_mm, dtype=float)
+                - expected_feature_cam
             ))
 
         # Fixed pick/place is deliberately open-loop after its initial
@@ -2194,7 +2743,9 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
         steps.append(("grasp_target_gate",
                       grasp_error <= FIXED_PICK_TARGET_TOL_MM,
                       f"error {grasp_error:.1f}mm; limit "
-                      f"{FIXED_PICK_TARGET_TOL_MM:.1f}mm"))
+                      f"{FIXED_PICK_TARGET_TOL_MM:.1f}mm; compared the "
+                      "identifier feature against its planned offset from the "
+                      "grasp region"))
         if grasp_error > FIXED_PICK_TARGET_TOL_MM:
             return recover(
                 f"endpoint observation is {grasp_error:.1f}mm from the fixed "
@@ -2204,57 +2755,350 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             )
         if grasp_det is not None:
             before_lift_cam = np.asarray(grasp_det.p_cam_mm, dtype=float)
+            jaw_slot_feature_cam = before_lift_cam.copy()
+        else:
+            jaw_slot_feature_cam = expected_feature_cam.copy()
+
+        # A wide general endpoint tolerance is useful for reachability, but it
+        # is not enough to prove that a narrow object lies between the fingers.
+        # In dynamic mode require the observed feature to be much closer to its
+        # calibrated open-jaw location before commanding any closure.  If the
+        # fingers occlude the feature, the exact prevalidated path remains the
+        # only available gate and no camera claim is fabricated.
+        if DYNAMIC_GRASP_ENABLED and grasp_det is not None:
+            slot_tol = float(np.clip(DYNAMIC_SLOT_TOL_MM, 3.0, 8.0))
+            slot_ok = grasp_error <= slot_tol
+            steps.append((
+                "dynamic_object_inside_jaw_slot", slot_ok,
+                f"3D feature error {grasp_error:.1f}mm; limit {slot_tol:.1f}mm",
+            ))
+            log(f"stage=dynamic_jaw_slot_gate ok={slot_ok} "
+                f"error_mm={grasp_error:.1f} limit_mm={slot_tol:.1f}")
+            if not slot_ok:
+                return recover(
+                    f"object is {grasp_error:.1f}mm from the calibrated jaw "
+                    f"slot; refusing to close or tighten"
+                )
+
+        # The ready-view width only proves that the object can fit.  The final
+        # close target must come from a new RGB-D measurement made after the
+        # open jaws have reached their validated endpoint.  If the fingers hide
+        # the object or the two measurements disagree, do not guess and do not
+        # move the gripper.
+        if DYNAMIC_GRASP_ENABLED:
+            if grasp_det is None or grasp_frame is None:
+                return recover(
+                    "object is not measurable between the open jaws at the "
+                    "endpoint; refusing image-controlled closure"
+                )
+            endpoint_geometry = _plan_scene_grasp_geometry(
+                grasp_frame, grasp_det, current_rpy=approach_rpy,
+                allow_orientation=False, object_name=object_name,
+            )
+            endpoint_plan = (
+                _plan_aperture(endpoint_geometry.grasp_detection)
+                if endpoint_geometry.ok
+                and endpoint_geometry.grasp_detection is not None else None
+            )
+            initial_width = float(jaw_plan["min_width_mm"])
+            endpoint_width = (
+                float(endpoint_plan["min_width_mm"])
+                if endpoint_plan is not None and endpoint_plan.get("ok") else None
+            )
+            width_delta = (
+                abs(endpoint_width - initial_width)
+                if endpoint_width is not None else float("inf")
+            )
+            endpoint_measure_ok = bool(
+                endpoint_plan is not None and endpoint_plan.get("ok")
+                and width_delta <= DYNAMIC_REMEASURE_MAX_DELTA_MM
+            )
+            steps.append((
+                "dynamic_endpoint_width", endpoint_measure_ok,
+                (f"ready-view {initial_width:.1f}mm, between-jaws "
+                 f"{endpoint_width:.1f}mm, delta {width_delta:.1f}mm; "
+                 f"close target {endpoint_plan['grasp_mm']:.1f}mm"
+                 if endpoint_width is not None and endpoint_plan is not None
+                 else endpoint_geometry.reason),
+            ))
+            log("stage=dynamic_endpoint_width "
+                f"ok={endpoint_measure_ok} ready_width_mm={initial_width:.1f} "
+                f"endpoint_width_mm={endpoint_width} delta_mm={width_delta:.1f}")
+            if not endpoint_measure_ok:
+                return recover(
+                    "between-jaws width could not be confirmed against the "
+                    f"initial feasibility check within "
+                    f"{DYNAMIC_REMEASURE_MAX_DELTA_MM:.1f}mm; refusing to close"
+                )
+            jaw_plan = endpoint_plan
+            # Hold verification must follow the physical body section between
+            # the jaws, not the colored identifier used to align the approach.
+            # A cap can swing several millimetres when a held marker settles
+            # without indicating that the grasp was lost.
+            before_lift_cam = np.asarray(
+                endpoint_geometry.grasp_detection.p_cam_mm, dtype=float
+            )
 
         grasp_rad = float(jaw_plan["grasp_rad"])
         log(f"stage=gripper_position_close target_mm={jaw_plan['grasp_mm']:.1f} "
             f"target_deg={math.degrees(grasp_rad):.1f} contact_inference=false")
-        closed = _gripper("close", grasp_rad)
-        steps.append(("position_close", bool(closed.get("ok")),
-                      f"{jaw_plan['grasp_mm']:.1f}mm commanded; no contact inference"))
+        if DYNAMIC_GRASP_ENABLED:
+            # Approach the image-derived angle in small monotonic position
+            # increments.  Each backend command is itself ramped; splitting the
+            # travel prevents a single fast 150deg->target snap.  The sequence
+            # can never cross the final image-derived target or the hard bounds.
+            start_rad = float(opened.get("position_rad", preopen_rad))
+            travel = abs(start_rad - grasp_rad)
+            max_step = math.radians(float(np.clip(
+                DYNAMIC_CLOSE_STEP_DEG, 5.0, 20.0
+            )))
+            close_steps = max(1, int(math.ceil(travel / max_step)))
+            closed = {"ok": False, "reason": "no close step executed"}
+            for close_index in range(1, close_steps + 1):
+                intermediate = start_rad + \
+                    (grasp_rad - start_rad) * close_index / close_steps
+                log(f"stage=image_controlled_close "
+                    f"step={close_index}/{close_steps} "
+                    f"target_deg={math.degrees(intermediate):.1f}")
+                closed = _gripper("close", intermediate)
+                if not closed.get("ok"):
+                    break
+            steps.append((
+                "image_controlled_slow_close", bool(closed.get("ok")),
+                f"{close_steps} bounded position ramps to endpoint-measured "
+                f"{jaw_plan['grasp_mm']:.1f}mm; no contact inference",
+            ))
+        else:
+            closed = _gripper("close", grasp_rad)
+            steps.append(("position_close", bool(closed.get("ok")),
+                          f"{jaw_plan['grasp_mm']:.1f}mm commanded; "
+                          "no contact inference"))
         if not closed.get("ok"):
             return recover(f"gripper position-close failed: {closed.get('reason')}")
+        log("stage=gripper_position_close_readback "
+            f"target_deg={math.degrees(grasp_rad):.1f} "
+            f"actual_deg={closed.get('position_deg', 'unavailable')} "
+            f"delta_deg={closed.get('delta_deg', 'unavailable')}")
         _OBJECT_HELD = None
         time.sleep(0.5)
 
         grasp_xyz = np.asarray(A.ee_pos(), dtype=float)
-        lift_endpoint = grasp_xyz.copy()
-        lift_endpoint[2] = min(
-            A.Z_MAX - APPROACH_WORKSPACE_MARGIN_M,
-            lift_endpoint[2] + FIXED_PICK_LIFT_M,
-        )
-        lift_waypoints, lift_plan_reason = _plan_fixed_approach_trajectory(
-            lift_endpoint
-        )
-        steps.append(("prevalidate_lift", lift_waypoints is not None,
-                      lift_plan_reason))
-        if lift_waypoints is None:
-            return recover(f"post-grasp lift is unsafe: {lift_plan_reason}")
-        log(f"stage=post_grasp_lift distance_mm="
-            f"{(lift_endpoint[2] - grasp_xyz[2]) * 1000:.1f}")
-        lift_ok, lift_reason = _execute_fixed_approach_trajectory(
-            lift_waypoints, log
-        )
-        steps.append(("lift", lift_ok, lift_reason))
-        if not lift_ok:
-            return recover(f"post-grasp lift failed: {lift_reason}")
+        retry_count = 0
+        current_grasp_mm = float(jaw_plan["grasp_mm"])
+        current_grasp_rad = float(grasp_rad)
+        while True:
+            lift_distance = (
+                float(np.clip(DYNAMIC_MICRO_LIFT_M, 0.010, 0.020))
+                if DYNAMIC_GRASP_ENABLED else FIXED_PICK_LIFT_M
+            )
+            lift_endpoint = np.asarray(A.ee_pos(), dtype=float)
+            lift_endpoint[2] = min(
+                A.Z_MAX - APPROACH_WORKSPACE_MARGIN_M,
+                lift_endpoint[2] + lift_distance,
+            )
+            lift_waypoints, lift_plan_reason = _plan_fixed_approach_trajectory(
+                lift_endpoint
+            )
+            steps.append(("prevalidate_micro_lift" if DYNAMIC_GRASP_ENABLED
+                          else "prevalidate_lift",
+                          lift_waypoints is not None, lift_plan_reason))
+            if lift_waypoints is None:
+                return recover(f"post-grasp lift is unsafe: {lift_plan_reason}")
+            log(f"stage={'dynamic_micro_lift' if DYNAMIC_GRASP_ENABLED else 'post_grasp_lift'} "
+                f"attempt={retry_count + 1} distance_mm={lift_distance * 1000:.1f}")
+            lift_ok, lift_reason = _execute_fixed_approach_trajectory(
+                lift_waypoints, log
+            )
+            steps.append(("micro_lift" if DYNAMIC_GRASP_ENABLED else "lift",
+                          lift_ok, lift_reason))
+            if not lift_ok:
+                return recover(f"post-grasp lift failed: {lift_reason}")
 
-        lifted_det, _, lifted_why = _observe(eye, object_name)
-        rigid_error = None
-        if lifted_det is not None:
-            rigid_error = float(np.linalg.norm(
-                np.asarray(lifted_det.p_cam_mm, dtype=float) - before_lift_cam
+            lifted_det, lifted_frame, lifted_why = _observe(eye, object_name)
+            lifted_hold_det = lifted_det
+            lifted_hold_reason = str(lifted_why)
+            if DYNAMIC_GRASP_ENABLED and lifted_det is not None \
+                    and lifted_frame is not None:
+                lifted_geometry = _plan_scene_grasp_geometry(
+                    lifted_frame, lifted_det,
+                    current_rpy=tuple(float(v) for v in A.ee_rpy()),
+                    allow_orientation=False, object_name=object_name,
+                )
+                if lifted_geometry.ok \
+                        and lifted_geometry.grasp_detection is not None:
+                    lifted_hold_det = lifted_geometry.grasp_detection
+                    lifted_hold_reason = (
+                        "semantic body grasp region tracked after lift"
+                    )
+                else:
+                    lifted_hold_det = None
+                    lifted_hold_reason = lifted_geometry.reason
+            if lifted_frame is not None:
+                _show(*lifted_frame,
+                      tag=f"dynamic_lift_attempt_{retry_count + 1}",
+                      det=lifted_hold_det, target_cam=before_lift_cam,
+                      note="visual hold check after micro-lift")
+            rigid_error = None
+            if lifted_hold_det is not None:
+                rigid_error = float(np.linalg.norm(
+                    np.asarray(lifted_hold_det.p_cam_mm, dtype=float)
+                    - before_lift_cam
+                ))
+            hold_tol = (
+                float(np.clip(DYNAMIC_HOLD_TOL_MM, 3.0, 8.0))
+                if DYNAMIC_GRASP_ENABLED else FIXED_HELD_RIGID_TOL_MM
+            )
+            held = lifted_hold_det is not None and rigid_error is not None and \
+                rigid_error <= hold_tol
+            steps.append(("dynamic_visual_hold_check" if DYNAMIC_GRASP_ENABLED
+                          else "visual_rigid_hold_check", held,
+                          f"camera-relative shift {rigid_error:.1f}mm; "
+                          f"limit {hold_tol:.1f}mm"
+                          if rigid_error is not None else lifted_hold_reason))
+            log(f"stage=visual_rigid_hold held={held} attempt={retry_count + 1} "
+                f"shift_mm={rigid_error if rigid_error is not None else 'unavailable'} "
+                f"limit_mm={hold_tol:.1f}")
+            if held:
+                break
+            # The initial close plus at most three visually-gated retries gives
+            # the uncertain single-span jaw model one additional bounded angle
+            # step.  Every retry still requires returning to the validated jaw
+            # slot and remains subject to the immutable 15deg hard limit.
+            max_retries = int(np.clip(DYNAMIC_MAX_RETRIES, 0, 3))
+            if not DYNAMIC_GRASP_ENABLED or retry_count >= max_retries:
+                _OBJECT_HELD = False
+                return recover(
+                    "object did not move rigidly with the wrist after the "
+                    "bounded visual grasp attempt; grasp not confirmed"
+                )
+
+            # Return to the exact validated endpoint before changing only the jaw
+            # position. No camera observation is allowed to steer this motion.
+            lower_waypoints, lower_reason = _plan_fixed_approach_trajectory(
+                grasp_xyz
+            )
+            if lower_waypoints is None:
+                return recover(f"dynamic retry return is unsafe: {lower_reason}")
+            lower_ok, lower_reason = _execute_fixed_approach_trajectory(
+                lower_waypoints, log
+            )
+            steps.append(("dynamic_retry_return", lower_ok, lower_reason))
+            if not lower_ok:
+                return recover(f"dynamic retry could not return: {lower_reason}")
+            retry_det, retry_frame, retry_why = _observe(eye, object_name)
+            if retry_frame is not None:
+                _show(*retry_frame,
+                      tag=f"dynamic_retry_endpoint_{retry_count + 1}",
+                      det=retry_det, target_cam=before_lift_cam,
+                      note="returned endpoint before tighter close")
+            if retry_det is None:
+                return recover(f"dynamic retry lost the object: {retry_why}")
+            retry_shift = float(np.linalg.norm(
+                np.asarray(retry_det.p_cam_mm, dtype=float)
+                - jaw_slot_feature_cam
             ))
-        held = lifted_det is not None and rigid_error is not None and \
-            rigid_error <= FIXED_HELD_RIGID_TOL_MM
-        steps.append(("visual_rigid_hold_check", held,
-                      f"camera-relative shift {rigid_error:.1f}mm"
-                      if rigid_error is not None else str(lifted_why)))
-        log(f"stage=visual_rigid_hold held={held} "
-            f"shift_mm={rigid_error if rigid_error is not None else 'unavailable'}")
-        if not held:
-            _OBJECT_HELD = False
-            return recover("object did not move rigidly with the wrist after lift; "
-                           "grasp not confirmed")
+            retry_slot_tol = float(np.clip(DYNAMIC_SLOT_TOL_MM, 3.0, 8.0))
+            if retry_shift > retry_slot_tol:
+                return recover(
+                    f"object shifted {retry_shift:.1f}mm after the failed lift; "
+                    f"outside the {retry_slot_tol:.1f}mm jaw-slot limit; "
+                    "refusing a blind retry"
+                )
+            retry_geometry = _plan_scene_grasp_geometry(
+                retry_frame, retry_det,
+                current_rpy=tuple(float(v) for v in A.ee_rpy()),
+                allow_orientation=False, object_name=object_name,
+            ) if retry_frame is not None else None
+            if retry_geometry is None or not retry_geometry.ok \
+                    or retry_geometry.grasp_detection is None:
+                return recover(
+                    "dynamic retry could not re-identify the body section "
+                    "between the jaws; refusing additional closure"
+                )
+            from arm_agent import gripper_model as _retry_gm
+            if dynamic_has_jaw_curve:
+                retry_mm = current_grasp_mm - float(np.clip(
+                    DYNAMIC_RETRY_CLOSE_MM, 0.0, 1.0
+                ))
+                retry_rad = _retry_gm.rad_for_aperture(
+                    retry_mm, _wrist_limits()
+                )
+                actual_retry_mm = (
+                    _retry_gm.aperture_mm(retry_rad)
+                    if retry_rad is not None else None
+                )
+                if retry_rad is None or actual_retry_mm is None \
+                        or abs(actual_retry_mm - retry_mm) > SIZE_TARGET_TOL_MM:
+                    return recover(
+                        f"calibrated jaw curve cannot represent the bounded "
+                        f"{retry_mm:.1f}mm retry aperture"
+                    )
+                retry_basis = "piecewise jaw curve, 1mm tighter"
+            else:
+                close_direction = 1.0 if _retry_gm.OPEN_RAD >= \
+                    _retry_gm.CLOSE_RAD else -1.0
+                angle_step = math.radians(float(np.clip(
+                    DYNAMIC_RETRY_CLOSE_DEG, 1.0, 5.0
+                )))
+                retry_rad = _retry_gm.clamp_rad(
+                    current_grasp_rad - close_direction * angle_step,
+                    _wrist_limits(),
+                )
+                if math.isclose(retry_rad, current_grasp_rad, abs_tol=1e-6):
+                    return recover(
+                        "bounded visual retry reached the hard jaw-angle limit; "
+                        "refusing additional closure"
+                    )
+                actual_retry_mm = _retry_gm.aperture_mm(retry_rad)
+                retry_basis = (
+                    f"single-span model uncertain; commanded "
+                    f"{math.degrees(angle_step):.1f}deg tighter"
+                )
+            retry_count += 1
+            current_grasp_rad = float(retry_rad)
+            if actual_retry_mm is not None:
+                current_grasp_mm = float(actual_retry_mm)
+            before_lift_cam = np.asarray(
+                retry_geometry.grasp_detection.p_cam_mm, dtype=float
+            )
+            log(f"stage=dynamic_retry_close attempt={retry_count + 1} "
+                f"target_mm={current_grasp_mm:.1f} "
+                f"target_deg={math.degrees(retry_rad):.1f} basis={retry_basis}")
+            retry_close = _gripper("close", retry_rad)
+            steps.append(("dynamic_retry_position_close",
+                          bool(retry_close.get("ok")),
+                          f"{math.degrees(retry_rad):.1f}deg commanded; "
+                          f"{retry_basis}; no contact inference"))
+            if not retry_close.get("ok"):
+                return recover(
+                    f"bounded retry close failed: {retry_close.get('reason')}"
+                )
+            log("stage=dynamic_retry_close_readback "
+                f"attempt={retry_count + 1} "
+                f"target_deg={math.degrees(retry_rad):.1f} "
+                f"actual_deg={retry_close.get('position_deg', 'unavailable')} "
+                f"delta_deg={retry_close.get('delta_deg', 'unavailable')}")
+            time.sleep(0.5)
+
+        if DYNAMIC_GRASP_ENABLED:
+            carry_endpoint = grasp_xyz.copy()
+            carry_endpoint[2] = min(
+                A.Z_MAX - APPROACH_WORKSPACE_MARGIN_M,
+                grasp_xyz[2] + FIXED_PICK_LIFT_M,
+            )
+            remaining_waypoints, remaining_reason = \
+                _plan_fixed_approach_trajectory(carry_endpoint)
+            if remaining_waypoints is None:
+                return recover(f"remaining carry lift is unsafe: {remaining_reason}")
+            remaining_ok, remaining_reason = _execute_fixed_approach_trajectory(
+                remaining_waypoints, log
+            )
+            steps.append(("lift_to_carry_after_visual_hold",
+                          remaining_ok, remaining_reason))
+            if not remaining_ok:
+                return recover(
+                    f"remaining carry lift failed: {remaining_reason}"
+                )
         _OBJECT_HELD = True
 
         release_z = min(
@@ -2307,6 +3151,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 "grasp_mm": round(float(jaw_plan["grasp_mm"]), 1),
                 "contact_inference": False,
             },
+            grasp_geometry=grasp_geometry_summary,
             reachability=reachability,
             high_drop_xyz_m=release_endpoint.round(4).tolist(),
         )
@@ -2317,6 +3162,9 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                            homed=False, object_held=False)
         return recover(f"fixed pick/place exception: {type(exc).__name__}: {exc}")
     finally:
+        stop_feed = getattr(eye, "stop_live_feed", None)
+        if callable(stop_feed):
+            stop_feed()
         if own_eye:
             eye.close()
 
@@ -2898,6 +3746,53 @@ def snapshot(object_name: str | None = None) -> dict[str, Any]:
         eye.close()
 
 
+def grasp_preview(object_name: str) -> dict[str, Any]:
+    """Camera-only ranked body cross-sections; never touches arm or gripper."""
+    eye = WristEye()
+    try:
+        try:
+            color, depth, intr = eye.frame()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "reason": f"wrist camera unavailable: {exc}"}
+        det, why = eye.object(object_name, color, depth, intr)
+        if det is None:
+            _show(color, depth, intr, tag="grasp_preview",
+                  note=f"not found: {object_name}")
+            return {"ok": False, "reason": "object not detected", "why": why,
+                    "camera_only": True, "arm_commanded": False,
+                    "gripper_commanded": False}
+        geometry = _plan_scene_grasp_geometry(
+            (color, depth, intr), det, current_rpy=(0.0, 0.0, 0.0),
+            object_name=object_name,
+        )
+        selected = geometry.grasp_detection
+        jaw_plan = _plan_aperture(selected) if geometry.ok and selected else None
+        ranked = sorted(
+            [dict(item) for item in geometry.candidates],
+            key=lambda item: float(item.get("score", -1e9)), reverse=True,
+        )
+        _show(color, depth, intr, tag="grasp_preview", det=selected or det,
+              candidates=ranked, title="camera-only dynamic grasp preview",
+              note=geometry.reason)
+        return {
+            "ok": bool(geometry.ok and jaw_plan and jaw_plan.get("ok")),
+            "reason": geometry.reason,
+            "camera_only": True,
+            "arm_commanded": False,
+            "gripper_commanded": False,
+            "identifier_detection": {
+                "source": det.source, "uv": [round(v, 1) for v in det.uv],
+                "z_mm": round(float(det.z_mm), 1),
+            },
+            "selected_grasp": geometry.summary().get("grasp_detection"),
+            "ranked_cross_sections": ranked,
+            "jaw_plan": jaw_plan,
+            "frames": str(_VIZ.outdir) if _VIZ is not None else None,
+        }
+    finally:
+        eye.close()
+
+
 # =====================================================================================
 # Offline simulation (no hardware)
 # =====================================================================================
@@ -2982,6 +3877,9 @@ def main() -> None:
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--sim", action="store_true", help="full loop against the offline simulator")
     mode.add_argument("--snapshot", action="store_true", help="one annotated wrist frame (no motion)")
+    mode.add_argument("--grasp-preview", metavar="OBJECT",
+                      help="camera-only: rank graspable body cross-sections; "
+                           "never connects to the arm or gripper")
     mode.add_argument("--calib-tcp", action="store_true", help="localize the TCP (jaws move only)")
     mode.add_argument("--teach-drop", action="store_true", help="record the release pose (no motion)")
     mode.add_argument("--show-calib", action="store_true", help="print the stored calibration")
@@ -2991,8 +3889,8 @@ def main() -> None:
                       help="detect once, execute a prevalidated fixed near-touch trajectory, "
                            "then home; no scan/contact/gripper")
     mode.add_argument("--fixed-pick-place", metavar="OBJECT",
-                      help="fixed approach, depth-sized position grasp, high release "
-                           "over taught drop zone, then home")
+                      help="geometry-planned grasp with bounded wrist yaw, full-object "
+                           "depth envelope, axial final approach, high release, then home")
     mode.add_argument("--pick", metavar="OBJECT", help="wrist-servo pick")
     mode.add_argument("--place", action="store_true", help="release into the taught drop zone")
     mode.add_argument("--pick-place", metavar="OBJECT", help="pick, then place in the drop zone")
@@ -3021,6 +3919,9 @@ def main() -> None:
                       help="compare the stored TCP against a held object; does not overwrite")
     mode.add_argument("--set-jaw-span", type=float, metavar="MM",
                       help="store the jaw scale from a measured gap (no camera needed)")
+    mode.add_argument("--set-jaw-point", metavar="DEG,MM",
+                      help="add one ruler-measured empty-jaw calibration point; "
+                           "saves only and never commands the gripper")
 
     p.add_argument("--object", help="object name for --snapshot")
     p.add_argument("--drop", help="explicit 'x,y,z' metres for --teach-drop")
@@ -3031,6 +3932,9 @@ def main() -> None:
                    help="MIT kp for this jaw move (config uses 50; try 8 or 2)")
     p.add_argument("--gripper-kd", type=float, default=None,
                    help="MIT kd for this jaw move (RobStride encodes 0-5)")
+    p.add_argument("--empty-jaws", action="store_true",
+                   help="assert no object is between the jaws; required for an "
+                        "explicit live gripper-only positioning command")
     p.add_argument("--scan-index", type=int, default=0,
                    help="--look: which scan pose (0 = centre, 1-4 = quadrants)")
     p.add_argument("--at-fraction", type=float, default=None,
@@ -3055,9 +3959,10 @@ def main() -> None:
     if args.run and (args.pick or args.place or args.pick_place):
         p.error("live grasp/place is temporarily safety-locked; use --approach OBJECT "
                 "to validate slow IK-only motion without descent or gripper commands")
-    if args.run and args.gripper in {"open", "close"}:
+    if args.run and args.gripper in {"open", "close"} and not args.empty_jaws:
         p.error("live gripper commands are temporarily safety-locked while the "
-                "IK-only approach path is being validated")
+                "IK-only approach path is being validated; for ruler calibration "
+                "remove every object and pass --empty-jaws")
     if args.run and args.look:
         p.error("scan-pose motion is temporarily disabled; use --watch for a "
                 "camera-only view or --approach OBJECT for current-view IK motion")
@@ -3091,12 +3996,15 @@ def main() -> None:
         from arm_agent import gripper_model as _gm
         out = {"tcp_camera_xyz_mm": load_tcp(), "tcp_file": str(TCP_FILE),
                "grasp_target_camera_xyz_mm": load_grasp_target(),
+               "grasp_target_detail": load_grasp_target_detail(),
                "grasp_target_file": str(GRASP_TARGET_FILE),
                "release_xyz_m": load_drop_zone(), "drop_file": str(DROP_FILE),
                "safety": load_safety_calibration(), "safety_file": str(SAFETY_FILE),
                "camera": CAMERA_KIND, "gripper": _gm.describe()}
     elif args.snapshot:
         out = snapshot(args.object)
+    elif args.grasp_preview:
+        out = grasp_preview(args.grasp_preview)
     elif args.watch:
         if not (args.live or args.mjpeg):
             p.error("--watch streams video; add --live (or --mjpeg PORT)")
@@ -3217,6 +4125,15 @@ def main() -> None:
     elif args.set_jaw_span is not None:
         from arm_agent import gripper_model as _gm
         out = _gm.set_span(args.set_jaw_span, args.at_fraction)
+    elif args.set_jaw_point:
+        from arm_agent import gripper_model as _gm
+        try:
+            angle_deg, aperture_mm = (
+                float(value) for value in args.set_jaw_point.split(",")
+            )
+        except (TypeError, ValueError):
+            p.error("--set-jaw-point needs 'DEG,MM', for example '60,18.5'")
+        out = _gm.add_calibration_point(angle_deg, aperture_mm)
     elif args.calib_tcp:
         out = calibrate_tcp(args.camera)
     elif args.teach_drop:
