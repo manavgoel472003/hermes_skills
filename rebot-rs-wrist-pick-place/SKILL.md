@@ -1,7 +1,7 @@
 ---
 name: rebot-rs-wrist-pick-place
 description: Detect, segment, preplan, image-size, pick, verify, drop, and home with a reBot RS arm and wrist RealSense. Use for camera-only detection checks, camera-only open-jaw calibration, or the hardware-verified dynamic marker pick/place workflow.
-version: 0.2.0
+version: 0.3.0
 author: Manav Goel
 metadata:
   hermes:
@@ -33,7 +33,10 @@ Use the Python interpreter that owns the RealSense and Pinocchio dependencies:
 - Treat Ctrl+C as controlled recovery: freeze, open, then home.
 - If home cannot be verified, keep motor control active and tell the operator to
   support the arm before using the physical E-stop or power cutoff.
-- Keep people and obstacles outside the planned arm, bottle, and drop-zone path.
+- Keep people outside the workspace. Static scene collision checking is not a
+  human-safety system and cannot see through the arm or a carried object.
+- When `REBOT_SCENE_COLLISION=1`, never bypass an empty-map, self-collision,
+  table, visible-obstacle, payload, or collision-free-home refusal.
 - Use camera-only `--watch` before attempting a new colour/object.
 - Use a light object for the first trial of a new geometry.
 
@@ -115,6 +118,10 @@ REBOT_ARM_ANGULAR_SPEED_RAD_S=0.54 \
 REBOT_JOINT_VLIM=0.90 \
 REBOT_GRIPPER_MOVE_S=1.10 \
 REBOT_GRIPPER_STEP_S=0.04 \
+REBOT_SCENE_COLLISION=1 \
+REBOT_SCENE_COLLISION_VOXEL_M=0.020 \
+REBOT_SCENE_COLLISION_INFLATION_M=0.025 \
+REBOT_SCENE_COLLISION_STRIDE_PX=4 \
 /home/manav/miniconda3/envs/rebot_rs/bin/python \
   -m arm_agent.wrist_servo \
   --fixed-pick-place "blue marker with white body" --run --live
@@ -125,6 +132,10 @@ Expected planning evidence:
 - `fit_rigid_camera_geometry` passes.
 - `preplan_reachable_grasp` passes.
 - `prevalidate_complete_approach` passes before approach motion begins.
+- `scene_collision_map` reports a nonzero obstacle-column count, 20 mm voxels,
+  and 25 mm inflation before the first object-approach trajectory.
+- Continuation IK is sampled for URDF self/table/scene collision; an attached
+  payload envelope is installed before the first lift.
 - GPU semantic vision identifies and segments the complete object, while stable
   color/depth tracking—not a changing whole-object box—drives the Jacobian.
 - `fit_rigid_camera_geometry` reports an error no greater than 0.15.
@@ -138,6 +149,18 @@ Expected planning evidence:
 - Post-lift vision follows the semantic body grasp region rather than a cap that
   may pivot while held.
 - The object is released over the taught drop zone and home is verified.
+
+For collision-aware scene-relative placement, prefer the robot-workspace wrapper:
+
+```bash
+./run_scene_pick_place.sh --dry "red marker" right "green marker" 0.10
+./run_scene_pick_place.sh --run "red marker" right "green marker" 0.10
+```
+
+Dry mode validates perception and grasp geometry but reports base-frame collision
+planning as deferred because it deliberately does not connect to read the live arm
+pose. Live mode fails closed if the map or complete collision-free path cannot be
+validated.
 
 ## New-object policy
 

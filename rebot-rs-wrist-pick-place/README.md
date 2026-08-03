@@ -1,7 +1,7 @@
 # reBot RS wrist-camera pick/place
 
 This is the known-good source snapshot for the fixed, preplanned RS wrist-camera
-pick/place workflow developed and hardware-tested through 2026-07-31.
+pick/place workflow developed and hardware-tested through 2026-08-03.
 
 ## Verified hardware outcome
 
@@ -26,13 +26,22 @@ pick/place workflow developed and hardware-tested through 2026-07-31.
   minimum-jerk joint trajectory, rather than stopping at each internal waypoint.
 - A visible endpoint miss can trigger up to two separately IK-validated,
   12 mm-capped open-jaw corrections before the existing jaw-slot gate is applied.
+- Scene-relative placement localizes a stable visible reference in the robot/table
+  frame and supports left, right, front, behind, and next-to requests.
+- Optional fail-closed collision checking converts RealSense depth into inflated
+  base-frame obstacle columns. Pinocchio/Coal checks RS-URDF self-collision, the
+  calibrated table, visible clutter, and an attached payload before motion.
+- Carry planning evaluates direct, X-first, Y-first, elevated, and lateral
+  corridors and refuses motion when no complete collision-free route exists.
 
 ## Safety boundary
 
 There is no validated force/contact signal. Closing is image-sized and
 position-only, with immutable 15–150 degree command limits. Novel fragile or
 unstable objects still require supervised trials; detection is not proof that an
-object can be safely grasped.
+object can be safely grasped. The collision map covers the static scene visible
+from the ready-pose wrist camera; it cannot guarantee clearance from hidden or
+moving obstacles.
 
 ## Source layout
 
@@ -53,4 +62,5 @@ From the robot workspace:
 python -m unittest discover -s tests
 ```
 
-The snapshot passes 74 tests.
+The robot-workspace snapshot passes 99 tests, including synthetic RGB-D mapping
+and RS-URDF collision tests.

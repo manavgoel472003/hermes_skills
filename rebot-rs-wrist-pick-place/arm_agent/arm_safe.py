@@ -283,6 +283,47 @@ def check_ik_path(
                       waypoints[-1])
 
 
+def configure_collision_scene(
+    boxes: list[dict], *, table_z_m: float, payload_radius_m: float = 0.0
+) -> MoveResult:
+    """Install an RGB-D scene in the local backend's central motion gate."""
+    local = _local_arm()
+    if local is None:
+        return MoveResult(False, "scene_collision_requires_local_backend")
+    try:
+        detail = local.configure_collision_scene(
+            boxes, table_z_m=table_z_m, payload_radius_m=payload_radius_m
+        )
+    except Exception as exc:
+        return MoveResult(False, f"collision_scene_error {exc}")
+    return MoveResult(
+        True,
+        f"collision_scene_ready boxes={detail['obstacle_boxes']} "
+        f"self_pairs={detail['self_collision_pairs']} "
+        f"payload_radius_mm={detail['payload_radius_m'] * 1000:.1f}",
+    )
+
+
+def update_collision_payload(radius_m: float) -> MoveResult:
+    local = _local_arm()
+    if local is None:
+        return MoveResult(False, "scene_collision_requires_local_backend")
+    try:
+        detail = local.update_collision_payload(radius_m)
+    except Exception as exc:
+        return MoveResult(False, f"collision_payload_error {exc}")
+    return MoveResult(bool(detail.get("ok")), str(
+        detail.get("reason") or
+        f"payload_radius_mm={float(detail['payload_radius_m']) * 1000:.1f}"
+    ))
+
+
+def clear_collision_scene() -> None:
+    local = _local_arm()
+    if local is not None:
+        local.clear_collision_scene()
+
+
 def safe_move(x, y, z, *, roll: float | None = None, pitch: float | None = None,
               yaw: float | None = None,
               duration: float | None = None, dry: bool = False,

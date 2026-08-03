@@ -78,6 +78,7 @@ if str(ROOT) not in sys.path:
 
 from arm_agent import arm_safe as A  # the shared, IK-verified, arm-agnostic motion gate
 from arm_agent import grasp_geometry as GG
+from arm_agent import scene_collision as SC
 from arm_agent import wrist_detect as WD
 from arm_agent.depth_camera import open_depth_camera
 
@@ -196,6 +197,18 @@ SCENE_PLACE_CONSENSUS_FRAMES = int(
 )
 SCENE_PLACE_MAX_SPREAD_MM = float(
     os.getenv("REBOT_WRIST_SCENE_PLACE_MAX_SPREAD_MM", "15.0")
+)
+SCENE_COLLISION_ENABLED = os.getenv(
+    "REBOT_SCENE_COLLISION", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+SCENE_COLLISION_VOXEL_M = float(
+    os.getenv("REBOT_SCENE_COLLISION_VOXEL_M", "0.020")
+)
+SCENE_COLLISION_INFLATION_M = float(
+    os.getenv("REBOT_SCENE_COLLISION_INFLATION_M", "0.025")
+)
+SCENE_COLLISION_STRIDE_PX = int(
+    os.getenv("REBOT_SCENE_COLLISION_STRIDE_PX", "4")
 )
 ALIGN_TOL_MM = 8.0       # camera-frame object<->target error we call "aligned"
 STALL_ITERS = 3          # no improvement for this many steps => at the sensor's noise floor
@@ -1342,6 +1355,10 @@ def _home_after_interrupt(*, open_gripper: bool = True) -> dict[str, Any]:
     else:
         opened = {"ok": True, "skipped": True,
                   "reason": "gripper intentionally untouched"}
+    if open_gripper and opened.get("ok") and SCENE_COLLISION_ENABLED:
+        # Once the jaws are verified open the payload is no longer attached to
+        # the arm. Keep static scene/table checks active for the home path.
+        A.update_collision_payload(0.0)
     try:
         homed = _home()
     except BaseException as exc:
@@ -1975,11 +1992,25 @@ def _plan_clearance_axial_trajectory(
         bridge_above_pregrasp = np.array(
             [pregrasp[0], pregrasp[1], clearance_z], dtype=float
         )
-        routes = (
+        routes: list[tuple[str, list[np.ndarray]]] = [
             ("straight_clearance", [pregrasp]),
             ("level_clearance", [bridge_above_start,
                                   bridge_above_pregrasp, pregrasp]),
-        )
+        ]
+        # If the direct level traverse intersects clutter, try bounded lateral
+        # corridors. Every corridor is still solved and collision-checked as one
+        # complete chain before its first command is sent.
+        for axis, label in ((1, "y"), (0, "x")):
+            for sign, side in ((1.0, "positive"), (-1.0, "negative")):
+                shifted_start = bridge_above_start.copy()
+                shifted_end = bridge_above_pregrasp.copy()
+                shifted_start[axis] += sign * 0.060
+                shifted_end[axis] += sign * 0.060
+                routes.append((
+                    f"{label}_{side}_corridor",
+                    [bridge_above_start, shifted_start, shifted_end,
+                     bridge_above_pregrasp, pregrasp],
+                ))
         for route_name, route_points in routes:
             combined: list[tuple[float, float, float]] = []
             leg_start = start.copy()
@@ -2313,6 +2344,73 @@ def _apply_pick_target_y_offset(target_cam: Any) -> tuple[np.ndarray, float]:
     return adjusted, offset_mm
 
 
+def _install_scene_collision_map(
+    frame: tuple[np.ndarray, np.ndarray, Any],
+    geometry: GG.GraspGeometry,
+    camera_mapping: np.ndarray,
+    *,
+    payload_radius_m: float = 0.0,
+) -> tuple[bool, dict[str, Any]]:
+    """Map visible non-target depth and install it in the central motion gate."""
+    if not SCENE_COLLISION_ENABLED:
+        return True, {
+            "collision_model": False,
+            "reason": "disabled; set REBOT_SCENE_COLLISION=1 for guarded runs",
+        }
+    target = load_grasp_target()
+    safety = load_safety_calibration()
+    table_z = safety.get("table_z_m")
+    if target is None:
+        return False, {"reason": "open-jaw camera target is unavailable"}
+    if table_z is None:
+        return False, {"reason": "calibrated table height is unavailable"}
+    exclusions: list[tuple[int, int, int, int]] = []
+    # The target is the sole allowed environmental contact. Prefer the complete
+    # semantic/depth envelope over the small colored identifier or grasp slice.
+    for detection in (geometry.envelope_detection, geometry.grasp_detection):
+        if detection is not None:
+            exclusions.append(tuple(int(v) for v in detection.box))
+            break
+    try:
+        _, depth, intr = frame
+        scene = SC.build_scene_map(
+            depth, intr,
+            ee_xyz_m=A.ee_pos(),
+            camera_mapping_mm_per_m=np.asarray(camera_mapping, dtype=float),
+            jaw_target_cam_mm=target,
+            table_z_m=float(table_z),
+            workspace_lo_m=(A.X_MIN, A.Y_MIN, A.Z_MIN),
+            workspace_hi_m=(A.X_MAX, A.Y_MAX, A.Z_MAX),
+            exclude_pixel_boxes=exclusions,
+            near_mm=max(100.0, float(WD.NEAR_MM)),
+            far_mm=float(WD.FAR_MM),
+            stride_px=SCENE_COLLISION_STRIDE_PX,
+            voxel_m=SCENE_COLLISION_VOXEL_M,
+            inflation_m=SCENE_COLLISION_INFLATION_M,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, {
+            "reason": f"RGB-D scene mapping failed: {type(exc).__name__}: {exc}"
+        }
+    if not scene.boxes:
+        return False, {
+            **scene.as_dict(),
+            "reason": "no above-table obstacle geometry was recovered; refusing "
+                      "to interpret an empty map as a clear scene",
+        }
+    configured = A.configure_collision_scene(
+        [box.as_dict() for box in scene.boxes],
+        table_z_m=float(table_z), payload_radius_m=payload_radius_m,
+    )
+    detail = {
+        **scene.as_dict(),
+        "reason": configured.reason,
+        "target_exclusion_boxes_px": [list(box) for box in exclusions],
+        "payload_radius_mm": round(payload_radius_m * 1000.0, 1),
+    }
+    return configured.ok, detail
+
+
 # =====================================================================================
 # SAFE APPROACH: current-view detection -> IK alignment -> home (no descent/gripper)
 # =====================================================================================
@@ -2484,6 +2582,8 @@ def servo_approach(object_name: str, *, dry: bool = False, verbose: bool = False
         log(f"stage={'fixed_endpoint_reached' if full_target else 'closest_safe_point_reached'} "
             "gripper=untouched descent=disabled next=home")
         recovery = _home_after_interrupt(open_gripper=False)
+        if SCENE_COLLISION_ENABLED and recovery.get("homed"):
+            A.clear_collision_scene()
         steps.append(("return_home", bool(recovery.get("homed")),
                       str(recovery.get("reason"))))
         return _result(
@@ -2535,10 +2635,18 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
     global _OBJECT_HELD, _FIXED_HELD_CONTEXT
     _OBJECT_HELD = False
     _FIXED_HELD_CONTEXT = None
+    if SCENE_COLLISION_ENABLED:
+        # A previous interrupted controller process must never leak stale scene
+        # geometry into a new observation.
+        A.clear_collision_scene()
     log = _printer(verbose)
     steps: list[tuple[str, bool, str]] = []
     preplanned_scene_endpoint: np.ndarray | None = None
     preplanned_scene_detail: dict[str, Any] | None = None
+    collision_detail: dict[str, Any] = {
+        "collision_model": False,
+        "reason": "scene collision checking disabled",
+    }
     task_name = "fixed_pick_place" if place_after_pick else "fixed_pick"
     normalized_place_relation = _normalize_scene_relation(place_relation)
     if place_after_pick and normalized_place_relation is None:
@@ -2680,6 +2788,8 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
     def recover(reason: str, **extra: Any) -> dict[str, Any]:
         global _OBJECT_HELD, _FIXED_HELD_CONTEXT
         recovery = _home_after_interrupt(open_gripper=True)
+        if SCENE_COLLISION_ENABLED and recovery.get("homed"):
+            A.clear_collision_scene()
         _OBJECT_HELD = False if recovery.get("gripper_opened") else None
         if _OBJECT_HELD is False:
             _FIXED_HELD_CONTEXT = None
@@ -2741,6 +2851,13 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 drop_ik = A.check_ik(float(drop[0]), float(drop[1]), release_z,
                                      0.0, 0.0, 0.0)
                 steps.append(("high_drop_ik", drop_ik.ok, drop_ik.reason))
+            if SCENE_COLLISION_ENABLED:
+                steps.append((
+                    "scene_collision_preview", True,
+                    "enabled for live execution; base-frame mapping and complete "
+                    "URDF path checks require the measured live arm pose and are "
+                    "therefore deferred without moving in dry mode",
+                ))
             ok = bool(det is not None and geometry and geometry.ok
                       and plan and plan["ok"]
                       and (not scene_place or reference_det is not None)
@@ -2763,6 +2880,10 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                      "z_mm": round(float(reference_det.z_mm), 1)}
                     if reference_det is not None else None
                 ),
+                collision_scene={
+                    "collision_model": bool(SCENE_COLLISION_ENABLED),
+                    "deferred_until_live_pose": bool(SCENE_COLLISION_ENABLED),
+                },
             )
 
         if START_GRIPPER_CLOSED:
@@ -2898,6 +3019,8 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     grasp_geometry=geometry_after.summary(),
                 )
             det = geometry_after.grasp_detection
+            frame = frame_after
+            geometry = geometry_after
             grasp_geometry_summary = geometry_after.summary()
         else:
             det = geometry.grasp_detection
@@ -2943,6 +3066,45 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             J = J_rigid
             log(f"stage=rigid_camera_fit detail={rigid_detail['reason']}")
 
+        if SCENE_COLLISION_ENABLED:
+            map_det, map_frame, map_why = _observe(eye, object_name)
+            if map_det is None or map_frame is None:
+                steps.append(("scene_collision_map", False, str(map_why)))
+                return recover(
+                    "target could not be isolated in the collision-map frame; "
+                    "refusing to treat it as generic free space"
+                )
+            map_geometry = _plan_scene_grasp_geometry(
+                map_frame, map_det,
+                current_rpy=tuple(float(v) for v in A.ee_rpy()),
+                allow_orientation=False, object_name=object_name,
+            )
+            if not map_geometry.ok:
+                steps.append(("scene_collision_map", False,
+                              map_geometry.reason))
+                return recover(
+                    "the grasp target could not be separated from scene "
+                    f"obstacles: {map_geometry.reason}"
+                )
+            collision_ok, collision_detail = _install_scene_collision_map(
+                map_frame, map_geometry, J
+            )
+            steps.append((
+                "scene_collision_map", collision_ok,
+                str(collision_detail.get("reason")),
+            ))
+            log("stage=scene_collision_map "
+                f"ok={collision_ok} "
+                f"obstacle_columns={collision_detail.get('obstacle_columns')} "
+                f"inflation_mm={collision_detail.get('inflation_mm')} "
+                f"detail={collision_detail.get('reason')}")
+            if not collision_ok:
+                return recover(
+                    "collision scene could not be validated; no trajectory was "
+                    f"executed: {collision_detail.get('reason')}",
+                    collision_scene=collision_detail,
+                )
+
         if scene_place:
             assert place_reference is not None
             provisional_context = {
@@ -2972,6 +3134,8 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     f"{(preplanned_scene_detail or {}).get('reason')}",
                     placement=preplanned_scene_detail,
                 )
+            if preplanned_scene_detail is not None and SCENE_COLLISION_ENABLED:
+                preplanned_scene_detail["scene_map"] = collision_detail
             log("stage=scene_place_preplanned_at_ready_pose "
                 f"reference={place_reference!r} "
                 f"endpoint={preplanned_scene_endpoint.round(4).tolist()} "
@@ -3482,6 +3646,25 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             f"actual_deg={closed.get('position_deg', 'unavailable')} "
             f"delta_deg={closed.get('delta_deg', 'unavailable')}")
         _OBJECT_HELD = None
+        if SCENE_COLLISION_ENABLED:
+            provisional_payload = {
+                "grasp_geometry": grasp_geometry_summary,
+                "jaw_plan": {
+                    "object_width_mm": float(jaw_plan["min_width_mm"]),
+                },
+            }
+            payload_radius = SC.payload_radius_m(provisional_payload)
+            payload_result = A.update_collision_payload(payload_radius)
+            steps.append(("attach_payload_collision_envelope",
+                          payload_result.ok, payload_result.reason))
+            log("stage=attach_payload_collision_envelope "
+                f"ok={payload_result.ok} radius_mm={payload_radius * 1000:.1f} "
+                f"detail={payload_result.reason}")
+            if not payload_result.ok:
+                return recover(
+                    "held-object collision envelope could not be installed; "
+                    "refusing to lift"
+                )
         time.sleep(0.5)
 
         grasp_xyz = np.asarray(A.ee_pos(), dtype=float)
@@ -3795,6 +3978,8 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             _FIXED_HELD_CONTEXT = None
         if released is not True:
             return recover("drop release was not verified")
+        if SCENE_COLLISION_ENABLED:
+            A.update_collision_payload(0.0)
 
         recovery = _home_after_interrupt(open_gripper=False)
         steps.append(("return_home", bool(recovery.get("homed")),
@@ -3816,6 +4001,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             reachability=reachability,
             high_drop_xyz_m=release_endpoint.round(4).tolist(),
             final_alignment_corrections=corrections,
+            collision_scene=collision_detail,
         )
     except BaseException as exc:
         if dry:
@@ -3928,34 +4114,63 @@ def _scene_reference_consensus(
 def _high_release_waypoints(
     endpoint: np.ndarray, fixed_rpy: tuple[float, float, float]
 ) -> tuple[list[tuple[float, float, float]] | None, str]:
-    """Prevalidate lift/level-traverse/lower without obstacle inference."""
+    """Choose a fully IK- and collision-validated carry corridor."""
     start = np.asarray(A.ee_pos(), dtype=float)
-    travel_z = min(
-        A.Z_MAX - APPROACH_WORKSPACE_MARGIN_M,
-        max(float(start[2]), float(endpoint[2])),
-    )
-    route = [
-        np.array([start[0], start[1], travel_z], dtype=float),
-        np.array([endpoint[0], endpoint[1], travel_z], dtype=float),
-        endpoint,
-    ]
-    combined: list[tuple[float, float, float]] = []
-    leg_start = start
-    for leg_endpoint in route:
-        if float(np.linalg.norm(leg_endpoint - leg_start)) < 1e-7:
-            continue
-        leg, reason = _plan_fixed_approach_trajectory(
-            leg_endpoint, start_m=leg_start, fixed_rpy=fixed_rpy,
-            validate_ik=False,
-        )
-        if leg is None:
-            return None, reason
-        combined.extend(leg)
-        leg_start = leg_endpoint
-    if not combined:
-        return None, "empty high-release path"
-    ok, reason = _validate_fixed_waypoints(combined, fixed_rpy)
-    return (combined, f"high release route; {reason}") if ok else (None, reason)
+    ceiling = A.Z_MAX - APPROACH_WORKSPACE_MARGIN_M
+    base_z = min(ceiling, max(float(start[2]), float(endpoint[2])))
+    travel_heights = sorted({
+        round(base_z, 4),
+        round(min(ceiling, base_z + 0.040), 4),
+        round(min(ceiling, base_z + 0.080), 4),
+    })
+    failures: list[str] = []
+    valid: list[tuple[float, list[tuple[float, float, float]], str]] = []
+    for travel_z in travel_heights:
+        start_top = np.array([start[0], start[1], travel_z], dtype=float)
+        end_top = np.array([endpoint[0], endpoint[1], travel_z], dtype=float)
+        route_candidates = [
+            ("direct", [start_top, end_top, endpoint]),
+            ("x_then_y", [start_top,
+                           np.array([endpoint[0], start[1], travel_z]),
+                           end_top, endpoint]),
+            ("y_then_x", [start_top,
+                           np.array([start[0], endpoint[1], travel_z]),
+                           end_top, endpoint]),
+        ]
+        for route_name, route in route_candidates:
+            combined: list[tuple[float, float, float]] = []
+            leg_start = start
+            failed = None
+            for leg_endpoint in route:
+                if float(np.linalg.norm(leg_endpoint - leg_start)) < 1e-7:
+                    continue
+                leg, reason = _plan_fixed_approach_trajectory(
+                    leg_endpoint, start_m=leg_start, fixed_rpy=fixed_rpy,
+                    validate_ik=False,
+                )
+                if leg is None:
+                    failed = reason
+                    break
+                combined.extend(leg)
+                leg_start = leg_endpoint
+            if failed is not None or not combined:
+                failures.append(
+                    f"{route_name}@z={travel_z:.3f}: {failed or 'empty path'}"
+                )
+                continue
+            ok, reason = _validate_fixed_waypoints(combined, fixed_rpy)
+            if not ok:
+                failures.append(f"{route_name}@z={travel_z:.3f}: {reason}")
+                continue
+            length = float(sum(np.linalg.norm(
+                np.asarray(b, dtype=float) - np.asarray(a, dtype=float)
+            ) for a, b in zip([tuple(start), *combined[:-1]], combined)))
+            valid.append((length, combined,
+                          f"{route_name} at z={travel_z:.3f}; {reason}"))
+    if not valid:
+        return None, "all collision-aware carry corridors failed: " + "; ".join(failures)
+    _, selected, detail = min(valid, key=lambda item: item[0])
+    return selected, f"collision-aware high release route; {detail}"
 
 
 def _plan_scene_relative_release(
@@ -4060,8 +4275,14 @@ def _plan_scene_relative_release(
         "distance_basis": distance_basis,
         "release_endpoint_m": selected["endpoint"].round(4).tolist(),
         "camera_mapping": mapping_detail,
-        "collision_model": False,
-        "warning": "IK/workspace only; scene obstacles are not modelled",
+        "collision_model": bool(SCENE_COLLISION_ENABLED),
+        "warning": (
+            "static RGB-D scene, URDF self-collision, table, and attached "
+            "payload checked; unseen or moving obstacles still trigger the "
+            "operator stop path"
+            if SCENE_COLLISION_ENABLED else
+            "IK/workspace only; scene obstacles are not modelled"
+        ),
     }
     return selected["endpoint"], selected["waypoints"], detail
 
@@ -4280,8 +4501,12 @@ def fixed_place(*, reference: str | None = None,
             _FIXED_HELD_CONTEXT = None
         if released is not True:
             return recover("drop release was not verified")
+        if SCENE_COLLISION_ENABLED:
+            A.update_collision_payload(0.0)
 
         recovery = _home_after_interrupt(open_gripper=False)
+        if SCENE_COLLISION_ENABLED and recovery.get("homed"):
+            A.clear_collision_scene()
         steps.append(("return_home", bool(recovery.get("homed")),
                       str(recovery.get("reason"))))
         return _result(

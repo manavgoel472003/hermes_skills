@@ -26,7 +26,8 @@ if str(CONTROL_ROOT) not in sys.path:
 from reBotArm_control_py.actuator import RebotArm
 from reBotArm_control_py.controllers import RebotArmEndPose
 from reBotArm_control_py.kinematics import (
-    get_end_effector_frame_id, joint_to_pose, load_robot_model, pad_q_for_model, pos_rot_to_se3,
+    _resolve_urdf, get_end_effector_frame_id, joint_to_pose, load_robot_model,
+    pad_q_for_model, pos_rot_to_se3,
 )
 from reBotArm_control_py.kinematics.inverse_kinematics import IKParams, solve_ik_with_retry
 
@@ -90,6 +91,16 @@ HOME_VEL_TOL_RAD_S = 0.10
 HOME_SETTLE_TIMEOUT_S = 2.0
 
 
+def _collision_library():
+    """Coal is the current HPP-FCL Python name; retain old-package fallback."""
+    try:
+        import coal
+        return coal
+    except ImportError:
+        import hppfcl
+        return hppfcl
+
+
 class LocalArm:
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -101,6 +112,256 @@ class LocalArm:
         self._ik = IKParams(max_iter=200, tolerance=1e-4, step_size=0.5, damping=1e-6)
         self._joint_lo = np.asarray(self._model.lowerPositionLimit[:6], dtype=np.float64)
         self._joint_hi = np.asarray(self._model.upperPositionLimit[:6], dtype=np.float64)
+        # Populated only when the wrist skill explicitly enables scene collision
+        # checking.  Keeping construction lazy avoids loading mesh geometry for
+        # read-only state/gripper commands.
+        self._collision_boxes: list[dict[str, Any]] = []
+        self._collision_table_z_m: float | None = None
+        self._collision_payload_radius_m = 0.0
+        self._collision_model: Any = None
+        self._collision_data: Any = None
+        self._self_collision_pairs: list[tuple[int, int]] = []
+
+    def _ensure_collision_model(self) -> None:
+        if self._collision_model is not None:
+            return
+        try:
+            import pinocchio as pin
+            urdf_path, package_dir = _resolve_urdf()
+            geometry = pin.buildGeomFromUrdf(
+                self._model, urdf_path, pin.GeometryType.COLLISION,
+                package_dirs=[package_dir],
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"URDF collision geometry unavailable: {type(exc).__name__}: {exc}"
+            ) from exc
+        pairs: list[tuple[int, int]] = []
+        parents = self._model.parents
+        for first in range(geometry.ngeoms):
+            joint_a = int(geometry.geometryObjects[first].parentJoint)
+            for second in range(first + 1, geometry.ngeoms):
+                joint_b = int(geometry.geometryObjects[second].parentJoint)
+                # Directly connected links and sibling jaws overlap by design at
+                # their joints; SRDF-style filtering removes those permanent
+                # contacts while retaining every non-adjacent pair.
+                adjacent = (
+                    joint_a == joint_b
+                    or int(parents[joint_a]) == joint_b
+                    or int(parents[joint_b]) == joint_a
+                    or int(parents[joint_a]) == int(parents[joint_b])
+                )
+                if not adjacent:
+                    pairs.append((first, second))
+        self._collision_model = geometry
+        self._collision_data = pin.GeometryData(geometry)
+        self._self_collision_pairs = pairs
+
+    def configure_collision_scene(
+        self,
+        boxes: list[dict[str, Any]],
+        *,
+        table_z_m: float,
+        payload_radius_m: float = 0.0,
+    ) -> dict[str, Any]:
+        """Install a static base-frame scene used by every subsequent motion."""
+        normalized: list[dict[str, Any]] = []
+        for index, item in enumerate(boxes):
+            center = np.asarray(item.get("center_m"), dtype=float)
+            size = np.asarray(item.get("size_m"), dtype=float)
+            if center.shape != (3,) or size.shape != (3,) \
+                    or not np.all(np.isfinite(center)) \
+                    or not np.all(np.isfinite(size)) \
+                    or np.any(size <= 0.0):
+                raise ValueError(f"invalid obstacle box {index}")
+            normalized.append({"center_m": center, "size_m": size})
+        self._ensure_collision_model()
+        self._collision_boxes = normalized
+        self._collision_table_z_m = float(table_z_m)
+        self._collision_payload_radius_m = float(np.clip(
+            payload_radius_m, 0.0, 0.12
+        ))
+        return {
+            "ok": True,
+            "obstacle_boxes": len(normalized),
+            "table_z_m": self._collision_table_z_m,
+            "payload_radius_m": self._collision_payload_radius_m,
+            "self_collision_pairs": len(self._self_collision_pairs),
+        }
+
+    def update_collision_payload(self, radius_m: float) -> dict[str, Any]:
+        if getattr(self, "_collision_model", None) is None:
+            return {"ok": False, "reason": "collision scene is not configured"}
+        self._collision_payload_radius_m = float(np.clip(radius_m, 0.0, 0.12))
+        return {"ok": True, "payload_radius_m": self._collision_payload_radius_m}
+
+    def clear_collision_scene(self) -> None:
+        self._collision_boxes = []
+        self._collision_table_z_m = None
+        self._collision_payload_radius_m = 0.0
+
+    @staticmethod
+    def _fcl_transform(rotation: Any, translation: Any) -> Any:
+        collision = _collision_library()
+        transform_type = getattr(
+            collision, "Transform3f", getattr(collision, "Transform3s")
+        )
+        return transform_type(
+            np.asarray(rotation, dtype=float),
+            np.asarray(translation, dtype=float),
+        )
+
+    def _configuration_collision(self, q6: np.ndarray) -> dict[str, Any]:
+        """Return the first collision and minimum inflated-scene clearance."""
+        if self._collision_model is None:
+            return {"collision": False, "minimum_clearance_m": None}
+        collision = _collision_library()
+        import pinocchio as pin
+
+        geometry = self._collision_model
+        geometry_data = self._collision_data
+        q = pad_q_for_model(
+            self._model, np.asarray(q6, dtype=float), controlled_joints=6
+        )
+        pin.forwardKinematics(self._model, self._data, q)
+        pin.updateFramePlacements(self._model, self._data)
+        pin.updateGeometryPlacements(
+            self._model, self._data, geometry, geometry_data, q
+        )
+        request = collision.CollisionRequest()
+
+        for first, second in self._self_collision_pairs:
+            result = collision.CollisionResult()
+            pose_a = geometry_data.oMg[first]
+            pose_b = geometry_data.oMg[second]
+            hit = collision.collide(
+                geometry.geometryObjects[first].geometry,
+                self._fcl_transform(pose_a.rotation, pose_a.translation),
+                geometry.geometryObjects[second].geometry,
+                self._fcl_transform(pose_b.rotation, pose_b.translation),
+                request, result,
+            )
+            if hit:
+                return {
+                    "collision": True,
+                    "kind": "self",
+                    "first": geometry.geometryObjects[first].name,
+                    "second": geometry.geometryObjects[second].name,
+                }
+
+        obstacle_geometries: list[tuple[str, Any, Any]] = []
+        for index, item in enumerate(self._collision_boxes):
+            obstacle_geometries.append((
+                f"scene_box_{index}",
+                collision.Box(*[float(v) for v in item["size_m"]]),
+                self._fcl_transform(np.eye(3), item["center_m"]),
+            ))
+        if self._collision_table_z_m is not None:
+            table_depth = 0.10
+            obstacle_geometries.append((
+                "table",
+                collision.Box(1.5, 1.5, table_depth),
+                self._fcl_transform(
+                    np.eye(3),
+                    [0.25, 0.0, self._collision_table_z_m - table_depth / 2.0],
+                ),
+            ))
+
+        minimum = float("inf")
+        distance_request = collision.DistanceRequest()
+        for geom_index, robot_object in enumerate(geometry.geometryObjects):
+            # The pedestal intersects the table by construction.  It is fixed and
+            # cannot sweep into tabletop clutter, so environmental checks begin at
+            # link2 while self-collision still covers all non-adjacent links.
+            if int(robot_object.parentJoint) <= 1:
+                continue
+            robot_pose = geometry_data.oMg[geom_index]
+            robot_tf = self._fcl_transform(
+                robot_pose.rotation, robot_pose.translation
+            )
+            for obstacle_name, obstacle_geometry, obstacle_tf in obstacle_geometries:
+                result = collision.CollisionResult()
+                hit = collision.collide(
+                    robot_object.geometry, robot_tf,
+                    obstacle_geometry, obstacle_tf,
+                    request, result,
+                )
+                if hit:
+                    return {
+                        "collision": True,
+                        "kind": "environment",
+                        "robot_link": robot_object.name,
+                        "obstacle": obstacle_name,
+                    }
+                distance_result = collision.DistanceResult()
+                distance = collision.distance(
+                    robot_object.geometry, robot_tf,
+                    obstacle_geometry, obstacle_tf,
+                    distance_request, distance_result,
+                )
+                minimum = min(minimum, float(distance))
+
+        if self._collision_payload_radius_m > 0.0:
+            payload = collision.Sphere(self._collision_payload_radius_m)
+            ee_pose = self._data.oMf[self._end_frame]
+            payload_tf = self._fcl_transform(
+                ee_pose.rotation, ee_pose.translation
+            )
+            for obstacle_name, obstacle_geometry, obstacle_tf in obstacle_geometries:
+                result = collision.CollisionResult()
+                hit = collision.collide(
+                    payload, payload_tf, obstacle_geometry, obstacle_tf,
+                    request, result,
+                )
+                if hit:
+                    return {
+                        "collision": True,
+                        "kind": "payload",
+                        "obstacle": obstacle_name,
+                    }
+                distance_result = collision.DistanceResult()
+                distance = collision.distance(
+                    payload, payload_tf, obstacle_geometry, obstacle_tf,
+                    distance_request, distance_result,
+                )
+                minimum = min(minimum, float(distance))
+        return {
+            "collision": False,
+            "minimum_clearance_m": None if not np.isfinite(minimum) else minimum,
+        }
+
+    def _assert_collision_free_joint_path(
+        self, joint_points: list[np.ndarray], *, label: str
+    ) -> dict[str, Any]:
+        if getattr(self, "_collision_model", None) is None or not joint_points:
+            return {"ok": True, "checked_configurations": 0,
+                    "minimum_clearance_m": None}
+        checked = 0
+        minimum = float("inf")
+        previous = np.asarray(joint_points[0], dtype=float)
+        for segment_index, target_raw in enumerate(joint_points):
+            target = np.asarray(target_raw, dtype=float)
+            max_step = float(np.max(np.abs(target - previous)))
+            samples = max(1, int(np.ceil(max_step / 0.035)))
+            for sample_index in range(1 if segment_index else 0, samples + 1):
+                fraction = sample_index / samples
+                candidate = previous + (target - previous) * fraction
+                detail = self._configuration_collision(candidate)
+                checked += 1
+                clearance = detail.get("minimum_clearance_m")
+                if clearance is not None:
+                    minimum = min(minimum, float(clearance))
+                if detail.get("collision"):
+                    raise RuntimeError(
+                        f"{label} collision at segment {segment_index}, "
+                        f"sample {sample_index}/{samples}: {detail}"
+                    )
+            previous = target
+        return {
+            "ok": True,
+            "checked_configurations": checked,
+            "minimum_clearance_m": None if not np.isfinite(minimum) else minimum,
+        }
 
     @property
     def connected(self) -> bool:
@@ -485,6 +746,11 @@ class LocalArm:
                     self._model, target_q, controlled_joints=6
                 )
                 previous_q = target_q
+            self._assert_collision_free_joint_path(
+                [np.asarray(q_live[:6], dtype=float)]
+                + [np.asarray(item["joints_rad"], dtype=float) for item in solved],
+                label="Cartesian path",
+            )
             return solved
 
     def move_pose(self, x: float, y: float, z: float, roll: float, pitch: float, yaw: float,
@@ -495,6 +761,9 @@ class LocalArm:
             start, _, _ = arm.get_state()
             start = np.asarray(start[:6], dtype=np.float64)
             target = np.asarray(solution["joints_rad"], dtype=np.float64)
+            self._assert_collision_free_joint_path(
+                [start, target], label="single-pose move"
+            )
             steps = max(12, int(max(0.8, duration) * 12))
             for i in range(1, steps + 1):
                 # Quintic minimum-jerk time scaling starts and ends each short
@@ -716,6 +985,13 @@ class LocalArm:
             arm, controller = self._require()
             q_start, _, _ = arm.get_state()
             q_start = np.asarray(q_start[:6], dtype=np.float64)
+            # Home is still a trajectory through the scene. Validate the direct
+            # joint-space return before sending it; on failure the caller's
+            # recovery path freezes and keeps motor holding torque enabled.
+            self._assert_collision_free_joint_path(
+                [q_start, np.zeros(6, dtype=np.float64)],
+                label="home path",
+            )
             # Recovery remains at the previously tested 2x ceiling even when a
             # normal trajectory opts into the faster 3x profile.
             max_vel = min(_joint_vlim(), 0.60)
