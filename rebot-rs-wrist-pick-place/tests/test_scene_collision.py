@@ -1,8 +1,11 @@
 import unittest
+from tempfile import TemporaryDirectory
 
 import numpy as np
 
-from arm_agent.scene_collision import build_scene_map, payload_radius_m
+from arm_agent.scene_collision import (
+    build_scene_map, payload_radius_m, save_scene_artifacts,
+)
 
 
 class SceneCollisionMapTest(unittest.TestCase):
@@ -49,6 +52,29 @@ class SceneCollisionMapTest(unittest.TestCase):
             }
         }
         self.assertEqual(payload_radius_m(context), 0.08)
+
+    def test_scene_map_exports_ply_and_interactive_recording(self):
+        depth = np.zeros((12, 12), dtype=np.float32)
+        depth[4:8, 4:8] = 200.0
+        scene = build_scene_map(
+            depth, (100.0, 100.0, 6.0, 6.0),
+            ee_xyz_m=(0.30, 0.0, 0.20),
+            camera_mapping_mm_per_m=-1000.0 * np.eye(3),
+            jaw_target_cam_mm=(0.0, 0.0, 100.0), table_z_m=0.0,
+            workspace_lo_m=(0.0, -0.5, 0.0),
+            workspace_hi_m=(0.6, 0.5, 0.6),
+            near_mm=100.0, far_mm=300.0, stride_px=1,
+            minimum_points_per_column=1,
+        )
+        with TemporaryDirectory() as directory:
+            artifacts = save_scene_artifacts(scene, directory)
+            with open(artifacts["ply"], encoding="utf-8") as exported:
+                text = exported.read()
+            self.assertIn("element vertex", text)
+            self.assertGreater(artifacts["ply_vertices"], len(scene.points_m))
+            if "rerun" in artifacts:
+                with open(artifacts["rerun"], "rb") as recording:
+                    self.assertGreater(len(recording.read()), 0)
 
     def test_rs_urdf_rejects_obstacle_at_home_gripper(self):
         from arm_agent.local_arm import LocalArm

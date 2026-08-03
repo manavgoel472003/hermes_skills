@@ -18,6 +18,7 @@ inflating every obstacle column before collision checking.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
@@ -49,6 +50,7 @@ class SceneMap:
     mapped_obstacle_points: int
     excluded_target_points: int
     closest_obstacle_m: float | None
+    points_m: tuple[tuple[float, float, float], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -211,6 +213,7 @@ def build_scene_map(
     return SceneMap(
         tuple(boxes), float(table_z_m), voxel, inflation,
         valid_depth_points, int(points.shape[0]), excluded_count, closest,
+        points_m=tuple(tuple(float(value) for value in point) for point in points),
     )
 
 
@@ -239,3 +242,111 @@ def payload_radius_m(context: dict[str, Any] | None) -> float:
     # Radius is capped because a long marker is carried lengthwise through the
     # gripper; using its complete length as a sphere would reject every route.
     return float(np.clip(max(widths) / 2000.0 + 0.015, 0.025, 0.080))
+
+
+def save_scene_artifacts(
+    scene: SceneMap, output_dir: str | Path, *, stem: str = "scene_collision"
+) -> dict[str, Any]:
+    """Save a universal PLY and, when available, an interactive Rerun recording."""
+    outdir = Path(output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    ply_path = outdir / f"{stem}.ply"
+    vertices: list[tuple[float, float, float, int, int, int]] = [
+        (x, y, z, 255, 170, 0) for x, y, z in scene.points_m
+    ]
+    # Red corners show the actual inflated collision volume rather than only the
+    # raw orange depth returns.
+    for box in scene.boxes:
+        center = np.asarray(box.center_m, dtype=float)
+        half = np.asarray(box.size_m, dtype=float) / 2.0
+        for sx in (-1.0, 1.0):
+            for sy in (-1.0, 1.0):
+                for sz in (-1.0, 1.0):
+                    point = center + half * np.array([sx, sy, sz])
+                    vertices.append((*[float(v) for v in point], 255, 40, 40))
+    # A sparse blue table grid gives the cloud an immediately readable reference.
+    if scene.boxes:
+        centres = np.asarray([box.center_m for box in scene.boxes], dtype=float)
+        x_min, y_min = np.min(centres[:, :2], axis=0) - 0.05
+        x_max, y_max = np.max(centres[:, :2], axis=0) + 0.05
+        for x in np.linspace(x_min, x_max, 12):
+            for y in np.linspace(y_min, y_max, 12):
+                vertices.append((float(x), float(y), scene.table_z_m,
+                                 50, 120, 255))
+    header = [
+        "ply", "format ascii 1.0", f"element vertex {len(vertices)}",
+        "property float x", "property float y", "property float z",
+        "property uchar red", "property uchar green", "property uchar blue",
+        "end_header",
+    ]
+    body = [
+        f"{x:.6f} {y:.6f} {z:.6f} {red} {green} {blue}"
+        for x, y, z, red, green, blue in vertices
+    ]
+    ply_path.write_text("\n".join([*header, *body]) + "\n")
+
+    result: dict[str, Any] = {
+        "ply": str(ply_path),
+        "ply_vertices": len(vertices),
+        "colors": {
+            "orange": "mapped RGB-D points",
+            "red": "inflated obstacle-box corners",
+            "blue": "calibrated table plane",
+        },
+    }
+    try:
+        import rerun as rr
+
+        rrd_path = outdir / f"{stem}.rrd"
+        rr.init("rebot_rs_collision_scene", spawn=False)
+        rr.save(str(rrd_path))
+        if scene.points_m:
+            rr.log(
+                "scene/mapped_depth",
+                rr.Points3D(scene.points_m, colors=[255, 170, 0], radii=0.002),
+                static=True,
+            )
+        if scene.boxes:
+            rr.log(
+                "scene/inflated_obstacles",
+                rr.Boxes3D(
+                    centers=[box.center_m for box in scene.boxes],
+                    sizes=[box.size_m for box in scene.boxes],
+                    colors=[255, 40, 40, 90],
+                    fill_mode="solid",
+                ),
+                static=True,
+            )
+        table_centers = np.asarray([
+            box.center_m for box in scene.boxes
+        ], dtype=float)
+        if table_centers.size:
+            lo = np.min(table_centers[:, :2], axis=0) - 0.05
+            hi = np.max(table_centers[:, :2], axis=0) + 0.05
+            rr.log(
+                "scene/table",
+                rr.Boxes3D(
+                    centers=[[(lo[0] + hi[0]) / 2.0,
+                              (lo[1] + hi[1]) / 2.0,
+                              scene.table_z_m - 0.0025]],
+                    sizes=[[hi[0] - lo[0], hi[1] - lo[1], 0.005]],
+                    colors=[50, 120, 255, 100], fill_mode="solid",
+                ),
+                static=True,
+            )
+        rr.log(
+            "robot_frame/axes",
+            rr.Arrows3D(
+                origins=[[0.0, 0.0, 0.0]] * 3,
+                vectors=[[0.10, 0.0, 0.0], [0.0, 0.10, 0.0],
+                         [0.0, 0.0, 0.10]],
+                colors=[[255, 0, 0], [0, 255, 0], [0, 100, 255]],
+                labels=["+X front", "+Y left", "+Z up"],
+            ),
+            static=True,
+        )
+        result["rerun"] = str(rrd_path)
+        result["open_command"] = f"rerun {rrd_path}"
+    except Exception as exc:  # noqa: BLE001 - PLY remains a valid artifact
+        result["rerun_error"] = f"{type(exc).__name__}: {exc}"
+    return result

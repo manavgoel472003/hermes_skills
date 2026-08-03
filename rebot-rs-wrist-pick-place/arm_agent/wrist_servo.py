@@ -2402,11 +2402,15 @@ def _install_scene_collision_map(
         [box.as_dict() for box in scene.boxes],
         table_z_m=float(table_z), payload_radius_m=payload_radius_m,
     )
+    artifacts = SC.save_scene_artifacts(
+        scene, DEBUG_DIR / "scene_collision", stem="latest_scene"
+    )
     detail = {
         **scene.as_dict(),
         "reason": configured.reason,
         "target_exclusion_boxes_px": [list(box) for box in exclusions],
         "payload_radius_mm": round(payload_radius_m * 1000.0, 1),
+        "visualization": artifacts,
     }
     return configured.ok, detail
 

@@ -33,6 +33,8 @@ pick/place workflow developed and hardware-tested through 2026-08-03.
   calibrated table, visible clutter, and an attached payload before motion.
 - Carry planning evaluates direct, X-first, Y-first, elevated, and lateral
   corridors and refuses motion when no complete collision-free route exists.
+- Every constructed map is exported as a colored PLY and an interactive Rerun
+  recording containing raw mapped points, inflated boxes, table, and base axes.
 
 ## Safety boundary
 
@@ -62,5 +64,5 @@ From the robot workspace:
 python -m unittest discover -s tests
 ```
 
-The robot-workspace snapshot passes 99 tests, including synthetic RGB-D mapping
+The robot-workspace snapshot passes 100 tests, including synthetic RGB-D mapping
 and RS-URDF collision tests.

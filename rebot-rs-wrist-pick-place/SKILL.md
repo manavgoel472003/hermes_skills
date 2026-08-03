@@ -134,6 +134,9 @@ Expected planning evidence:
 - `prevalidate_complete_approach` passes before approach motion begins.
 - `scene_collision_map` reports a nonzero obstacle-column count, 20 mm voxels,
   and 25 mm inflation before the first object-approach trajectory.
+- The result's `collision_scene.visualization.open_command` opens the interactive
+  `.rrd`; orange points are depth returns, red boxes are inflated collision
+  volumes, blue is the calibrated table, and RGB arrows are robot-frame axes.
 - Continuation IK is sampled for URDF self/table/scene collision; an attached
   payload envelope is installed before the first lift.
 - GPU semantic vision identifies and segments the complete object, while stable
