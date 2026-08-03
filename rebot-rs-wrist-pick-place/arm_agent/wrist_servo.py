@@ -2372,7 +2372,7 @@ def _install_scene_collision_map(
             exclusions.append(tuple(int(v) for v in detection.box))
             break
     try:
-        _, depth, intr = frame
+        color, depth, intr = frame
         scene = SC.build_scene_map(
             depth, intr,
             ee_xyz_m=A.ee_pos(),
@@ -2387,6 +2387,16 @@ def _install_scene_collision_map(
             stride_px=SCENE_COLLISION_STRIDE_PX,
             voxel_m=SCENE_COLLISION_VOXEL_M,
             inflation_m=SCENE_COLLISION_INFLATION_M,
+        )
+        view_points, view_colors = SC.build_dense_view_cloud(
+            color, depth, intr,
+            ee_xyz_m=A.ee_pos(),
+            camera_mapping_mm_per_m=np.asarray(camera_mapping, dtype=float),
+            jaw_target_cam_mm=target,
+            workspace_lo_m=(A.X_MIN, A.Y_MIN, A.Z_MIN),
+            workspace_hi_m=(A.X_MAX, A.Y_MAX, A.Z_MAX),
+            near_mm=float(WD.NEAR_MM), far_mm=float(WD.FAR_MM),
+            stride_px=1, voxel_m=0.002, bounds_margin_m=0.15,
         )
     except Exception as exc:  # noqa: BLE001
         return False, {
@@ -2403,8 +2413,10 @@ def _install_scene_collision_map(
         table_z_m=float(table_z), payload_radius_m=payload_radius_m,
     )
     artifacts = SC.save_scene_artifacts(
-        scene, DEBUG_DIR / "scene_collision", stem="latest_scene"
+        scene, DEBUG_DIR / "scene_collision", stem="latest_scene",
+        view_points_m=view_points, view_colors_rgb=view_colors,
     )
+    artifacts["dense_rgb_points"] = int(len(view_points))
     detail = {
         **scene.as_dict(),
         "reason": configured.reason,

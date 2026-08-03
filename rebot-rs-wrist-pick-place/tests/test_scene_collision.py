@@ -4,7 +4,8 @@ from tempfile import TemporaryDirectory
 import numpy as np
 
 from arm_agent.scene_collision import (
-    build_scene_map, payload_radius_m, save_scene_artifacts,
+    build_dense_view_cloud, build_scene_map, payload_radius_m,
+    save_scene_artifacts,
 )
 
 
@@ -75,6 +76,22 @@ class SceneCollisionMapTest(unittest.TestCase):
             if "rerun" in artifacts:
                 with open(artifacts["rerun"], "rb") as recording:
                     self.assertGreater(len(recording.read()), 0)
+
+    def test_dense_view_cloud_preserves_camera_rgb(self):
+        depth = np.full((12, 12), 200.0, dtype=np.float32)
+        color = np.zeros((12, 12, 3), dtype=np.uint8)
+        color[:] = [10, 20, 230]  # BGR input -> RGB output
+        points, colors = build_dense_view_cloud(
+            color, depth, (100.0, 100.0, 6.0, 6.0),
+            ee_xyz_m=(0.30, 0.0, 0.20),
+            camera_mapping_mm_per_m=-1000.0 * np.eye(3),
+            jaw_target_cam_mm=(0.0, 0.0, 100.0),
+            workspace_lo_m=(0.0, -0.5, 0.0),
+            workspace_hi_m=(0.6, 0.5, 0.6),
+            near_mm=100.0, far_mm=300.0, voxel_m=0.0015,
+        )
+        self.assertGreater(len(points), 20)
+        self.assertTrue(np.all(colors == np.array([230, 20, 10])))
 
     def test_rs_urdf_rejects_obstacle_at_home_gripper(self):
         from arm_agent.local_arm import LocalArm

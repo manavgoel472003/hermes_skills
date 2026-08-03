@@ -135,7 +135,8 @@ Expected planning evidence:
 - `scene_collision_map` reports a nonzero obstacle-column count, 20 mm voxels,
   and 25 mm inflation before the first object-approach trajectory.
 - The result's `collision_scene.visualization.open_command` opens the interactive
-  `.rrd`; orange points are depth returns, red boxes are inflated collision
+  `.rrd`; `scene/dense_rgb_cloud` is the refined camera-colored view,
+  `collision/raw_obstacle_returns` is orange, red boxes are inflated collision
   volumes, blue is the calibrated table, and RGB arrows are robot-frame axes.
 - Continuation IK is sampled for URDF self/table/scene collision; an attached
   payload envelope is installed before the first lift.
