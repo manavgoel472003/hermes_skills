@@ -1,21 +1,42 @@
 """Lazy in-process open-vocabulary vision for the wrist servo.
 
-The default backend is purpose-built Grounding DINO + SAM 2.1: DINO finds the
-named whole-object box and SAM turns that box into a contour.  LocateAnything is
-kept as an explicit compatibility fallback, but a 3B generative VLM is no longer
-the default detector for geometric grasping.
+SAM 3 provides unified text-prompted detection and instance masks. Grounding
+DINO + SAM 2.1 and LocateAnything remain explicit compatibility backends.
 """
 from __future__ import annotations
 
 import os
 import re
 import threading
+from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 
 _BOX = re.compile(r"<box><(\d+)><(\d+)><(\d+)><(\d+)></box>")
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _hf_token() -> str | None:
+    """Read a Hugging Face token without printing or exporting it."""
+    for name in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN",
+                 "HUGGING_FACE_HUB_TOKEN"):
+        value = os.getenv(name)
+        if value:
+            return value
+    try:
+        for raw in (ROOT / ".env").read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() in {"HF_TOKEN", "HUGGINGFACE_HUB_TOKEN",
+                               "HUGGING_FACE_HUB_TOKEN"}:
+                return value.strip().strip('"').strip("'") or None
+    except Exception:
+        pass
+    return None
 
 
 class LocateAnything:
@@ -109,7 +130,7 @@ class GroundedSam2:
             "REBOT_GROUNDING_DINO_MODEL", "IDEA-Research/grounding-dino-base"
         )
         self.segmenter_name = os.getenv(
-            "REBOT_SAM2_MODEL", "facebook/sam2.1-hiera-small"
+            "REBOT_SAM2_MODEL", "facebook/sam2.1-hiera-large"
         )
         self.device = os.getenv("REBOT_VISION_DEVICE", "cuda")
         self.box_threshold = float(os.getenv("REBOT_GROUNDING_BOX_THRESHOLD", "0.30"))
@@ -139,11 +160,11 @@ class GroundedSam2:
                 else torch.float32
             det_processor = AutoProcessor.from_pretrained(self.detector_name)
             detector = AutoModelForZeroShotObjectDetection.from_pretrained(
-                self.detector_name, torch_dtype=dtype, low_cpu_mem_usage=True
+                self.detector_name, dtype=dtype, low_cpu_mem_usage=True
             ).to(self.device).eval()
             sam_processor = Sam2Processor.from_pretrained(self.segmenter_name)
             segmenter = Sam2Model.from_pretrained(
-                self.segmenter_name, torch_dtype=dtype, low_cpu_mem_usage=True
+                self.segmenter_name, dtype=dtype, low_cpu_mem_usage=True
             ).to(self.device).eval()
             self._bundle = {
                 "torch": torch,
@@ -229,7 +250,116 @@ class GroundedSam2:
             return None
 
 
-_detector: LocateAnything | GroundedSam2 | None = None
+class Sam3TextSegmenter:
+    """SAM3 text-prompted instance detection and segmentation in one model."""
+
+    def __init__(self) -> None:
+        self.model_name = os.getenv("REBOT_SAM3_MODEL", "facebook/sam3")
+        self.device = os.getenv("REBOT_VISION_DEVICE", "cuda")
+        self.score_threshold = float(os.getenv("REBOT_SAM3_SCORE_THRESHOLD", "0.30"))
+        self.mask_threshold = float(os.getenv("REBOT_SAM3_MASK_THRESHOLD", "0.50"))
+        self._bundle: dict[str, Any] | None = None
+        self._lock = threading.Lock()
+        self._last_mask: np.ndarray | None = None
+        self._last_box: tuple[int, int, int, int] | None = None
+
+    def _load(self) -> dict[str, Any]:
+        with self._lock:
+            if self._bundle is not None:
+                return self._bundle
+            import torch
+            from transformers import Sam3Model, Sam3Processor
+
+            dtype_name = os.getenv("REBOT_VISION_DTYPE", "bfloat16").lower()
+            dtype = torch.bfloat16 if self.device == "cuda" and dtype_name in {
+                "bf16", "bfloat16"
+            } else torch.float32
+            token = _hf_token()
+            processor = Sam3Processor.from_pretrained(
+                self.model_name, token=token
+            )
+            model = Sam3Model.from_pretrained(
+                self.model_name, token=token, dtype=dtype,
+                low_cpu_mem_usage=True,
+            ).to(self.device).eval()
+            self._bundle = {
+                "torch": torch, "dtype": dtype,
+                "processor": processor, "model": model,
+            }
+            return self._bundle
+
+    def locate(self, frame_bgr: np.ndarray, description: str) -> dict[str, Any]:
+        height, width = frame_bgr.shape[:2]
+        self._last_mask = None
+        self._last_box = None
+        try:
+            b = self._load()
+            image = GroundedSam2._image(frame_bgr)
+            inputs = b["processor"](
+                images=image, text=description.strip(), return_tensors="pt"
+            ).to(self.device)
+            # Image tensors should match model weights; token tensors remain int.
+            for key in ("pixel_values",):
+                if key in inputs:
+                    inputs[key] = inputs[key].to(dtype=b["dtype"])
+            with b["torch"].inference_mode():
+                outputs = b["model"](**inputs)
+            result = b["processor"].post_process_instance_segmentation(
+                outputs,
+                threshold=self.score_threshold,
+                mask_threshold=self.mask_threshold,
+                target_sizes=[(height, width)],
+            )[0]
+            scores, boxes, masks = (
+                result.get("scores"), result.get("boxes"), result.get("masks")
+            )
+            if scores is None or boxes is None or masks is None or len(scores) == 0:
+                return {
+                    "ok": True, "found": False, "backend": "sam3",
+                    "image_size": [width, height],
+                }
+            best = int(b["torch"].argmax(scores).item())
+            box_values = boxes[best].detach().float().cpu().tolist()
+            x1, y1, x2, y2 = (
+                int(round(float(value))) for value in box_values
+            )
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+            if x2 <= x1 or y2 <= y1:
+                return {"ok": True, "found": False, "backend": "sam3",
+                        "image_size": [width, height]}
+            mask = masks[best].detach().cpu().numpy().astype(np.uint8) * 255
+            self._last_box = (x1, y1, x2, y2)
+            self._last_mask = mask
+            score = float(scores[best].detach().float().cpu())
+            return {
+                "ok": True, "found": True,
+                "box": [x1, y1, x2, y2],
+                "point_px": [(x1 + x2) / 2.0, (y1 + y2) / 2.0],
+                "confidence": score, "backend": "sam3",
+                "instances": int(len(scores)),
+                "image_size": [width, height],
+            }
+        except Exception as exc:
+            return {
+                "ok": False, "found": False, "error": str(exc),
+                "backend": "sam3", "image_size": [width, height],
+            }
+
+    def segment_box(self, frame_bgr: np.ndarray,
+                    box: tuple[int, int, int, int]) -> np.ndarray | None:
+        """Return the native mask from the immediately preceding text query."""
+        if self._last_mask is None or self._last_box is None:
+            return None
+        a = self._last_box
+        intersection = max(0, min(a[2], box[2]) - max(a[0], box[0])) * \
+            max(0, min(a[3], box[3]) - max(a[1], box[1]))
+        union = ((a[2] - a[0]) * (a[3] - a[1])
+                 + (box[2] - box[0]) * (box[3] - box[1]) - intersection)
+        return self._last_mask.copy() if intersection / max(1, union) >= 0.5 else None
+
+
+_detector: LocateAnything | GroundedSam2 | Sam3TextSegmenter | None = None
 
 
 def locate(frame_bgr: np.ndarray, description: str) -> dict[str, Any]:
@@ -242,7 +372,12 @@ def locate(frame_bgr: np.ndarray, description: str) -> dict[str, Any]:
     global _detector
     if _detector is None:
         backend = os.getenv("REBOT_VISION_BACKEND", "grounded_sam2").strip().lower()
-        _detector = LocateAnything() if backend == "locate_anything" else GroundedSam2()
+        if backend == "locate_anything":
+            _detector = LocateAnything()
+        elif backend == "sam3":
+            _detector = Sam3TextSegmenter()
+        else:
+            _detector = GroundedSam2()
     return _detector.locate(frame_bgr, description)
 
 

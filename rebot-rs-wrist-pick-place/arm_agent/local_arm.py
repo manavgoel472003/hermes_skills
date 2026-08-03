@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -44,8 +46,22 @@ GRIPPER_ALREADY_CLOSED_RAD = float(os.getenv("REBOT_GRIPPER_CLOSED_EPS_RAD", "")
 # the current position makes it apply kp * (large error) all at once, which snaps
 # the jaws and slams a burst of saturated commands onto the CAN bus. Walking the
 # target across in small increments gives the same end state, smoothly.
-GRIPPER_MOVE_S = float(os.getenv("REBOT_GRIPPER_MOVE_S", "") or 1.5)
-GRIPPER_STEP_S = float(os.getenv("REBOT_GRIPPER_STEP_S", "") or 0.05)
+def _bounded_timing_env(name: str, default: float, low: float, high: float) -> float:
+    try:
+        requested = float(os.getenv(name, "") or default)
+    except ValueError:
+        requested = default
+    return min(high, max(low, requested))
+
+
+# The fast grasp profile may shorten these ramps modestly, but hard floors keep
+# the jaws from receiving a large position error or a sparse sequence of targets.
+GRIPPER_MOVE_S = _bounded_timing_env(
+    "REBOT_GRIPPER_MOVE_S", 1.5, 0.8, 3.0
+)
+GRIPPER_STEP_S = _bounded_timing_env(
+    "REBOT_GRIPPER_STEP_S", 0.05, 0.025, 0.10
+)
 def _joint_vlim() -> float:
     """Per-joint velocity ceiling (rad/s). Read from arm_safe so the joint ceiling
     and the cartesian pace are tuned together; imported lazily because arm_safe
@@ -90,6 +106,90 @@ class LocalArm:
     def connected(self) -> bool:
         return self._arm is not None and self._controller is not None
 
+    @staticmethod
+    def _verify_can_bitrate(can_iface: str) -> int:
+        """Refuse an interface configured differently from this RS station."""
+        expected = int(os.getenv("REBOT_CAN_BITRATE", "1000000"))
+        try:
+            result = subprocess.run(
+                ["ip", "-details", "link", "show", can_iface],
+                check=True, capture_output=True, text=True, timeout=2.0,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"cannot verify CAN bitrate for {can_iface!r}: {exc}"
+            ) from exc
+        match = re.search(r"\bbitrate\s+(\d+)\b", result.stdout)
+        if match is None:
+            raise RuntimeError(
+                f"CAN interface {can_iface!r} does not report a bitrate"
+            )
+        actual = int(match.group(1))
+        if actual != expected:
+            raise RuntimeError(
+                f"CAN interface {can_iface!r} is configured at {actual} bit/s; "
+                f"this RS station requires {expected} bit/s. Refusing to send "
+                "motor traffic at the wrong bitrate"
+            )
+        return actual
+
+    @staticmethod
+    def _verified_feedback(
+        arm: RebotArm,
+        *,
+        attempts: int = 10,
+        interval_s: float = 0.05,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Require a real, fault-free reply from every configured motor.
+
+        ``RebotArm.get_state`` substitutes zero for a missing motor state. Those
+        zeros are useful for display but must never seed or authorize motion.
+        Inspect the underlying per-motor reply objects before accepting a state.
+        """
+        last_missing = list(arm.joint_names)
+        last_faults: list[str] = []
+        state = (np.zeros(len(last_missing)),) * 3
+        for _ in range(max(1, attempts)):
+            state = arm.get_state()
+            last_missing = []
+            last_faults = []
+            for name in arm.joint_names:
+                motor_state = arm._motor_map[name].get_state()
+                if motor_state is None:
+                    last_missing.append(name)
+                elif int(motor_state.status_code) != 0:
+                    last_faults.append(
+                        f"{name}=fault:{int(motor_state.status_code)}"
+                    )
+            arrays = tuple(np.asarray(values, dtype=np.float64)
+                           for values in state)
+            if not last_missing and not last_faults and all(
+                np.all(np.isfinite(values)) for values in arrays
+            ):
+                return arrays  # type: ignore[return-value]
+            time.sleep(max(0.0, interval_s))
+        detail = []
+        if last_missing:
+            detail.append("no feedback from " + ", ".join(last_missing))
+        if last_faults:
+            detail.append("motor faults " + ", ".join(last_faults))
+        if not detail:
+            detail.append("non-finite motor state")
+        raise RuntimeError(
+            "motor feedback unavailable; refusing to enable or move ("
+            + "; ".join(detail) + ")"
+        )
+
+    @staticmethod
+    def _enable_feedback_wake(arm: RebotArm) -> None:
+        """Wake RS feedback without starting a controller or sending a target."""
+        arm_group = arm.groups.get("arm")
+        if arm_group is None or not arm_group.enable():
+            raise RuntimeError(
+                "motor enable acknowledgement failed while waking feedback; "
+                "refusing to start position control"
+            )
+
     def connect(self) -> None:
         with self._lock:
             if self.connected:
@@ -104,18 +204,69 @@ class LocalArm:
                 raise RuntimeError(
                     f"CAN interface {can_iface!r} is down; bring it up before connecting the arm"
                 )
+            self._verify_can_bitrate(can_iface)
             cfg = ROOT / "reBotArm_control_py_fresh" / "config" / "rebotarm_rs.yaml"
             arm = RebotArm(str(cfg))
             # Read the physical pose before enabling the position controller.  A
             # fresh controller otherwise starts with a zero joint target, which is
             # unsafe for a diagnostic connection when the arm is parked elsewhere.
             arm.connect()
-            q, _, _ = arm.get_state()
+            enabled_for_feedback = False
+            try:
+                try:
+                    # Some RS drives answer while disabled, so prefer the fully
+                    # passive read first.
+                    q, _, _ = self._verified_feedback(
+                        arm, attempts=3, interval_s=0.05
+                    )
+                except RuntimeError:
+                    # RobStride feedback is not reliable while disabled. Enabling
+                    # sends no pose target; it only wakes the drives so their
+                    # measured state can be read. Position control is not started
+                    # until that measured pose has been latched below.
+                    self._enable_feedback_wake(arm)
+                    enabled_for_feedback = True
+                    q, _, _ = self._verified_feedback(arm)
+            except BaseException:
+                # No pose target or control loop has started. If the feedback wake
+                # succeeded partially, make one bounded disable attempt before
+                # closing the transport.
+                if enabled_for_feedback:
+                    try:
+                        arm.disable_all()
+                    except BaseException:
+                        pass
+                for ctrl in arm._ctrl_map.values():
+                    try:
+                        ctrl.shutdown()
+                    except BaseException:
+                        pass
+                    try:
+                        ctrl.close()
+                    except BaseException:
+                        pass
+                raise
             controller = RebotArmEndPose(arm)
             controller._q_target = np.asarray(q[:6], dtype=np.float64).copy()
             if len(q) > 6:
                 controller._gripper_target = float(q[6])
-            controller.start()
+            try:
+                controller.start()
+            except BaseException:
+                try:
+                    arm.stop_control_loop()
+                except BaseException:
+                    pass
+                for ctrl in arm._ctrl_map.values():
+                    try:
+                        ctrl.shutdown()
+                    except BaseException:
+                        pass
+                    try:
+                        ctrl.close()
+                    except BaseException:
+                        pass
+                raise
             # Keep local visual-servo moves deliberately slow even if the hardware
             # YAML has higher per-joint limits. Sourced from arm_safe so the joint
             # ceiling and the cartesian pace are tuned from one place.
@@ -346,7 +497,13 @@ class LocalArm:
             target = np.asarray(solution["joints_rad"], dtype=np.float64)
             steps = max(12, int(max(0.8, duration) * 12))
             for i in range(1, steps + 1):
-                controller._q_target = (start + (target - start) * (i / steps)).copy()
+                # Quintic minimum-jerk time scaling starts and ends each short
+                # Cartesian segment with zero target velocity and acceleration.
+                # This is materially smoother than the previous linear ramp,
+                # especially when the faster profile crosses many waypoints.
+                t = i / steps
+                blend = 10.0 * t**3 - 15.0 * t**4 + 6.0 * t**5
+                controller._q_target = (start + (target - start) * blend).copy()
                 time.sleep(duration / steps)
         deadline = time.monotonic() + max(3.0, duration)
         while time.monotonic() < deadline:
@@ -355,6 +512,88 @@ class LocalArm:
                 break
             time.sleep(0.1)
         return self.state()
+
+    def move_pose_path(
+        self,
+        poses: list[tuple[float, float, float, float, float, float]],
+        duration: float,
+        send_freq: float = 50.0,
+    ) -> dict[str, Any]:
+        """Execute a fully solved Cartesian chain as one minimum-jerk path.
+
+        ``solve_ik_path`` validates every pose, joint hard limit, and inter-pose
+        joint continuity before this method sends the first target.  The global
+        minimum-jerk clock then advances through the dense joint-space polyline
+        without stopping at each Cartesian waypoint.
+        """
+        if not poses:
+            return self.state()
+        solutions = self.solve_ik_path(poses)
+        targets = [
+            np.asarray(item["joints_rad"], dtype=np.float64)
+            for item in solutions
+        ]
+        with self._lock:
+            arm, controller = self._require()
+            q_live, _, _ = arm.get_state()
+            points = [np.asarray(q_live[:6], dtype=np.float64), *targets]
+            segment_lengths = np.asarray([
+                float(np.max(np.abs(b - a)))
+                for a, b in zip(points[:-1], points[1:])
+            ], dtype=np.float64)
+            cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+            path_length = float(cumulative[-1])
+            if path_length < 1e-8:
+                controller._q_target[:] = targets[-1]
+                return self.state()
+
+            # The peak derivative of 10s^3-15s^4+6s^5 is 1.875.  This lower
+            # bound keeps the commanded joint path within the configured velocity
+            # ceiling even at the midpoint of the minimum-jerk profile.
+            velocity_duration = 1.875 * path_length / max(1e-6, _joint_vlim())
+            total_s = max(float(duration), velocity_duration, 0.25)
+            count = max(2, int(np.ceil(total_s * max(20.0, send_freq))))
+            interval = total_s / count
+
+            for i in range(1, count + 1):
+                t = i / count
+                blend = 10.0 * t**3 - 15.0 * t**4 + 6.0 * t**5
+                distance = blend * path_length
+                segment = min(
+                    len(segment_lengths) - 1,
+                    int(np.searchsorted(cumulative, distance, side="right") - 1),
+                )
+                local_length = float(segment_lengths[segment])
+                local_fraction = (
+                    1.0 if local_length < 1e-10 else
+                    float(np.clip(
+                        (distance - cumulative[segment]) / local_length,
+                        0.0, 1.0,
+                    ))
+                )
+                controller._q_target[:] = (
+                    points[segment]
+                    + (points[segment + 1] - points[segment]) * local_fraction
+                )
+                time.sleep(interval)
+            controller._q_target[:] = targets[-1]
+
+        deadline = time.monotonic() + 3.0
+        state = self.state()
+        while time.monotonic() < deadline:
+            joint_error = max(
+                abs(a - b)
+                for a, b in zip(state["joints_rad"], targets[-1])
+            )
+            max_velocity = max(
+                (abs(float(v)) for v in state.get("joint_vel_rad_s", [])),
+                default=float("inf"),
+            )
+            if joint_error < 0.02 and max_velocity < 0.10:
+                break
+            time.sleep(0.05)
+            state = self.state()
+        return state
 
     def gripper(self, action: str, target_rad: float | None = None,
                 limit_rads: tuple[float, float] | None = None,
@@ -477,7 +716,9 @@ class LocalArm:
             arm, controller = self._require()
             q_start, _, _ = arm.get_state()
             q_start = np.asarray(q_start[:6], dtype=np.float64)
-            max_vel = _joint_vlim()
+            # Recovery remains at the previously tested 2x ceiling even when a
+            # normal trajectory opts into the faster 3x profile.
+            max_vel = min(_joint_vlim(), 0.60)
             # safe_home uses a minimum-jerk trajectory lasting
             # 2*max_joint_error/max_vel. Its old fixed 15 s timeout was shorter
             # than a valid scan->home path at the deliberate 0.25 rad/s limit.

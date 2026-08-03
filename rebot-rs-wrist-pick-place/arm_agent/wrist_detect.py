@@ -13,6 +13,7 @@ to a plausible grasp range removes both before contours are ever considered.
 from __future__ import annotations
 
 import os
+import itertools
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -231,15 +232,34 @@ def median_depth(depth: np.ndarray, u: float, v: float, r: int = 6) -> float:
     return float(np.median(valid)) if valid.size else 0.0
 
 
-def color_of(description: str) -> str | None:
-    """Pull a known colour word out of a free-text object name, or None."""
-    for word in str(description).lower().replace("-", " ").split():
+def colors_of(description: str) -> list[str]:
+    """Return every distinct known colour in a free-text object name.
+
+    Slash-separated alternatives such as ``red/pink marker`` are common operator
+    descriptions.  Treating that as one token silently bypassed stable colour
+    tracking and made the changing semantic object box drive camera calibration.
+    """
+    normalized = str(description).lower()
+    for separator in ("-", "/", "|", "+"):
+        normalized = normalized.replace(separator, " ")
+    found: list[str] = []
+    for word in normalized.split():
         word = word.strip(",.'\"")
         if word in COLORS:
-            return word
-        if word in _ALIASES:
-            return _ALIASES[word]
-    return None
+            name = word
+        elif word in _ALIASES:
+            name = _ALIASES[word]
+        else:
+            continue
+        if name not in found:
+            found.append(name)
+    return found
+
+
+def color_of(description: str) -> str | None:
+    """Pull the first known colour word out of a free-text object name, or None."""
+    names = colors_of(description)
+    return names[0] if names else None
 
 
 def depth_gate(depth: np.ndarray, near_mm: float = NEAR_MM, far_mm: float = FAR_MM) -> np.ndarray:
@@ -255,16 +275,25 @@ def color_mask(color_bgr: np.ndarray, name: str) -> np.ndarray:
     return mask
 
 
-def detect_color(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, name: str,
-                 *, near_mm: float = NEAR_MM, far_mm: float = FAR_MM,
-                 min_area_px: float = MIN_AREA_PX) -> Detection | None:
-    """Largest depth-gated blob of the named colour, or None."""
-    if name not in COLORS:
-        return None
-    mask = cv2.bitwise_and(color_mask(color_bgr, name),
-                           depth_gate(depth_mm, near_mm, far_mm).astype(np.uint8) * 255)
+def _detect_mask(
+    mask: np.ndarray,
+    depth_mm: np.ndarray,
+    intr: Intrinsics,
+    source: str,
+    *,
+    near_mm: float,
+    far_mm: float,
+    min_area_px: float,
+    close_kernel: int = 7,
+) -> Detection | None:
+    mask = cv2.bitwise_and(
+        mask, depth_gate(depth_mm, near_mm, far_mm).astype(np.uint8) * 255
+    )
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE,
+        np.ones((max(3, close_kernel), max(3, close_kernel)), np.uint8),
+    )
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours = [c for c in contours if cv2.contourArea(c) >= min_area_px]
     if not contours:
@@ -290,10 +319,296 @@ def detect_color(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, 
     min_mm, max_mm = _metric_size(rw, rh, z, intr)
     geometry = rect_geometry(best)
     return Detection(box=(x, y, x + w, y + h), uv=(float(u), float(v)), z_mm=z,
-                     p_cam_mm=deproject(u, v, z, intr), source=f"color:{name}",
+                     p_cam_mm=deproject(u, v, z, intr), source=source,
                      area_px=float(cv2.contourArea(best)),
                      min_width_mm=min_mm, max_width_mm=max_mm,
                      info={"depth_px": int(values.size), **geometry})
+
+
+def detect_color(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, name: str,
+                 *, near_mm: float = NEAR_MM, far_mm: float = FAR_MM,
+                 min_area_px: float = MIN_AREA_PX) -> Detection | None:
+    """Largest depth-gated blob of the named colour, or None."""
+    if name not in COLORS:
+        return None
+    return _detect_mask(
+        color_mask(color_bgr, name), depth_mm, intr, f"color:{name}",
+        near_mm=near_mm, far_mm=far_mm, min_area_px=min_area_px,
+    )
+
+
+def detect_color_union(
+    color_bgr: np.ndarray,
+    depth_mm: np.ndarray,
+    intr: Intrinsics,
+    names: list[str],
+    *,
+    near_mm: float = NEAR_MM,
+    far_mm: float = FAR_MM,
+    min_area_px: float = MIN_AREA_PX,
+) -> Detection | None:
+    """Treat a multi-colour description as one physical visual feature.
+
+    Returning the first named colour made ``green and yellow sponge`` alternate
+    between different patches as perspective changed. Their union is a much more
+    stable identifier and remains depth-gated to the grasp workspace.
+    """
+    valid_names = [name for name in names if name in COLORS]
+    if not valid_names:
+        return None
+    mask = np.zeros(color_bgr.shape[:2], dtype=np.uint8)
+    for name in valid_names:
+        mask = cv2.bitwise_or(mask, color_mask(color_bgr, name))
+    return _detect_mask(
+        mask, depth_mm, intr, f"color:{'+'.join(valid_names)}",
+        near_mm=near_mm, far_mm=far_mm, min_area_px=min_area_px,
+        close_kernel=11,
+    )
+
+
+def _requires_all_colors(description: str) -> bool:
+    """True for descriptions such as ``green and yellow sponge``.
+
+    A slash normally means alternatives (``red/pink marker``), while ``and``
+    describes a compound appearance.  Mixing those meanings caused the largest
+    single green object to satisfy a green-and-yellow request.
+    """
+    words = str(description).lower().replace("-", " ").split()
+    return "and" in words and len(colors_of(description)) > 1
+
+
+def _box_has_all_colors(
+    color_bgr: np.ndarray,
+    box: tuple[int, int, int, int],
+    names: list[str],
+    *,
+    min_pixels: int = 25,
+) -> bool:
+    """Validate that every requested colour occurs inside a semantic box."""
+    h, w = color_bgr.shape[:2]
+    x1, y1, x2, y2 = box
+    pad_x = max(3, int(0.08 * max(1, x2 - x1)))
+    pad_y = max(3, int(0.08 * max(1, y2 - y1)))
+    x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+    x2, y2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
+    return all(
+        int(np.count_nonzero(color_mask(color_bgr, name)[y1:y2, x1:x2]))
+        >= min_pixels
+        for name in names
+    )
+
+
+def detect_color_conjunction(
+    color_bgr: np.ndarray,
+    depth_mm: np.ndarray,
+    intr: Intrinsics,
+    names: list[str],
+    *,
+    near_mm: float = NEAR_MM,
+    far_mm: float = FAR_MM,
+    min_area_px: float = MIN_AREA_PX,
+) -> Detection | None:
+    """Find one nearby RGB-D object containing *every* named colour.
+
+    Components need not touch in the image—the coloured faces of a sponge can
+    be separated by foam or glare—but they must be close in metric 3-D and at a
+    similar depth.  Consequently a standalone green marker cannot win a
+    ``green and yellow sponge`` request.
+    """
+    valid_names = [name for name in names if name in COLORS]
+    if len(valid_names) < 2:
+        return None
+    valid_depth = depth_gate(depth_mm, near_mm, far_mm)
+    groups: list[list[dict[str, Any]]] = []
+    component_min = max(25.0, 0.20 * float(min_area_px))
+    for name in valid_names:
+        mask = cv2.bitwise_and(
+            color_mask(color_bgr, name), valid_depth.astype(np.uint8) * 255
+        )
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        components: list[dict[str, Any]] = []
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < component_min:
+                continue
+            blob = np.zeros(mask.shape, np.uint8)
+            cv2.drawContours(blob, [contour], -1, 255, -1)
+            values = depth_mm[(blob > 0) & valid_depth]
+            moments = cv2.moments(contour)
+            if values.size < 8 or moments["m00"] <= 0:
+                continue
+            u = float(moments["m10"] / moments["m00"])
+            v = float(moments["m01"] / moments["m00"])
+            z = float(np.median(values))
+            components.append({
+                "contour": contour, "area": area, "uv": (u, v), "z": z,
+                "p": np.asarray(deproject(u, v, z, intr), dtype=float),
+            })
+        if not components:
+            return None
+        groups.append(components)
+
+    max_separation_mm = _env_float("REBOT_COLOR_CONJUNCTION_MAX_SEPARATION_MM", 90.0)
+    max_depth_delta_mm = _env_float("REBOT_COLOR_CONJUNCTION_MAX_DEPTH_DELTA_MM", 55.0)
+    candidates: list[tuple[float, tuple[dict[str, Any], ...]]] = []
+    for combination in itertools.product(*groups):
+        distances = [
+            float(np.linalg.norm(a["p"] - b["p"]))
+            for a, b in itertools.combinations(combination, 2)
+        ]
+        depth_deltas = [
+            abs(float(a["z"]) - float(b["z"]))
+            for a, b in itertools.combinations(combination, 2)
+        ]
+        if max(distances, default=0.0) > max_separation_mm:
+            continue
+        if max(depth_deltas, default=0.0) > max_depth_delta_mm:
+            continue
+        total_area = sum(float(item["area"]) for item in combination)
+        score = total_area / (1.0 + max(distances, default=0.0))
+        candidates.append((score, combination))
+    if not candidates:
+        return None
+    _, chosen = max(candidates, key=lambda item: item[0])
+    component_mask = np.zeros(depth_mm.shape, np.uint8)
+    all_points = []
+    for item in chosen:
+        cv2.drawContours(component_mask, [item["contour"]], -1, 255, -1)
+        all_points.append(item["contour"])
+    points = np.concatenate(all_points, axis=0)
+    hull = cv2.convexHull(points)
+    values = depth_mm[(component_mask > 0) & valid_depth]
+    moments = cv2.moments(component_mask, binaryImage=True)
+    if values.size < 10 or moments["m00"] <= 0:
+        return None
+    u = float(moments["m10"] / moments["m00"])
+    v = float(moments["m01"] / moments["m00"])
+    z = float(np.median(values))
+    x, y, bw, bh = cv2.boundingRect(hull)
+    (_, _), (rw, rh), _ = cv2.minAreaRect(hull)
+    min_mm, max_mm = _metric_size(rw, rh, z, intr)
+    geometry = rect_geometry(hull)
+    return Detection(
+        box=(x, y, x + bw, y + bh), uv=(u, v), z_mm=z,
+        p_cam_mm=deproject(u, v, z, intr),
+        source=f"color:{'&'.join(valid_names)}",
+        area_px=sum(float(item["area"]) for item in chosen),
+        min_width_mm=min_mm, max_width_mm=max_mm,
+        info={
+            "required_colors": valid_names,
+            "component_centres_uv": [
+                [round(item["uv"][0], 1), round(item["uv"][1], 1)]
+                for item in chosen
+            ],
+            "max_component_separation_mm": round(max(
+                (float(np.linalg.norm(a["p"] - b["p"]))
+                 for a, b in itertools.combinations(chosen, 2)),
+                default=0.0,
+            ), 1),
+            **geometry,
+        },
+    )
+
+
+def track_detection_flow(
+    before: tuple[np.ndarray, np.ndarray, Intrinsics],
+    after: tuple[np.ndarray, np.ndarray, Intrinsics],
+    detection: Detection,
+    description: str,
+) -> Detection | None:
+    """Track one detected instance across a short arm jog using RGB-D flow.
+
+    This is an association layer, not a replacement detector. Forward/backward
+    Lucas-Kanade consistency rejects drifting points, while the initial object
+    colours and depth keep features off the table/background.
+    """
+    color0, depth0, _intr0 = before
+    color1, depth1, intr1 = after
+    gray0 = cv2.cvtColor(color0, cv2.COLOR_BGR2GRAY)
+    gray1 = cv2.cvtColor(color1, cv2.COLOR_BGR2GRAY)
+    h, w = gray0.shape
+    x1, y1, x2, y2 = detection.box
+    pad_x = max(4, int(0.12 * max(1, x2 - x1)))
+    pad_y = max(4, int(0.12 * max(1, y2 - y1)))
+    roi = np.zeros((h, w), dtype=np.uint8)
+    roi[max(0, y1 - pad_y):min(h, y2 + pad_y),
+        max(0, x1 - pad_x):min(w, x2 + pad_x)] = 255
+    depth_seed = (
+        (depth0 > max(NEAR_MM, detection.z_mm - 45.0))
+        & (depth0 < min(FAR_MM, detection.z_mm + 45.0))
+    ).astype(np.uint8) * 255
+    mask = cv2.bitwise_and(roi, depth_seed)
+    names = colors_of(description)
+    if names:
+        color_union = np.zeros_like(mask)
+        for name in names:
+            color_union = cv2.bitwise_or(color_union, color_mask(color0, name))
+        colored = cv2.bitwise_and(mask, color_union)
+        if int(np.count_nonzero(colored)) >= 30:
+            mask = colored
+    points0 = cv2.goodFeaturesToTrack(
+        gray0, maxCorners=80, qualityLevel=0.01, minDistance=4,
+        mask=mask, blockSize=5,
+    )
+    if points0 is None or len(points0) < 5:
+        return None
+    lk = dict(winSize=(31, 31), maxLevel=3,
+              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                        30, 0.01))
+    points1, status1, _ = cv2.calcOpticalFlowPyrLK(gray0, gray1, points0, None, **lk)
+    if points1 is None or status1 is None:
+        return None
+    points_back, status2, _ = cv2.calcOpticalFlowPyrLK(
+        gray1, gray0, points1, None, **lk
+    )
+    if points_back is None or status2 is None:
+        return None
+    p0 = points0.reshape(-1, 2)
+    p1 = points1.reshape(-1, 2)
+    pb = points_back.reshape(-1, 2)
+    good = (status1.reshape(-1) > 0) & (status2.reshape(-1) > 0)
+    good &= np.linalg.norm(pb - p0, axis=1) <= 1.5
+    good &= (p1[:, 0] >= 0) & (p1[:, 0] < w) \
+        & (p1[:, 1] >= 0) & (p1[:, 1] < h)
+    if int(np.count_nonzero(good)) < 4:
+        return None
+    shifts = p1[good] - p0[good]
+    median_shift = np.median(shifts, axis=0)
+    residual = np.linalg.norm(shifts - median_shift, axis=1)
+    mad = float(np.median(residual))
+    consistent = residual <= max(1.5, 3.0 * mad)
+    if int(np.count_nonzero(consistent)) < 4:
+        return None
+    p1_good = p1[good][consistent]
+    tracked_u = float(detection.uv[0] + np.median(shifts[consistent, 0]))
+    tracked_v = float(detection.uv[1] + np.median(shifts[consistent, 1]))
+    us = np.clip(np.rint(p1_good[:, 0]).astype(int), 0, w - 1)
+    vs = np.clip(np.rint(p1_good[:, 1]).astype(int), 0, h - 1)
+    depths = depth1[vs, us]
+    depths = depths[
+        (depths > max(NEAR_MM, detection.z_mm - 70.0))
+        & (depths < min(FAR_MM, detection.z_mm + 70.0))
+    ]
+    if depths.size < 3:
+        return None
+    z = float(np.median(depths))
+    dx, dy = float(median_shift[0]), float(median_shift[1])
+    bx1 = int(np.clip(round(x1 + dx), 0, w - 1))
+    by1 = int(np.clip(round(y1 + dy), 0, h - 1))
+    bx2 = int(np.clip(round(x2 + dx), bx1 + 1, w))
+    by2 = int(np.clip(round(y2 + dy), by1 + 1, h))
+    return Detection(
+        box=(bx1, by1, bx2, by2), uv=(tracked_u, tracked_v), z_mm=z,
+        p_cam_mm=deproject(tracked_u, tracked_v, z, intr1),
+        source=f"flow:{detection.source}", area_px=detection.area_px,
+        min_width_mm=detection.min_width_mm,
+        max_width_mm=detection.max_width_mm,
+        info={**detection.info, "flow_points": int(np.count_nonzero(consistent)),
+              "flow_shift_px": [round(dx, 2), round(dy, 2)]},
+    )
 
 
 # Words that mean "whatever is there", rather than naming a particular object.
@@ -705,6 +1020,8 @@ def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, descri
     vision_primary = os.getenv(
         "REBOT_VISION_PRIMARY", "0"
     ).strip().lower() in {"1", "true", "yes", "on"}
+    names = colors_of(description)
+    require_all_colors = _requires_all_colors(description)
     if allow_vlm and vision_enabled and vision_primary:
         found = detect_vlm(
             color_bgr, depth_mm, intr, description,
@@ -712,16 +1029,62 @@ def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, descri
         )
         why["semantic_result"] = found.source if found else "not found"
         if found is not None:
+            if require_all_colors:
+                # Semantic grounding understands the noun (for example,
+                # ``sponge``); HSV does not reliably see every named colour on
+                # a shaded or edge-on face. Keep this as explainable telemetry,
+                # not a veto over a stable semantic-primary result.
+                why["semantic_color_check"] = (
+                    "all requested colours visible in box"
+                    if _box_has_all_colors(color_bgr, found.box, names)
+                    else "incomplete under HSV; accepted semantic noun match"
+                )
             why["used"] = found.source
             return found, why
-    name = color_of(description)
-    why["color_word"] = name
-    if name is not None:
-        found = detect_color(color_bgr, depth_mm, intr, name, near_mm=near_mm, far_mm=far_mm)
+    why["color_word"] = names[0] if len(names) == 1 else None
+    why["color_words"] = names
+    if names:
+        found = (
+            detect_color_conjunction(
+                color_bgr, depth_mm, intr, names,
+                near_mm=near_mm, far_mm=far_mm,
+            ) if require_all_colors else
+            detect_color_union(
+                color_bgr, depth_mm, intr, names,
+                near_mm=near_mm, far_mm=far_mm,
+            ) if len(names) > 1 else None
+        )
         if found is not None:
             why["used"] = found.source
             return found, why
-        why["color_result"] = "no depth-gated blob of that colour"
+        if require_all_colors:
+            why["color_result"] = (
+                "no nearby RGB-D object contained every requested colour"
+            )
+            # Never degrade a conjunction to one colour: that is precisely how
+            # a green marker was mistaken for a green-and-yellow sponge.
+            if not allow_vlm:
+                why["used"] = None
+                return None, why
+            found = detect_vlm(color_bgr, depth_mm, intr, description,
+                               near_mm=near_mm, far_mm=far_mm)
+            if found is not None:
+                why["fallback_semantic_color_check"] = (
+                    "all requested colours visible in box"
+                    if _box_has_all_colors(color_bgr, found.box, names)
+                    else "incomplete under HSV; accepted semantic noun match"
+                )
+            why["used"] = found.source if found else None
+            return found, why
+        for name in names:
+            found = detect_color(
+                color_bgr, depth_mm, intr, name,
+                near_mm=near_mm, far_mm=far_mm,
+            )
+            if found is not None:
+                why["used"] = found.source
+                return found, why
+        why["color_result"] = "no depth-gated blob of the requested colour(s)"
     if not allow_vlm:
         why["used"] = None
         return None, why

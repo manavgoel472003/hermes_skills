@@ -80,7 +80,7 @@ REBOT_ENABLE_LOCATE_ANYTHING=1 \
 REBOT_VISION_BACKEND=grounded_sam2 \
 REBOT_VISION_PRIMARY=0 \
 REBOT_GROUNDING_DINO_MODEL=IDEA-Research/grounding-dino-base \
-REBOT_SAM2_MODEL=facebook/sam2.1-hiera-small \
+REBOT_SAM2_MODEL=facebook/sam2.1-hiera-large \
 REBOT_VISION_DTYPE=float32 \
 REBOT_WS_X_MAX=0.490 \
 REBOT_WRIST_NEAR_MM=60 \
@@ -88,8 +88,11 @@ REBOT_WRIST_FAR_MM=600 \
 REBOT_WRIST_PICK_CLOSER_MM=4 \
 REBOT_WRIST_PICK_TARGET_Y_OFFSET_MM=8 \
 REBOT_WRIST_PICK_TARGET_TOL_MM=20 \
+REBOT_WRIST_PICK_MAX_CORRECTIONS=2 \
+REBOT_WRIST_PICK_MAX_CORRECTION_M=0.012 \
+REBOT_WRIST_FINAL_ALIGN_GAIN=0.85 \
 REBOT_WRIST_RIGID_FIT_MAX_ERROR=0.15 \
-REBOT_DYNAMIC_SLOT_TOL_MM=6 \
+REBOT_DYNAMIC_SLOT_TOL_MM=8 \
 REBOT_DYNAMIC_REMEASURE_MAX_DELTA_MM=6 \
 REBOT_DYNAMIC_CLOSE_STEP_DEG=15 \
 REBOT_WRIST_PICK_OPEN_BEFORE_END_M=0.040 \
@@ -106,10 +109,12 @@ REBOT_DYNAMIC_HOLD_TOL_MM=6 \
 REBOT_DYNAMIC_RETRY_CLOSE_DEG=5 \
 REBOT_DYNAMIC_MAX_RETRIES=3 \
 REBOT_LOCAL_IK_POS_TOL_M=0.004 \
-REBOT_ARM_SPEED_M_S=0.018 \
-REBOT_ARM_MIN_MOVE_S=0.833333 \
-REBOT_ARM_ANGULAR_SPEED_RAD_S=0.18 \
-REBOT_JOINT_VLIM=0.30 \
+REBOT_ARM_SPEED_M_S=0.054 \
+REBOT_ARM_MIN_MOVE_S=0.277778 \
+REBOT_ARM_ANGULAR_SPEED_RAD_S=0.54 \
+REBOT_JOINT_VLIM=0.90 \
+REBOT_GRIPPER_MOVE_S=1.10 \
+REBOT_GRIPPER_STEP_S=0.04 \
 /home/manav/miniconda3/envs/rebot_rs/bin/python \
   -m arm_agent.wrist_servo \
   --fixed-pick-place "blue marker with white body" --run --live
@@ -123,9 +128,13 @@ Expected planning evidence:
 - GPU semantic vision identifies and segments the complete object, while stable
   color/depth tracking—not a changing whole-object box—drives the Jacobian.
 - `fit_rigid_camera_geometry` reports an error no greater than 0.15.
+- Hardware path logs report `continuous_minimum_jerk_arrived`; the Cartesian
+  safety waypoints remain prevalidated but are traversed continuously.
 - `dynamic_endpoint_width` confirms the between-jaws measurement.
 - `image_controlled_slow_close` reaches the bounded image-derived aperture.
-- No camera checkpoint or camera steering alters the preplanned trajectory.
+- No camera checkpoint alters the long preplanned approach. A final visible miss
+  may trigger only the bounded, separately IK-validated open-jaw retry described
+  above.
 - Post-lift vision follows the semantic body grasp region rather than a cap that
   may pivot while held.
 - The object is released over the taught drop zone and home is verified.

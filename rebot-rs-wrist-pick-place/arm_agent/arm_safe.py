@@ -96,16 +96,33 @@ DEF_PITCH = 1.30                    # wrist pitched down
 DEF_YAW = 0.0                       # wrist not rotated -> stable, predictable
 
 # ---- motion pace ------------------------------------------------------------------
-# Deliberately slow, but never jerky: each move is still a smooth IK + joint-space
-# interpolation, we simply give it a longer duration so the same path is traversed
-# gently. TOOL_SPEED is the cartesian pace; MIN_MOVE_S keeps very short steps (the
-# 9 mm servo steps) from becoming brief twitches.
-TOOL_SPEED_M_S = float(os.getenv("REBOT_ARM_SPEED_M_S", "") or 0.015)
-MIN_MOVE_S = float(os.getenv("REBOT_ARM_MIN_MOVE_S", "") or 1.0)
-TOOL_ANGULAR_SPEED_RAD_S = float(os.getenv("REBOT_ARM_ANGULAR_SPEED_RAD_S", "") or 0.15)
+# Every arm-speed input is bounded here, not merely documented in a shell command.
+# This permits a substantially faster pick cycle while preventing a typo from
+# bypassing the tested fast-safe envelope.  The gripper has separate timing in
+# local_arm.py and is intentionally unaffected by these values.
+def _bounded_motion_env(name: str, default: float, low: float, high: float) -> float:
+    try:
+        requested = float(os.getenv(name, "") or default)
+    except ValueError:
+        requested = default
+    return min(high, max(low, requested))
+
+
+TOOL_SPEED_M_S = _bounded_motion_env(
+    "REBOT_ARM_SPEED_M_S", 0.015, 0.005, 0.060
+)
+# Short waypoints still receive enough time for smooth target interpolation.
+MIN_MOVE_S = _bounded_motion_env(
+    "REBOT_ARM_MIN_MOVE_S", 1.0, 0.277778, 3.0
+)
+TOOL_ANGULAR_SPEED_RAD_S = _bounded_motion_env(
+    "REBOT_ARM_ANGULAR_SPEED_RAD_S", 0.15, 0.05, 0.60
+)
 ORIENTATION_TOL_RAD = float(os.getenv("REBOT_ARM_ORIENTATION_TOL_RAD", "") or 0.03)
 # Per-joint velocity ceiling handed to the RS position controller (rad/s).
-JOINT_VLIM = float(os.getenv("REBOT_JOINT_VLIM", "") or 0.25)
+JOINT_VLIM = _bounded_motion_env(
+    "REBOT_JOINT_VLIM", 0.25, 0.10, 0.90
+)
 
 
 def _move_duration(dx: float, dy: float, dz: float) -> float:
@@ -339,6 +356,77 @@ def safe_move(x, y, z, *, roll: float | None = None, pitch: float | None = None,
     reached = tuple(ee_pos())
     off = max(abs(reached[0] - x), abs(reached[1] - y), abs(reached[2] - z))
     return MoveResult(off < 0.01, "arrived" if off < 0.01 else f"arrived_off {off*1000:.0f}mm", reached)
+
+
+def safe_move_path(
+    waypoints: list[tuple[float, float, float]],
+    *,
+    roll: float,
+    pitch: float,
+    yaw: float,
+) -> MoveResult:
+    """Preflight and execute one continuous local minimum-jerk waypoint chain."""
+    if not waypoints:
+        return MoveResult(True, "empty_path")
+    local = _local_arm()
+    if local is None:
+        return MoveResult(False, "continuous_path_requires_local_backend")
+    try:
+        current = tuple(float(v) for v in ee_pos())
+    except Exception as exc:
+        return MoveResult(False, f"state_read_failed {exc}")
+    previous = current
+    total_distance = 0.0
+    eps = 1e-5
+    for index, waypoint in enumerate(waypoints, 1):
+        if not in_bounds(*waypoint):
+            return MoveResult(False, f"path waypoint {index} out_of_bounds")
+        delta = tuple(float(a - b) for a, b in zip(waypoint, previous))
+        if abs(delta[0]) > MAX_XY_STEP + eps or \
+                abs(delta[1]) > MAX_XY_STEP + eps or \
+                abs(delta[2]) > MAX_Z_STEP + eps:
+            return MoveResult(
+                False,
+                f"path waypoint {index} step_too_large "
+                f"dx={delta[0]*1000:.1f} dy={delta[1]*1000:.1f} "
+                f"dz={delta[2]*1000:.1f}mm",
+            )
+        total_distance += sum(value * value for value in delta) ** 0.5
+        previous = waypoint
+
+    # Preserve the established per-waypoint pace while removing each intermediate
+    # stop. The backend may lengthen this further to honor the joint velocity cap.
+    duration = max(
+        total_distance / max(1e-6, TOOL_SPEED_M_S),
+        len(waypoints) * MIN_MOVE_S,
+    )
+    poses = [
+        (float(x), float(y), float(z), float(roll), float(pitch), float(yaw))
+        for x, y, z in waypoints
+    ]
+    try:
+        state = local.move_pose_path(poses, duration=duration, send_freq=50.0)
+    except Exception as exc:
+        return MoveResult(False, f"continuous_path_error {exc}")
+    endpoint = waypoints[-1]
+    reached = tuple(float(v) for v in state["end_effector"]["position_m"])
+    reached_rpy = tuple(float(v) for v in state["end_effector"]["rpy_rad"])
+    off = max(abs(a - b) for a, b in zip(reached, endpoint))
+    angular_off = max(abs(a - b) for a, b in zip(
+        reached_rpy, (roll, pitch, yaw)
+    ))
+    velocity = max(
+        (abs(float(v)) for v in state.get("joint_vel_rad_s", [])),
+        default=float("inf"),
+    )
+    ok = off < 0.01 and angular_off < ORIENTATION_TOL_RAD and velocity < 0.10
+    reason = (
+        f"continuous_minimum_jerk_arrived ({len(waypoints)} waypoints)"
+        if ok else
+        f"continuous_path_unsettled position={off*1000:.1f}mm "
+        f"orientation={angular_off:.4f}rad velocity={velocity:.3f}rad/s"
+    )
+    return MoveResult(ok, reason, reached)
 
 
 def safe_step(dx=0.0, dy=0.0, dz=0.0, *, cur=None, **kw) -> MoveResult:

@@ -171,8 +171,10 @@ def plan_grasp_geometry(
         # be materially larger before replacing it.  A Grounding DINO result is
         # already a whole-object *box*; its SAM mask is intentionally smaller
         # and more precise, and must always supersede the coarse box geometry.
-        grounded_whole_object = target.source == "grounding_dino_sam2"
-        substantially_larger = area_ratio >= 1.35 or grounded_whole_object
+        semantic_whole_object_box = target.source in {
+            "grounding_dino_sam2", "locate_anything", "sam3"
+        }
+        substantially_larger = area_ratio >= 1.35 or semantic_whole_object_box
         envelope_fits = (
             chosen_candidate is not None
             or local_width <= float(max_aperture_mm)

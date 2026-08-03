@@ -61,6 +61,31 @@ class GeometryGraspPlannerTest(TestCase):
         self.assertAlmostEqual(plan.grasp_detection.min_width_mm, 16.0)
         self.assertIn("local body cross-section", plan.reason)
 
+    def test_semantic_box_uses_refined_envelope_orientation(self):
+        # Coarse semantic boxes have no reliable physical axis. Their RGB-D
+        # refinement must drive both width and jaw orientation, even when the
+        # refined mask area is smaller than the original box.
+        for source in ("locate_anything", "grounding_dino_sam2", "sam3"):
+            with self.subTest(source=source):
+                box = detection(source=source, width=33.3, length=61.2,
+                                area=5000, axis=None)
+                envelope = detection(source="rgbd:semantic_envelope", width=35.5,
+                                     length=62.4, area=4200, axis=85.56)
+                with patch.object(gg, "segment_target_envelope",
+                                  return_value=envelope):
+                    plan = gg.plan_grasp_geometry(
+                        self.color, self.depth, self.intr, box,
+                        current_rpy=(0.0, 0.0, 0.0), max_aperture_mm=50.0,
+                        jaw_long_axis_camera_deg=-90.0,
+                        max_yaw_delta_deg=10.0,
+                    )
+
+                self.assertTrue(plan.ok, plan.reason)
+                self.assertTrue(plan.used_full_envelope)
+                self.assertIs(plan.grasp_detection, envelope)
+                self.assertAlmostEqual(abs(plan.yaw_correction_deg), 4.44,
+                                       places=2)
+
     def test_oversized_body_refuses_non_prominent_cap(self):
         cap = detection(source="color:green", width=18, length=20, area=400,
                         z=220)

@@ -9,8 +9,10 @@ pick/place workflow developed and hardware-tested through 2026-07-31.
 - A noisy measured camera Jacobian was projected onto a rigid translation model.
 - Deterministic continuation IK prevalidated the complete Cartesian route without
   random seed branches.
-- Grounding DINO Base identifies the requested whole object and SAM 2.1 Small
-  supplies its mask; stable color/depth tracking drives motion geometry.
+- Grounding DINO Base identifies the requested whole object and SAM 2.1 Large
+  supplies its mask; conjunctive multi-colour RGB-D matching requires every
+  requested colour on the same nearby object, while forward/backward optical
+  flow preserve instance identity during calibration jogs.
 - The object is checked for jaw fit before motion and measured again between the
   open jaws at the final endpoint.
 - The gripper closes through slow bounded position ramps to the image-derived
@@ -20,6 +22,10 @@ pick/place workflow developed and hardware-tested through 2026-07-31.
 - Ctrl+C and failure recovery freeze before opening/homing.
 - If the first emergency jaw-open is interrupted, recovery retries it at home.
 - Motor disable is refused unless home is independently verified.
+- Prevalidated RS waypoint chains run as one continuous 50 Hz quintic
+  minimum-jerk joint trajectory, rather than stopping at each internal waypoint.
+- A visible endpoint miss can trigger up to two separately IK-validated,
+  12 mm-capped open-jaw corrections before the existing jaw-slot gate is applied.
 
 ## Safety boundary
 
@@ -47,4 +53,4 @@ From the robot workspace:
 python -m unittest discover -s tests
 ```
 
-The snapshot passed 64 tests before publication.
+The snapshot passes 74 tests.
