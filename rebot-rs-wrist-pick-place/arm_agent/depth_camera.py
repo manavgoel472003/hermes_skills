@@ -62,6 +62,25 @@ class RealSenseCamera:
         height = int(os.getenv("REBOT_REALSENSE_HEIGHT", "480"))
         fps = int(os.getenv("REBOT_REALSENSE_FPS", "30"))
         serial = os.getenv("REBOT_REALSENSE_SERIAL")
+        # Fail synchronously, with a useful message, before a caller starts any
+        # robot motion.  In particular, do not leave device discovery to a
+        # background video thread where the exception can be invisible.
+        devices = rs.context().query_devices()
+        if len(devices) == 0:
+            raise RuntimeError(
+                "no RealSense camera is connected; connect the wrist camera "
+                "and rerun (no robot motion was started)"
+            )
+        if serial:
+            connected_serials = {
+                device.get_info(rs.camera_info.serial_number)
+                for device in devices
+            }
+            if serial not in connected_serials:
+                raise RuntimeError(
+                    f"configured RealSense serial {serial!r} is not connected; "
+                    f"available serials: {sorted(connected_serials)}"
+                )
         config = rs.config()
         if serial:
             config.enable_device(serial)

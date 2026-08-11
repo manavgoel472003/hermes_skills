@@ -1,7 +1,7 @@
 ---
 name: rebot-rs-wrist-pick-place
 description: Detect, segment, preplan, image-size, pick, verify, drop, and home with a reBot RS arm and wrist RealSense. Use for camera-only detection checks, camera-only open-jaw calibration, or the hardware-verified dynamic marker pick/place workflow.
-version: 0.3.0
+version: 1.0.0
 author: Manav Goel
 metadata:
   hermes:
@@ -11,6 +11,22 @@ prerequisites:
 ---
 
 # reBot RS wrist pick/place
+
+## Decoupled Hermes tools
+
+The preferred agent workflow is now two explicit MCP calls:
+
+1. `wrist_pick(object="yellow sponge")` performs only detection, grasp,
+   verification, and lift. It returns while holding the object.
+2. After deciding the destination, call
+   `wrist_place(reference="green marker", relation="left", distance_m=0.10)`.
+
+Both calls must use the same long-lived MCP process. `wrist_place` refuses any
+caller-supplied held-state claim and requires the in-memory certificate created
+by `wrist_pick`. Use `wrist_stop` to freeze, release, and home at any point.
+
+`wrist_pick_and_place` remains the backward-compatible atomic operation and
+internally hands the verified pick context to the same placement implementation.
 
 Operate the implementation from the robot workspace:
 
@@ -120,7 +136,7 @@ REBOT_GRIPPER_MOVE_S=1.10 \
 REBOT_GRIPPER_STEP_S=0.04 \
 REBOT_SCENE_COLLISION=1 \
 REBOT_SCENE_COLLISION_VOXEL_M=0.020 \
-REBOT_SCENE_COLLISION_INFLATION_M=0.025 \
+REBOT_SCENE_COLLISION_INFLATION_M=0.003 \
 REBOT_SCENE_COLLISION_STRIDE_PX=4 \
 /home/manav/miniconda3/envs/rebot_rs/bin/python \
   -m arm_agent.wrist_servo \
@@ -133,7 +149,8 @@ Expected planning evidence:
 - `preplan_reachable_grasp` passes.
 - `prevalidate_complete_approach` passes before approach motion begins.
 - `scene_collision_map` reports a nonzero obstacle-column count, 20 mm voxels,
-  and 25 mm inflation before the first object-approach trajectory.
+  and 3 mm map inflation before the first object-approach trajectory. Robot-link
+  and payload-aware route footprints are applied separately by the planners.
 - The result's `collision_scene.visualization.open_command` opens the interactive
   `.rrd`; `scene/dense_rgb_cloud` is the refined camera-colored view,
   `collision/raw_obstacle_returns` is orange, red boxes are inflated collision

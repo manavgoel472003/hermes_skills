@@ -710,9 +710,107 @@ def segment_objects(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsic
             p_cam_mm=deproject(u, v, z, intr), source="depth:object",
             area_px=float(cv2.contourArea(contour)),
             min_width_mm=min_mm, max_width_mm=max_mm,
-            info={"mean_bgr": [int(c) for c in patch.mean(axis=0)]
-                  if patch.size else None, **geometry}))
+            info={
+                "mean_bgr": [int(c) for c in patch.mean(axis=0)]
+                if patch.size else None,
+                # Preserve the actual depth component.  Metric 3-D geometry
+                # must never substitute the component's rectangular bounding
+                # box, which also contains table/background depth.
+                "mask_u8": blob,
+                "segmentation_source": "table_plane_depth_component",
+                **geometry,
+            }))
     return out
+
+
+def detect_colored_tabletop_object(
+    color_bgr: np.ndarray,
+    depth_mm: np.ndarray,
+    intr: Intrinsics,
+    names: list[str],
+    *,
+    require_all: bool = False,
+    near_mm: float = NEAR_MM,
+    far_mm: float = FAR_MM,
+) -> Detection | None:
+    """Match requested colour inside an independently segmented 3D object.
+
+    This is deliberately stronger than selecting the largest HSV contour. The
+    table plane and depth connectivity define the physical object first; colour
+    only identifies which of those objects the description refers to. Distant
+    red furniture therefore cannot stand in for a red tabletop marker.
+    """
+    valid_names = [name for name in names if name in COLORS]
+    if not valid_names:
+        return None
+    objects = segment_objects(
+        color_bgr, depth_mm, intr,
+        near_mm=near_mm, far_mm=far_mm,
+        # Upright markers and bottles can exceed the generic 120 mm object
+        # ceiling. This remains bounded below the wrist/camera workspace depth.
+        max_height_mm=220.0,
+        min_area_px=max(80.0, 0.4 * float(MIN_AREA_PX)),
+    )
+    color_masks = {
+        name: color_mask(color_bgr, name) > 0 for name in valid_names
+    }
+    minimum_pixels = int(np.clip(_env_float(
+        "REBOT_COLORED_OBJECT_MIN_PIXELS", 25.0
+    ), 12.0, 200.0))
+    candidates: list[tuple[float, float, Detection, dict[str, int]]] = []
+    for detected in objects:
+        height, width = depth_mm.shape[:2]
+        x1, y1, x2, y2 = detected.box
+        edge_margin = 4
+        # An object cut by the camera boundary has unknown dimensions and its
+        # centroid shifts as more of it enters the image. It cannot establish
+        # hybrid identity or authorize jaw sizing; bounded live look-around is
+        # responsible for finding a complete view.
+        if x1 <= edge_margin or y1 <= edge_margin \
+                or x2 >= width - edge_margin \
+                or y2 >= height - edge_margin:
+            continue
+        object_mask = np.asarray(
+            detected.info.get("mask_u8"), dtype=np.uint8
+        ) > 0
+        if object_mask.shape != depth_mm.shape:
+            continue
+        counts = {
+            name: int(np.count_nonzero(object_mask & color_masks[name]))
+            for name in valid_names
+        }
+        present = [count >= minimum_pixels for count in counts.values()]
+        color_ok = all(present) if require_all else any(present)
+        if not color_ok:
+            continue
+        object_pixels = max(1, int(np.count_nonzero(object_mask)))
+        coverage = float(sum(counts.values())) / float(object_pixels)
+        candidates.append((float(detected.z_mm), -coverage, detected, counts))
+    if not candidates:
+        return None
+    # A wrist camera sees the grasp workspace before the room background. Among
+    # independently segmented matching objects, prefer the nearest physical
+    # object and use colour coverage only as a tie-breaker.
+    _depth, _negative_coverage, selected, selected_counts = min(
+        candidates, key=lambda item: (item[0], item[1])
+    )
+    return Detection(
+        box=selected.box,
+        uv=selected.uv,
+        z_mm=selected.z_mm,
+        p_cam_mm=selected.p_cam_mm,
+        source="rgbd:colored_object",
+        area_px=selected.area_px,
+        min_width_mm=selected.min_width_mm,
+        max_width_mm=selected.max_width_mm,
+        info={
+            **selected.info,
+            "identifier_colors": valid_names,
+            "identifier_color_pixels": selected_counts,
+            "identifier_requires_all_colors": bool(require_all),
+            "identity_basis": "table_plane_depth_component_with_color",
+        },
+    )
 
 
 def segment_target_envelope(
@@ -747,25 +845,45 @@ def segment_target_envelope(
     )
     roi = np.zeros((h, w), np.uint8)
     roi[ry1:ry2, rx1:rx2] = 255
-    mask = (valid.astype(np.uint8) * 255) & roi
-    mask = cv2.morphologyEx(
-        mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
-    )
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        (mask > 0).astype(np.uint8), connectivity=8
-    )
-    if count <= 1:
+    eligible = valid & (roi > 0)
+    if not np.any(eligible):
         return None
-    seed = np.zeros((h, w), np.uint8)
-    seed[max(0, y1):min(h, y2), max(0, x1):min(w, x2)] = 1
-    overlaps = [
-        int(np.count_nonzero((labels == label) & (seed > 0)))
-        for label in range(1, count)
-    ]
-    if not overlaps or max(overlaps) == 0:
-        return None
-    label = int(np.argmax(overlaps)) + 1
-    component = (labels == label).astype(np.uint8) * 255
+    # Absolute depth gating alone is insufficient: two touching surfaces at
+    # 205 mm and 310 mm both fit the historical 120 mm band and therefore
+    # became one binary component. Grow from the identifier using a bounded
+    # *local* depth edge. This can traverse the cap/body step of a marker while
+    # refusing the much larger jump onto a support or background surface.
+    seed_u = int(np.clip(round(float(target.uv[0])), 0, w - 1))
+    seed_v = int(np.clip(round(float(target.uv[1])), 0, h - 1))
+    if not eligible[seed_v, seed_u]:
+        vv, uu = np.nonzero(eligible)
+        seed_region = (
+            (uu >= max(0, x1)) & (uu < min(w, x2))
+            & (vv >= max(0, y1)) & (vv < min(h, y2))
+        )
+        if np.any(seed_region):
+            uu_seed, vv_seed = uu[seed_region], vv[seed_region]
+        else:
+            uu_seed, vv_seed = uu, vv
+        nearest = int(np.argmin(
+            (uu_seed - seed_u) ** 2 + (vv_seed - seed_v) ** 2
+        ))
+        seed_u, seed_v = int(uu_seed[nearest]), int(vv_seed[nearest])
+    depth_edge_mm = float(np.clip(_env_float(
+        "REBOT_TARGET_DEPTH_EDGE_MM", 30.0
+    ), 15.0, 35.0))
+    flood_mask = np.ones((h + 2, w + 2), dtype=np.uint8)
+    flood_mask[1:-1, 1:-1][eligible] = 0
+    cv2.floodFill(
+        np.asarray(depth_mm, dtype=np.float32).copy(), flood_mask,
+        (seed_u, seed_v), 0.0,
+        loDiff=depth_edge_mm, upDiff=depth_edge_mm,
+        flags=8 | cv2.FLOODFILL_MASK_ONLY | (255 << 8),
+    )
+    component = (flood_mask[1:-1, 1:-1] == 255).astype(np.uint8) * 255
+    component = cv2.morphologyEx(
+        component, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
+    )
     contours, _ = cv2.findContours(
         component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
@@ -798,6 +916,13 @@ def segment_target_envelope(
         min_width_mm=min_mm, max_width_mm=max_mm,
         info={
             "seed_source": target.source,
+            # This exact component is the authoritative input to metric 3-D
+            # fitting.  Previously it was discarded here, so the downstream
+            # fitter filled the whole bounding rectangle and turned a slender
+            # colour-identified marker into a large chunk of the scene.
+            "mask_u8": component,
+            "segmentation_source": "target_seeded_depth_component",
+            "depth_edge_mm": depth_edge_mm,
             "depth_span_mm": [
                 round(float(np.min(values)), 1),
                 round(float(np.max(values)), 1),
@@ -824,6 +949,7 @@ def segment_semantic_envelope(
     *,
     near_mm: float = NEAR_MM,
     far_mm: float = FAR_MM,
+    diagnostics: dict[str, Any] | None = None,
 ) -> Detection | None:
     """RGB foreground mask inside a semantic whole-object box.
 
@@ -831,11 +957,16 @@ def segment_semantic_envelope(
     The semantic model supplies only a tight box; GrabCut supplies the contour,
     while the original color/VLM identifier is a definite foreground seed.
     """
+    diag = diagnostics if diagnostics is not None else {}
+    diag.clear()
+    diag["semantic_source"] = semantic_box.source
+    diag["semantic_box"] = list(semantic_box.box)
     h, w = color_bgr.shape[:2]
     x1, y1, x2, y2 = semantic_box.box
     x1, y1 = max(0, int(x1)), max(0, int(y1))
     x2, y2 = min(w, int(x2)), min(h, int(y2))
     if x2 - x1 < 8 or y2 - y1 < 8:
+        diag.update(stage="semantic_box", reason="box smaller than 8 pixels")
         return None
     pad_x = max(4, int(0.10 * (x2 - x1)))
     pad_y = max(4, int(0.06 * (y2 - y1)))
@@ -848,7 +979,8 @@ def segment_semantic_envelope(
     component = segment_local_box(
         color_bgr, (x1, y1, x2, y2)
     )
-    segmentation_source = "sam2.1"
+    segmentation_source = f"{semantic_box.source}:native_mask"
+    diag["native_mask_available"] = component is not None
     if component is None:
         segmentation_source = "grabcut"
         mask = np.full((h, w), cv2.GC_BGD, dtype=np.uint8)
@@ -861,21 +993,82 @@ def segment_semantic_envelope(
             cv2.grabCut(color_bgr, mask, None, bg_model, fg_model, 5,
                         cv2.GC_INIT_WITH_MASK)
         except cv2.error:
+            diag.update(stage="grabcut", reason="OpenCV GrabCut failed")
             return None
         component = np.where(
             (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0
         ).astype(np.uint8)
-    # Never let foreground escape the semantic model's padded object region.
+    # A native instance mask must remain inside the detector box.  The padded
+    # region exists only for GrabCut, which needs explicit background context.
+    # Allowing a native mask into that padding made occasional SAM spill attach
+    # a neighbouring support or table surface to a small target.
     roi = np.zeros_like(component)
-    roi[ry1:ry2, rx1:rx2] = 255
+    if segmentation_source == "grabcut":
+        roi[ry1:ry2, rx1:rx2] = 255
+    else:
+        roi[y1:y2, x1:x2] = 255
     component &= roi
+    diag["mask_pixels_before_cleanup"] = int(np.count_nonzero(component))
     component = cv2.morphologyEx(
         component, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)
     )
+    # Select the surface reached from the detector's target point without
+    # crossing a physical RGB-D edge.  Plain 2-D connected components cannot
+    # distinguish a target from background that a learned mask has joined to
+    # it by one or two pixels.  OpenCV's floating-range flood fill compares
+    # neighbouring depths, so sloped/rounded objects remain connected while a
+    # sharp object/support boundary stops the fill.
+    valid = depth_gate(depth_mm, near_mm, far_mm)
+    eligible = (component > 0) & valid
+    if not np.any(eligible):
+        diag.update(
+            stage="mask_depth", reason="fewer than 10 valid depth pixels",
+            mask_pixels=int(np.count_nonzero(component)),
+            valid_depth_pixels=0, valid_depth_fraction=0.0,
+        )
+        return None
+    seed_u = int(round(float(identifier.uv[0])))
+    seed_v = int(round(float(identifier.uv[1])))
+    seed_u = int(np.clip(seed_u, 0, w - 1))
+    seed_v = int(np.clip(seed_v, 0, h - 1))
+    if not eligible[seed_v, seed_u]:
+        vv, uu = np.nonzero(eligible)
+        nearest = int(np.argmin((uu - seed_u) ** 2 + (vv - seed_v) ** 2))
+        seed_u, seed_v = int(uu[nearest]), int(vv[nearest])
+    depth_edge_mm = float(np.clip(float(os.getenv(
+        "REBOT_SEMANTIC_DEPTH_EDGE_MM", "12"
+    )), 5.0, 35.0))
+    flood_mask = np.ones((h + 2, w + 2), dtype=np.uint8)
+    flood_mask[1:-1, 1:-1][eligible] = 0
+    cv2.floodFill(
+        np.asarray(depth_mm, dtype=np.float32).copy(), flood_mask,
+        (seed_u, seed_v), 0.0,
+        loDiff=depth_edge_mm, upDiff=depth_edge_mm,
+        flags=8 | cv2.FLOODFILL_MASK_ONLY | (255 << 8),
+    )
+    depth_component = flood_mask[1:-1, 1:-1] == 255
+    retained = int(np.count_nonzero(depth_component))
+    before_depth = int(np.count_nonzero(component))
+    if retained < max(20, int(0.15 * max(1.0, float(identifier.area_px)))):
+        diag.update(
+            stage="depth_connectivity",
+            reason="target-seeded depth component is too small",
+            depth_component_pixels=retained,
+            depth_edge_mm=depth_edge_mm,
+        )
+        return None
+    component = depth_component.astype(np.uint8) * 255
+    component = cv2.morphologyEx(
+        component, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
+    )
+    diag["depth_edge_mm"] = depth_edge_mm
+    diag["depth_component_pixels"] = retained
+    diag["depth_rejected_pixels"] = before_depth - retained
     count, labels, _, _ = cv2.connectedComponentsWithStats(
         (component > 0).astype(np.uint8), connectivity=8
     )
     if count <= 1:
+        diag.update(stage="mask_components", reason="mask has no foreground component")
         return None
     seed = np.zeros_like(component)
     seed[max(0, iy1):min(h, iy2), max(0, ix1):min(w, ix2)] = 1
@@ -892,19 +1085,33 @@ def segment_semantic_envelope(
         component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
     if not contours:
+        diag.update(stage="mask_contour", reason="foreground has no contour")
         return None
     contour = max(contours, key=cv2.contourArea)
     area = float(cv2.contourArea(contour))
     if area < max(30.0, 0.4 * float(identifier.area_px)):
+        diag.update(
+            stage="mask_area", reason="foreground mask is too small",
+            contour_area_px=area,
+            minimum_area_px=max(30.0, 0.4 * float(identifier.area_px)),
+        )
         return None
     moments = cv2.moments(contour)
     if moments["m00"] <= 0:
+        diag.update(stage="mask_moments", reason="foreground centroid is undefined")
         return None
     u = float(moments["m10"] / moments["m00"])
     v = float(moments["m01"] / moments["m00"])
-    valid = depth_gate(depth_mm, near_mm, far_mm)
     values = depth_mm[(component > 0) & valid]
+    diag["mask_pixels"] = int(np.count_nonzero(component))
+    diag["valid_depth_pixels"] = int(values.size)
+    diag["valid_depth_fraction"] = round(
+        float(values.size) / max(1, int(np.count_nonzero(component))), 3
+    )
     if values.size < 10:
+        diag.update(
+            stage="mask_depth", reason="fewer than 10 valid depth pixels"
+        )
         return None
     # The nearer half suppresses table pixels retained around a flush object.
     cutoff = float(np.percentile(values, 60.0))
@@ -918,6 +1125,12 @@ def segment_semantic_envelope(
     local_width = local_cross_section_width_mm(
         component, (u, v), float(geometry["long_axis_deg"]), z, intr
     )
+    diag.update(
+        ok=True, stage="complete", reason="semantic mask with robust in-mask depth",
+        segmentation_source=segmentation_source,
+        depth_median_mm=round(z, 1), contour_area_px=round(area, 1),
+        width_mm=[round(float(min_mm), 1), round(float(max_mm), 1)],
+    )
     return Detection(
         box=(x, y, x + bw, y + bh), uv=(u, v), z_mm=z,
         p_cam_mm=deproject(u, v, z, intr),
@@ -927,6 +1140,16 @@ def segment_semantic_envelope(
             "semantic_box": list(semantic_box.box),
             "segmentation_source": segmentation_source,
             "identifier_source": identifier.source,
+            "depth_edge_mm": depth_edge_mm,
+            "mask_pixels_before_cleanup": diag.get(
+                "mask_pixels_before_cleanup"
+            ),
+            "depth_component_pixels": diag.get("depth_component_pixels"),
+            "depth_rejected_pixels": diag.get("depth_rejected_pixels"),
+            # Kept in-memory only. GraspGeometry.summary deliberately omits it.
+            # The metric 3D box fitter needs the exact semantic pixels rather
+            # than the axis-aligned detector box.
+            "mask_u8": component,
             "local_grasp_width_mm": local_width,
             "cross_section_candidates": profile,
             **geometry,
@@ -965,7 +1188,7 @@ def detect_vlm(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics,
                description: str, *, near_mm: float = NEAR_MM,
                far_mm: float = FAR_MM) -> Detection | None:
     """Open-vocabulary fallback via LocateAnything (opt-in; see local_vision)."""
-    from .local_vision import locate as locate_local
+    from .local_vision import locate as locate_local, segment_box as segment_local_box
 
     result = locate_local(color_bgr, description)
     if not result or not result.get("found"):
@@ -975,22 +1198,67 @@ def detect_vlm(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics,
     x2, y2 = min(depth_mm.shape[1], x2), min(depth_mm.shape[0], y2)
     if x2 <= x1 or y2 <= y1:
         return None
-    patch = depth_mm[y1:y2, x1:x2]
-    values = patch[depth_gate(patch, near_mm, far_mm)]
-    if values.size < 10:
-        return None
-    z = float(np.median(values))
-    u, v = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-    # Only an axis-aligned box is available here, so the extents are an upper bound.
-    min_mm, max_mm = _metric_size(x2 - x1, y2 - y1, z, intr)
     backend = str(result.get("backend") or "locate_anything")
+    native_mask = segment_local_box(color_bgr, (x1, y1, x2, y2))
+    mask_u8 = None
+    depth_basis = "axis_aligned_box"
+    if native_mask is not None:
+        native_mask = np.asarray(native_mask)
+        if native_mask.shape != depth_mm.shape:
+            # A semantic mask exists, so silently reverting to its much larger
+            # axis-aligned box would allow background depth to establish target
+            # identity. Fail this observation and let the bounded view retry.
+            return None
+        mask_u8 = np.where(native_mask > 0, 255, 0).astype(np.uint8)
+        roi = np.zeros_like(mask_u8)
+        roi[y1:y2, x1:x2] = 255
+        mask_u8 &= roi
+        valid_mask = (mask_u8 > 0) & depth_gate(
+            depth_mm, near_mm, far_mm
+        )
+        rows, cols = np.nonzero(valid_mask)
+        if rows.size < 10:
+            # SAM supplied pixel authority but those pixels have no trustworthy
+            # range. Never substitute table/background pixels from the box.
+            return None
+        values = np.asarray(depth_mm[valid_mask], dtype=float)
+        z = float(np.median(values))
+        # Locate the 3-D anchor at the median of the ranged mask pixels. This
+        # remains on the visible object even when its detector box is clipped
+        # against an image edge and mostly contains distant background.
+        u, v = float(np.median(cols)), float(np.median(rows))
+        contours, _ = cv2.findContours(
+            mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            return None
+        contour = max(contours, key=cv2.contourArea)
+        (_, _), (rw, rh), _ = cv2.minAreaRect(contour)
+        min_mm, max_mm = _metric_size(rw, rh, z, intr)
+        area_px = float(np.count_nonzero(mask_u8))
+        depth_basis = "native_semantic_mask"
+    else:
+        # LocateAnything and older box-only backends have no pixel mask. Keep
+        # their legacy behavior; hybrid SAM3 runs take the mask-authoritative
+        # branch above.
+        patch = depth_mm[y1:y2, x1:x2]
+        values = patch[depth_gate(patch, near_mm, far_mm)]
+        if values.size < 10:
+            return None
+        z = float(np.median(values))
+        u, v = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        min_mm, max_mm = _metric_size(x2 - x1, y2 - y1, z, intr)
+        area_px = float((x2 - x1) * (y2 - y1))
     return Detection(box=(x1, y1, x2, y2), uv=(u, v), z_mm=z,
                      p_cam_mm=deproject(u, v, z, intr), source=backend,
-                     area_px=float((x2 - x1) * (y2 - y1)),
+                     area_px=area_px,
                      min_width_mm=min_mm, max_width_mm=max_mm,
                      info={"confidence": result.get("confidence"),
                            "detector_backend": backend,
-                           "box_axis_aligned": True})
+                           "box_axis_aligned": True,
+                           "depth_basis": depth_basis,
+                           **({"mask_u8": mask_u8}
+                              if mask_u8 is not None else {})})
 
 
 def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, description: str,
@@ -1039,6 +1307,24 @@ def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, descri
                     if _box_has_all_colors(color_bgr, found.box, names)
                     else "incomplete under HSV; accepted semantic noun match"
                 )
+            why["used"] = found.source
+            return found, why
+    # Hybrid identity needs a physical object candidate even when open-vocabulary
+    # grounding misses. The depth/table component is authoritative here; HSV is
+    # only evidence inside that component. Legacy detection order is untouched.
+    hybrid_identity = os.getenv(
+        "REBOT_OBJECT_GEOMETRY_MODE", "legacy"
+    ).strip().lower() == "hybrid"
+    if hybrid_identity and names:
+        found = detect_colored_tabletop_object(
+            color_bgr, depth_mm, intr, names,
+            require_all=require_all_colors,
+            near_mm=near_mm, far_mm=far_mm,
+        )
+        why["rgbd_colored_object_result"] = (
+            "found" if found is not None else "not found"
+        )
+        if found is not None:
             why["used"] = found.source
             return found, why
     why["color_word"] = names[0] if len(names) == 1 else None

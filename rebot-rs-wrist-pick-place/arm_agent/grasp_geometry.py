@@ -61,6 +61,7 @@ class GraspGeometry:
     final_approach_mm: float = 40.0
     used_full_envelope: bool = False
     candidates: list[dict[str, Any]] = field(default_factory=list)
+    object_box_3d: dict[str, Any] | None = None
 
     def summary(self) -> dict[str, Any]:
         data = asdict(self)
@@ -96,11 +97,16 @@ def plan_grasp_geometry(
     max_aperture_mm: float,
     jaw_long_axis_camera_deg: float | None,
     max_yaw_delta_deg: float = 10.0,
+    yaw_delta_bounds_deg: tuple[float, float] | None = None,
     yaw_measurement_slop_deg: float = 0.5,
+    max_residual_yaw_deg: float = 0.0,
+    allow_aperture_derived_residual: bool = False,
     final_approach_mm: float = 40.0,
     min_feature_prominence_mm: float = 25.0,
     require_axis_for_elongated: bool = True,
     semantic_envelope: Detection | None = None,
+    metric_jaw_width_mm: float | None = None,
+    metric_major_mm: float | None = None,
 ) -> GraspGeometry:
     """Choose a grasp region and a heavily bounded wrist-yaw adjustment.
 
@@ -109,21 +115,23 @@ def plan_grasp_geometry(
     feature is accepted only when it is clearly proud of the envelope in depth;
     otherwise the gripper would have to pass through the body to reach it.
     """
-    seeded = segment_target_envelope(color, depth, intr, target)
-    # Always compare the seed-grown region with table-plane-separated objects.
-    # The seed route recovers tall features that plane segmentation can miss, but
-    # on a low object it can depth-connect into the table. Association prefers
-    # the compact candidate centred on the identifier feature, leaving the seeded
-    # region as a fallback instead of allowing it to suppress a better envelope.
-    envelopes = [semantic_envelope] if semantic_envelope is not None else []
-    envelopes.extend(segment_objects(color, depth, intr))
-    if seeded is not None:
-        envelopes.append(seeded)
-    envelope = (
-        semantic_envelope
-        if semantic_envelope is not None and _contains(semantic_envelope.box, target.uv)
-        else associate_envelope(target, envelopes)
-    )
+    # A promptable whole-object mask with valid in-mask depth is authoritative.
+    # Do not run table-plane segmentation eagerly: aside from added latency, its
+    # downward-camera assumption is unreliable in the nearly horizontal ready
+    # view. Seed growth and plane separation are fallback sources only.
+    if semantic_envelope is not None and _contains(
+        semantic_envelope.box, target.uv
+    ):
+        envelope = semantic_envelope
+    else:
+        seeded = segment_target_envelope(color, depth, intr, target)
+        # The seed route recovers tall features that plane segmentation can miss,
+        # but on a low object it can depth-connect into the table. Association
+        # prefers the compact candidate centred on the identifier feature.
+        envelopes = segment_objects(color, depth, intr)
+        if seeded is not None:
+            envelopes.append(seeded)
+        envelope = associate_envelope(target, envelopes)
     grasp = target
     used_envelope = False
     feature_clearance_note: str | None = None
@@ -142,6 +150,24 @@ def plan_grasp_geometry(
         if isinstance(envelope.info.get("cross_section_candidates"), list)
         else []
     )
+    metric_width: float | None = None
+    metric_major: float | None = None
+    if metric_jaw_width_mm is not None:
+        try:
+            metric_width = float(metric_jaw_width_mm)
+            metric_major = float(
+                metric_major_mm if metric_major_mm is not None
+                else envelope.max_width_mm or metric_width
+            )
+        except (TypeError, ValueError):
+            metric_width, metric_major = math.nan, math.nan
+        if not math.isfinite(metric_width) or metric_width <= 0.0 \
+                or not math.isfinite(metric_major) \
+                or metric_major < metric_width:
+            return GraspGeometry(
+                False, "metric 3D jaw dimensions are invalid",
+                grasp, envelope, None, candidates=envelope_candidates,
+            )
 
     if envelope.min_width_mm is not None:
         try:
@@ -166,6 +192,13 @@ def plan_grasp_geometry(
                 key=lambda item: float(item.get("score", -1e9)), reverse=True
             )
         chosen_candidate = usable_candidates[0] if usable_candidates else None
+        # A fused metric OBB is stronger evidence than the perspective-stretched
+        # 2D cross-section. Apply it before deciding that the envelope is too
+        # large; applying it later leaves the feature-prominence rejection in
+        # control and discards the very 3D evidence intended to resolve it.
+        if metric_width is not None:
+            local_width = metric_width
+            chosen_candidate = None
         area_ratio = envelope.area_px / max(1.0, target.area_px)
         # A color blob is merely an identifier, so its associated envelope must
         # be materially larger before replacing it.  A Grounding DINO result is
@@ -200,9 +233,17 @@ def plan_grasp_geometry(
                     grasp = replace(
                         envelope,
                         min_width_mm=local_width,
+                        max_width_mm=(
+                            metric_major if metric_major is not None
+                            else envelope.max_width_mm
+                        ),
                         source="depth:local_grasp_section",
                         info={**envelope.info, "jaw_sizing_basis":
-                              "local cross-section at grasp centre"},
+                              (
+                                  "multiview metric 3D horizontal axes"
+                                  if metric_width is not None else
+                                  "local cross-section at grasp centre"
+                              )},
                     )
             else:
                 if chosen_candidate is None:
@@ -227,6 +268,19 @@ def plan_grasp_geometry(
             )
 
     width = grasp.min_width_mm
+    if metric_width is not None and metric_major is not None:
+        grasp = replace(
+            grasp,
+            min_width_mm=metric_width,
+            max_width_mm=metric_major,
+            info={
+                **grasp.info,
+                "jaw_sizing_basis": "multiview metric 3D horizontal axes",
+                "metric_3d_jaw_width_mm": metric_width,
+                "metric_3d_major_mm": metric_major,
+            },
+        )
+        width = metric_width
     if width is None or not math.isfinite(float(width)) or float(width) <= 0:
         return GraspGeometry(False, "no reliable metric grasp width", None,
                              envelope, None)
@@ -240,6 +294,8 @@ def plan_grasp_geometry(
 
     yaw_delta = 0.0
     yaw_clamp_note: str | None = None
+    yaw_residual_deg = 0.0
+    raw_grasp_width_mm = float(width)
     rpy = tuple(float(v) for v in current_rpy)
     object_axis = grasp.info.get("long_axis_deg")
     aspect_ratio = float(grasp.max_width_mm or width) / max(
@@ -254,21 +310,86 @@ def plan_grasp_geometry(
         required = _angle_delta_deg(float(object_axis),
                                     float(jaw_long_axis_camera_deg))
         yaw_limit = max(0.0, float(max_yaw_delta_deg))
+        yaw_lo, yaw_hi = (-yaw_limit, yaw_limit)
+        if yaw_delta_bounds_deg is not None:
+            yaw_lo = max(yaw_lo, float(yaw_delta_bounds_deg[0]))
+            yaw_hi = min(yaw_hi, float(yaw_delta_bounds_deg[1]))
+        if yaw_lo > yaw_hi:
+            return GraspGeometry(
+                False, "camera calibration leaves no safe wrist-yaw budget",
+                grasp, envelope, None, candidates=envelope_candidates,
+            )
         measurement_slop = max(0.0, float(yaw_measurement_slop_deg))
-        if abs(required) > yaw_limit + measurement_slop:
+        residual_allowance = max(
+            measurement_slop, max(0.0, float(max_residual_yaw_deg))
+        )
+        outside_fixed_allowance = bool(
+            required < yaw_lo - residual_allowance
+            or required > yaw_hi + residual_allowance
+        )
+        if outside_fixed_allowance and not allow_aperture_derived_residual:
+            limit_text = (
+                f"beyond the clamped {yaw_limit:.1f}deg limit"
+                if yaw_delta_bounds_deg is None else
+                f"outside the safe [{yaw_lo:.1f}, {yaw_hi:.1f}]deg budget"
+            )
+            allowance_text = (
+                f"{measurement_slop:.1f}deg vision uncertainty"
+                if float(max_residual_yaw_deg) <= measurement_slop else
+                f"the bounded {residual_allowance:.1f}deg residual allowance"
+            )
             return GraspGeometry(
                 False,
                 f"grasp needs {required:.1f}deg of wrist yaw to align the jaws, "
-                f"beyond the clamped {yaw_limit:.1f}deg limit plus "
-                f"{measurement_slop:.1f}deg vision uncertainty",
+                f"{limit_text} plus {allowance_text}",
                 grasp, envelope, None,
                 candidates=envelope_candidates,
             )
-        yaw_delta = min(yaw_limit, max(-yaw_limit, required))
+        yaw_delta = min(yaw_hi, max(yaw_lo, required))
         if not math.isclose(yaw_delta, required, abs_tol=1e-9):
+            yaw_residual_deg = abs(float(required) - float(yaw_delta))
+            # A small residual angle makes an elongated object appear wider
+            # between parallel jaws.  Account for that geometry instead of
+            # treating measurement slop as free alignment error.  This keeps
+            # the commanded wrist orientation inside its existing calibrated
+            # bound and refuses the grasp if the resulting span cannot fit.
+            major_mm = max(float(width), float(grasp.max_width_mm or width))
+            residual_rad = math.radians(yaw_residual_deg)
+            projected_width_mm = (
+                float(width) * abs(math.cos(residual_rad))
+                + major_mm * abs(math.sin(residual_rad))
+            )
+            if projected_width_mm > float(max_aperture_mm):
+                return GraspGeometry(
+                    False,
+                    f"grasp yaw is {yaw_residual_deg:.1f}deg outside the safe "
+                    f"wrist budget; its conservative projected jaw span is "
+                    f"{projected_width_mm:.1f}mm, beyond the "
+                    f"{max_aperture_mm:.1f}mm jaw limit",
+                    grasp, envelope, None,
+                    candidates=envelope_candidates,
+                )
+            grasp_info = dict(grasp.info)
+            grasp_info.update({
+                "raw_grasp_width_mm": raw_grasp_width_mm,
+                "yaw_residual_deg": yaw_residual_deg,
+                "yaw_projected_width_mm": projected_width_mm,
+            })
+            grasp = replace(
+                grasp,
+                min_width_mm=projected_width_mm,
+                info=grasp_info,
+            )
+            width = projected_width_mm
             yaw_clamp_note = (
                 f"vision requested {required:.1f}deg; commanded "
-                f"{yaw_delta:.1f}deg at the physical clamp"
+                f"{yaw_delta:.1f}deg at the physical clamp; compensated "
+                f"{yaw_residual_deg:.1f}deg residual with "
+                f"{projected_width_mm:.1f}mm projected jaw span"
+                + (
+                    " using aperture-derived residual acceptance"
+                    if outside_fixed_allowance else ""
+                )
             )
         rpy = (rpy[0], rpy[1], rpy[2] + math.radians(yaw_delta))
     elif not rotation_invariant and require_axis_for_elongated:

@@ -20,6 +20,25 @@ def detection(*, source: str, width: float, length: float, area: float,
 
 
 class GeometryGraspPlannerTest(TestCase):
+    def test_valid_semantic_envelope_skips_table_plane_fallback(self):
+        box = detection(source="sam3", width=20, length=70, area=1800,
+                        axis=0)
+        envelope = detection(source="rgbd:semantic_envelope", width=18,
+                             length=68, area=1700, axis=0)
+        with patch.object(gg, "segment_target_envelope") as seeded, \
+                patch.object(gg, "segment_objects") as plane:
+            plan = gg.plan_grasp_geometry(
+                self.color, self.depth, self.intr, box,
+                current_rpy=(0.0, 0.0, 0.0), max_aperture_mm=50.0,
+                jaw_long_axis_camera_deg=0.0,
+                semantic_envelope=envelope,
+            )
+
+        self.assertTrue(plan.ok, plan.reason)
+        self.assertIs(plan.grasp_detection, envelope)
+        seeded.assert_not_called()
+        plane.assert_not_called()
+
     def setUp(self):
         self.color = np.zeros((300, 300, 3), dtype=np.uint8)
         self.depth = np.full((300, 300), 300.0, dtype=np.float32)
@@ -116,6 +135,39 @@ class GeometryGraspPlannerTest(TestCase):
         self.assertFalse(plan.ok)
         self.assertIn("beyond the clamped", plan.reason)
 
+    def test_nineteen_degree_alignment_fits_twenty_degree_scene_envelope(self):
+        obj = detection(source="depth:object", width=44.2, length=76.9,
+                        area=9700, axis=70.9)
+        with patch.object(gg, "segment_target_envelope",
+                          return_value=obj):
+            plan = gg.plan_grasp_geometry(
+                self.color, self.depth, self.intr, obj,
+                current_rpy=(0.0, 0.0, 0.0), max_aperture_mm=50.0,
+                jaw_long_axis_camera_deg=-90.0, max_yaw_delta_deg=20.0,
+                yaw_measurement_slop_deg=0.5,
+            )
+
+        self.assertTrue(plan.ok, plan.reason)
+        self.assertAlmostEqual(plan.yaw_correction_deg, -19.1, places=1)
+
+    def test_asymmetric_camera_budget_clamps_within_vision_slop(self):
+        obj = detection(source="depth:object", width=47.2, length=75.8,
+                        area=13200, axis=70.02)
+        with patch.object(gg, "segment_target_envelope", return_value=obj):
+            plan = gg.plan_grasp_geometry(
+                self.color, self.depth, self.intr, obj,
+                current_rpy=(0.0, 0.1257, -0.0263),
+                max_aperture_mm=50.0,
+                jaw_long_axis_camera_deg=-90.0,
+                max_yaw_delta_deg=20.0,
+                yaw_delta_bounds_deg=(-19.55, 20.0),
+                yaw_measurement_slop_deg=0.5,
+            )
+
+        self.assertTrue(plan.ok, plan.reason)
+        self.assertAlmostEqual(plan.yaw_correction_deg, -19.55, places=2)
+        self.assertIn("physical clamp", plan.reason)
+
     def test_boundary_vision_noise_is_clamped_to_physical_yaw_limit(self):
         obj = detection(source="depth:object", width=28, length=40,
                         area=1500, axis=79.9)
@@ -146,6 +198,168 @@ class GeometryGraspPlannerTest(TestCase):
 
         self.assertFalse(plan.ok)
         self.assertIn("vision uncertainty", plan.reason)
+
+    def test_small_residual_yaw_uses_conservative_projected_width(self):
+        obj = detection(source="depth:object", width=42, length=75,
+                        area=3000, axis=69.0)
+        with patch.object(gg, "segment_target_envelope", return_value=obj):
+            plan = gg.plan_grasp_geometry(
+                self.color, self.depth, self.intr, obj,
+                current_rpy=(0.0, 0.0, 0.0), max_aperture_mm=50.0,
+                jaw_long_axis_camera_deg=-90.0,
+                max_yaw_delta_deg=20.0,
+                yaw_delta_bounds_deg=(-20.0, 20.0),
+                yaw_measurement_slop_deg=1.5,
+            )
+
+        self.assertTrue(plan.ok, plan.reason)
+        self.assertAlmostEqual(plan.yaw_correction_deg, -20.0)
+        self.assertIsNotNone(plan.grasp_detection)
+        self.assertGreater(plan.grasp_detection.min_width_mm, 42.0)
+        self.assertAlmostEqual(
+            plan.grasp_detection.info["yaw_residual_deg"], 1.0
+        )
+        self.assertIn("projected jaw span", plan.reason)
+
+    def test_residual_yaw_is_refused_when_projected_width_does_not_fit(self):
+        obj = detection(source="depth:object", width=49, length=90,
+                        area=3000, axis=69.0)
+        with patch.object(gg, "segment_target_envelope", return_value=obj):
+            plan = gg.plan_grasp_geometry(
+                self.color, self.depth, self.intr, obj,
+                current_rpy=(0.0, 0.0, 0.0), max_aperture_mm=50.0,
+                jaw_long_axis_camera_deg=-90.0,
+                max_yaw_delta_deg=20.0,
+                yaw_delta_bounds_deg=(-20.0, 20.0),
+                yaw_measurement_slop_deg=1.5,
+            )
+
+        self.assertFalse(plan.ok)
+        self.assertIn("projected jaw span", plan.reason)
+        self.assertIn("beyond the 50.0mm jaw limit", plan.reason)
+
+    def test_bounded_residual_yaw_accepts_projected_width_that_fits(self):
+        obj = detection(source="depth:object", width=25.7, length=73.5,
+                        area=7000, axis=65.5)
+        with patch.object(gg, "segment_target_envelope", return_value=obj):
+            plan = gg.plan_grasp_geometry(
+                self.color, self.depth, self.intr, obj,
+                current_rpy=(0.0, 0.0, 0.0), max_aperture_mm=50.0,
+                jaw_long_axis_camera_deg=-90.0,
+                max_yaw_delta_deg=20.0,
+                yaw_delta_bounds_deg=(-20.0, 19.5),
+                yaw_measurement_slop_deg=1.5,
+                max_residual_yaw_deg=6.0,
+            )
+
+        self.assertTrue(plan.ok, plan.reason)
+        self.assertAlmostEqual(plan.yaw_correction_deg, -20.0)
+        self.assertAlmostEqual(
+            plan.grasp_detection.info["yaw_residual_deg"], 4.5
+        )
+        self.assertLess(plan.grasp_detection.min_width_mm, 50.0)
+
+    def test_residual_larger_than_bounded_allowance_is_refused(self):
+        obj = detection(source="depth:object", width=20, length=70,
+                        area=7000, axis=62.0)
+        with patch.object(gg, "segment_target_envelope", return_value=obj):
+            plan = gg.plan_grasp_geometry(
+                self.color, self.depth, self.intr, obj,
+                current_rpy=(0.0, 0.0, 0.0), max_aperture_mm=50.0,
+                jaw_long_axis_camera_deg=-90.0,
+                max_yaw_delta_deg=20.0,
+                yaw_delta_bounds_deg=(-20.0, 19.5),
+                yaw_measurement_slop_deg=1.5,
+                max_residual_yaw_deg=6.0,
+            )
+
+        self.assertFalse(plan.ok)
+        self.assertIn("bounded 6.0deg residual allowance", plan.reason)
+
+    def test_aperture_derived_residual_accepts_complete_object_that_fits(self):
+        obj = detection(source="depth:object", width=22, length=75,
+                        area=7000, axis=62.0)
+        with patch.object(gg, "segment_target_envelope", return_value=obj):
+            plan = gg.plan_grasp_geometry(
+                self.color, self.depth, self.intr, obj,
+                current_rpy=(0.0, 0.0, 0.0), max_aperture_mm=50.0,
+                jaw_long_axis_camera_deg=-90.0,
+                max_yaw_delta_deg=20.0,
+                yaw_delta_bounds_deg=(-20.0, 20.0),
+                yaw_measurement_slop_deg=1.5,
+                max_residual_yaw_deg=6.0,
+                allow_aperture_derived_residual=True,
+            )
+
+        self.assertTrue(plan.ok, plan.reason)
+        self.assertAlmostEqual(plan.yaw_correction_deg, -20.0)
+        self.assertLess(plan.grasp_detection.min_width_mm, 50.0)
+        self.assertIn("aperture-derived residual", plan.reason)
+
+    def test_aperture_derived_residual_still_refuses_projected_span(self):
+        obj = detection(source="depth:object", width=43, length=90,
+                        area=7000, axis=62.0)
+        with patch.object(gg, "segment_target_envelope", return_value=obj):
+            plan = gg.plan_grasp_geometry(
+                self.color, self.depth, self.intr, obj,
+                current_rpy=(0.0, 0.0, 0.0), max_aperture_mm=50.0,
+                jaw_long_axis_camera_deg=-90.0,
+                max_yaw_delta_deg=20.0,
+                yaw_delta_bounds_deg=(-20.0, 20.0),
+                yaw_measurement_slop_deg=1.5,
+                max_residual_yaw_deg=6.0,
+                allow_aperture_derived_residual=True,
+            )
+
+        self.assertFalse(plan.ok)
+        self.assertIn("projected jaw span", plan.reason)
+        self.assertIn("beyond the 50.0mm jaw limit", plan.reason)
+
+    def test_multiview_metric_axes_replace_tilted_silhouette_width(self):
+        obj = detection(source="depth:object", width=43, length=90,
+                        area=7000, axis=62.0)
+        with patch.object(gg, "segment_target_envelope", return_value=obj):
+            plan = gg.plan_grasp_geometry(
+                self.color, self.depth, self.intr, obj,
+                current_rpy=(0.0, 0.0, 0.0), max_aperture_mm=50.0,
+                jaw_long_axis_camera_deg=-90.0,
+                max_yaw_delta_deg=20.0,
+                yaw_delta_bounds_deg=(-20.0, 20.0),
+                yaw_measurement_slop_deg=1.5,
+                max_residual_yaw_deg=6.0,
+                allow_aperture_derived_residual=True,
+                metric_jaw_width_mm=22.0,
+                metric_major_mm=74.0,
+            )
+
+        self.assertTrue(plan.ok, plan.reason)
+        self.assertLess(plan.grasp_detection.min_width_mm, 50.0)
+        self.assertEqual(
+            plan.grasp_detection.info["jaw_sizing_basis"],
+            "multiview metric 3D horizontal axes",
+        )
+
+    def test_metric_axes_apply_before_oversized_feature_rejection(self):
+        target = detection(source="sam3", width=43, length=90,
+                           area=4000, axis=62.0, z=220)
+        envelope = detection(source="depth:object", width=60, length=100,
+                             area=7000, axis=62.0, z=230)
+        plan = gg.plan_grasp_geometry(
+            self.color, self.depth, self.intr, target,
+            current_rpy=(0.0, 0.0, 0.0), max_aperture_mm=50.0,
+            jaw_long_axis_camera_deg=-90.0,
+            max_yaw_delta_deg=20.0,
+            yaw_delta_bounds_deg=(-20.0, 20.0),
+            max_residual_yaw_deg=6.0,
+            allow_aperture_derived_residual=True,
+            semantic_envelope=envelope,
+            metric_jaw_width_mm=22.7,
+            metric_major_mm=74.9,
+        )
+
+        self.assertTrue(plan.ok, plan.reason)
+        self.assertNotIn("does not fit", plan.reason)
+        self.assertLess(plan.grasp_detection.min_width_mm, 50.0)
 
     def test_prominent_feature_can_be_grasped_above_oversized_body(self):
         handle = detection(source="color:green", width=18, length=20,

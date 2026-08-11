@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 TELEOP_EXAMPLE_DIR = ROOT / "reBotArm_control_py_fresh" / "example"
@@ -283,8 +284,28 @@ def check_ik_path(
                       waypoints[-1])
 
 
+def check_pose_clearance(
+    x: float, y: float, z: float,
+    roll: float, pitch: float, yaw: float,
+) -> MoveResult:
+    """Read-only endpoint IK/collision gate, including an attached payload."""
+    if not in_bounds(x, y, z):
+        return MoveResult(False, f"endpoint out_of_bounds ({x:.3f},{y:.3f},{z:.3f})")
+    local = _local_arm()
+    if local is None:
+        # Legacy service mode has no collision geometry; retain its IK gate.
+        return check_ik(x, y, z, roll, pitch, yaw)
+    try:
+        detail = local.validate_pose_configuration(x, y, z, roll, pitch, yaw)
+    except Exception as exc:
+        return MoveResult(False, f"endpoint_collision_check_error {exc}")
+    return MoveResult(bool(detail.get("ok")), str(detail.get("reason")),
+                      (x, y, z) if detail.get("ok") else None)
+
+
 def configure_collision_scene(
-    boxes: list[dict], *, table_z_m: float, payload_radius_m: float = 0.0
+    boxes: list[dict], *, table_z_m: float, payload_radius_m: float = 0.0,
+    voxel_m: float | None = None, inflation_m: float | None = None,
 ) -> MoveResult:
     """Install an RGB-D scene in the local backend's central motion gate."""
     local = _local_arm()
@@ -292,7 +313,8 @@ def configure_collision_scene(
         return MoveResult(False, "scene_collision_requires_local_backend")
     try:
         detail = local.configure_collision_scene(
-            boxes, table_z_m=table_z_m, payload_radius_m=payload_radius_m
+            boxes, table_z_m=table_z_m, payload_radius_m=payload_radius_m,
+            voxel_m=voxel_m, inflation_m=inflation_m,
         )
     except Exception as exc:
         return MoveResult(False, f"collision_scene_error {exc}")
@@ -302,6 +324,27 @@ def configure_collision_scene(
         f"self_pairs={detail['self_collision_pairs']} "
         f"payload_radius_mm={detail['payload_radius_m'] * 1000:.1f}",
     )
+
+
+def filter_scene_boxes_at_current_pose(boxes: list[dict]) -> dict:
+    local = _local_arm()
+    if local is None:
+        return {"ok": False, "reason": "scene_collision_requires_local_backend"}
+    try:
+        return local.filter_scene_boxes_at_current_pose(boxes)
+    except Exception as exc:
+        return {"ok": False, "reason": f"scene_self_filter_error {exc}"}
+
+
+def validate_current_collision_scene() -> dict:
+    """Read-only gate for a just-installed scene at current motor feedback."""
+    local = _local_arm()
+    if local is None:
+        return {"ok": False, "reason": "scene_collision_requires_local_backend"}
+    try:
+        return local.validate_current_collision_scene()
+    except Exception as exc:
+        return {"ok": False, "reason": f"scene_current_pose_error {exc}"}
 
 
 def update_collision_payload(radius_m: float) -> MoveResult:
@@ -318,10 +361,122 @@ def update_collision_payload(radius_m: float) -> MoveResult:
     ))
 
 
+def update_collision_payload_box(
+    size_m, long_axis_ee, center_offset_ee_m=None, axes_ee=None,
+) -> MoveResult:
+    local = _local_arm()
+    if local is None:
+        return MoveResult(False, "scene_collision_requires_local_backend")
+    try:
+        detail = local.update_collision_payload_box(
+            size_m, long_axis_ee, center_offset_ee_m, axes_ee=axes_ee
+        )
+    except Exception as exc:
+        return MoveResult(False, f"collision_payload_box_error {exc}")
+    return MoveResult(
+        bool(detail.get("ok")),
+        f"payload_box_size_m={detail.get('payload_box_size_m')} "
+        f"center_offset_ee_m="
+        f"{detail.get('payload_box_center_offset_ee_m')}",
+    )
+
+
+def begin_payload_vertical_escape() -> dict:
+    """Open a scoped collision exception for support contact at grasp time."""
+    local = _local_arm()
+    if local is None:
+        return {"ok": False, "reason": "scene_collision_requires_local_backend"}
+    try:
+        return local.begin_payload_vertical_escape()
+    except Exception as exc:
+        return {"ok": False, "reason": f"payload_escape_begin_error {exc}"}
+
+
+def validate_payload_escape_endpoint(
+    x: float, y: float, z: float,
+    roll: float, pitch: float, yaw: float,
+) -> MoveResult:
+    """Require an extraction endpoint to clear the complete collision scene."""
+    if not in_bounds(x, y, z):
+        return MoveResult(False, "payload escape endpoint is out of bounds")
+    local = _local_arm()
+    if local is None:
+        return MoveResult(False, "scene_collision_requires_local_backend")
+    try:
+        detail = local.validate_payload_escape_endpoint(
+            x, y, z, roll, pitch, yaw
+        )
+    except Exception as exc:
+        return MoveResult(False, f"payload_escape_endpoint_error {exc}")
+    return MoveResult(bool(detail.get("ok")), str(
+        detail.get("reason") if detail.get("ok") else detail
+    ), (x, y, z) if detail.get("ok") else None)
+
+
+def end_payload_vertical_escape() -> dict:
+    """Restore full collision checking and validate the measured arm pose."""
+    local = _local_arm()
+    if local is None:
+        return {"ok": False, "reason": "scene_collision_requires_local_backend"}
+    try:
+        return local.end_payload_vertical_escape()
+    except Exception as exc:
+        return {"ok": False, "reason": f"payload_escape_end_error {exc}"}
+
+
 def clear_collision_scene() -> None:
     local = _local_arm()
     if local is not None:
         local.clear_collision_scene()
+
+
+def collision_scene_version() -> int | None:
+    local = _local_arm()
+    return None if local is None else local.collision_scene_version
+
+
+def plan_joint_motion(
+    terminal_poses: list[tuple[float, float, float, float, float, float]],
+    *,
+    orientation_ref_rpy=None,
+    max_tilt_rad: float | None = None,
+    timeout_s: float = 4.0,
+    max_nodes: int = 4000,
+    seed: int = 0,
+) -> dict:
+    """Plan an arbitrary collision-free joint route; never moves hardware."""
+    local = _local_arm()
+    if local is None:
+        return {"ok": False, "reason": "joint planner requires local backend"}
+    try:
+        return local.plan_joint_motion(
+            terminal_poses,
+            workspace_lo=(X_MIN, Y_MIN, Z_MIN),
+            workspace_hi=(X_MAX, Y_MAX, Z_MAX),
+            orientation_ref_rpy=orientation_ref_rpy,
+            max_tilt_rad=max_tilt_rad,
+            timeout_s=timeout_s,
+            max_nodes=max_nodes,
+            seed=seed,
+        )
+    except Exception as exc:
+        return {"ok": False, "reason": f"joint_planner_error {exc}"}
+
+
+def execute_joint_plan(plan: dict) -> MoveResult:
+    """Execute only a still-current, backend-certified joint plan."""
+    local = _local_arm()
+    if local is None:
+        return MoveResult(False, "joint planner requires local backend")
+    try:
+        state = local.execute_joint_plan(plan)
+    except Exception as exc:
+        return MoveResult(False, f"joint_plan_execution_refused {exc}")
+    reached = state.get("end_effector", {}).get("position_m")
+    return MoveResult(
+        True, "certified minimum-jerk joint plan completed",
+        tuple(float(value) for value in reached) if reached else None,
+    )
 
 
 def safe_move(x, y, z, *, roll: float | None = None, pitch: float | None = None,
@@ -460,14 +615,107 @@ def safe_move_path(
         (abs(float(v)) for v in state.get("joint_vel_rad_s", [])),
         default=float("inf"),
     )
-    ok = off < 0.01 and angular_off < ORIENTATION_TOL_RAD and velocity < 0.10
+    settlement = state.get("settlement")
+    settled = (
+        bool(settlement.get("ok")) if isinstance(settlement, dict)
+        else velocity < 0.10
+    )
+    ok = off < 0.01 and angular_off < ORIENTATION_TOL_RAD and settled
     reason = (
-        f"continuous_minimum_jerk_arrived ({len(waypoints)} waypoints)"
+        f"continuous_minimum_jerk_arrived ({len(waypoints)} waypoints; "
+        f"settled_by={(settlement or {}).get('method', 'velocity_snapshot')})"
         if ok else
         f"continuous_path_unsettled position={off*1000:.1f}mm "
-        f"orientation={angular_off:.4f}rad velocity={velocity:.3f}rad/s"
+        f"orientation={angular_off:.4f}rad velocity={velocity:.3f}rad/s "
+        f"settlement={settlement}"
     )
     return MoveResult(ok, reason, reached)
+
+
+def safe_pose_path(
+    poses: list[tuple[float, float, float, float, float, float]],
+) -> MoveResult:
+    """Execute a fully prevalidated XYZ+RPY chain as one smooth trajectory.
+
+    Unlike repeated ``safe_move`` calls, this enters the controller once.  The
+    local backend solves the entire chain with deterministic IK continuation and
+    validates joint limits/collisions before sending the first target.
+    """
+    if not poses:
+        return MoveResult(True, "empty_pose_path")
+    local = _local_arm()
+    if local is None:
+        return MoveResult(False, "continuous_pose_path_requires_local_backend")
+    try:
+        current_xyz = np.asarray(ee_pos(), dtype=float)
+        current_rpy = np.asarray(ee_rpy(), dtype=float)
+    except Exception as exc:
+        return MoveResult(False, f"state_read_failed {exc}")
+    previous_xyz = current_xyz
+    previous_rpy = current_rpy
+    linear_distance = 0.0
+    angular_distance = 0.0
+    eps = 1e-5
+    normalized = []
+    for index, pose in enumerate(poses, 1):
+        if len(pose) != 6:
+            return MoveResult(False, f"pose waypoint {index} is not XYZRPY")
+        values = np.asarray(pose, dtype=float)
+        if not np.all(np.isfinite(values)):
+            return MoveResult(False, f"pose waypoint {index} is non-finite")
+        xyz, rpy = values[:3], values[3:]
+        if not in_bounds(*xyz):
+            return MoveResult(False, f"pose waypoint {index} out_of_bounds")
+        delta = xyz - previous_xyz
+        if abs(delta[0]) > MAX_XY_STEP + eps or \
+                abs(delta[1]) > MAX_XY_STEP + eps or \
+                abs(delta[2]) > MAX_Z_STEP + eps:
+            return MoveResult(
+                False,
+                f"pose waypoint {index} step_too_large "
+                f"dx={delta[0]*1000:.1f} dy={delta[1]*1000:.1f} "
+                f"dz={delta[2]*1000:.1f}mm",
+            )
+        linear_distance += float(np.linalg.norm(delta))
+        angular_distance += float(np.max(np.abs(rpy - previous_rpy)))
+        previous_xyz, previous_rpy = xyz, rpy
+        normalized.append(tuple(float(value) for value in values))
+    duration = max(
+        MIN_MOVE_S,
+        linear_distance / max(1e-6, TOOL_SPEED_M_S),
+        angular_distance / max(1e-6, TOOL_ANGULAR_SPEED_RAD_S),
+    )
+    try:
+        state = local.move_pose_path(
+            normalized, duration=duration, send_freq=50.0
+        )
+    except Exception as exc:
+        return MoveResult(False, f"continuous_pose_path_error {exc}")
+    endpoint = np.asarray(normalized[-1], dtype=float)
+    reached = np.asarray(state["end_effector"]["position_m"], dtype=float)
+    reached_rpy = np.asarray(state["end_effector"]["rpy_rad"], dtype=float)
+    position_error = float(np.max(np.abs(reached - endpoint[:3])))
+    angular_error = float(np.max(np.abs(reached_rpy - endpoint[3:])))
+    velocity = max(
+        (abs(float(value)) for value in state.get("joint_vel_rad_s", [])),
+        default=float("inf"),
+    )
+    settlement = state.get("settlement")
+    settled = (
+        bool(settlement.get("ok")) if isinstance(settlement, dict)
+        else velocity < 0.10
+    )
+    ok = position_error < 0.01 and angular_error < ORIENTATION_TOL_RAD \
+        and settled
+    reason = (
+        f"continuous_pose_minimum_jerk_arrived ({len(normalized)} waypoints; "
+        f"settled_by={(settlement or {}).get('method', 'velocity_snapshot')})"
+        if ok else
+        f"continuous_pose_unsettled position={position_error*1000:.1f}mm "
+        f"orientation={angular_error:.4f}rad velocity={velocity:.4f}rad/s "
+        f"settlement={settlement}"
+    )
+    return MoveResult(ok, reason, tuple(float(value) for value in reached))
 
 
 def safe_step(dx=0.0, dy=0.0, dz=0.0, *, cur=None, **kw) -> MoveResult:

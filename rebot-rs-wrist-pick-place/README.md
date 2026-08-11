@@ -1,7 +1,12 @@
 # reBot RS wrist-camera pick/place
 
 This is the known-good source snapshot for the fixed, preplanned RS wrist-camera
-pick/place workflow developed and hardware-tested through 2026-08-03.
+pick/place workflow, refreshed from the hardware-tested workspace on 2026-08-11.
+
+Pick and placement are exposed independently through the long-lived Hermes MCP
+controller. A successful pick creates an in-memory hold certificate and measured
+payload context; placement consumes that certificate, releases, and homes. The
+combined operation remains available and uses the same two phase implementations.
 
 ## Verified hardware outcome
 
@@ -65,5 +70,7 @@ From the robot workspace:
 python -m unittest discover -s tests
 ```
 
-The robot-workspace snapshot passes 101 tests, including synthetic RGB-D mapping
-and RS-URDF collision tests.
+The refreshed workspace passes the 172-test wrist workflow suite and the
+10-test voxel-navigation suite. Hardware-dependent local-arm tests additionally
+require the robot workspace's controller package, URDF, and private calibration
+files, which are intentionally not duplicated here.
