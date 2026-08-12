@@ -813,6 +813,273 @@ def detect_colored_tabletop_object(
     )
 
 
+def complete_semantic_with_rgbd_object(
+    color_bgr: np.ndarray,
+    depth_mm: np.ndarray,
+    intr: Intrinsics,
+    semantic: Detection,
+    *,
+    near_mm: float = NEAR_MM,
+    far_mm: float = FAR_MM,
+) -> tuple[Detection | None, dict[str, Any]]:
+    """Associate a semantic part mask with its complete physical RGB-D object.
+
+    Text segmentation often returns the named/coloured part of an object (for
+    example a purple cap) rather than a differently coloured connected body.
+    SAM remains the identity authority, while the table-plane depth component
+    supplies the whole physical mask only when it contains a substantial part
+    of that exact semantic mask at compatible depth.  No class-specific names,
+    colours, or dimensions are used.
+    """
+    semantic_mask = np.asarray(
+        (getattr(semantic, "info", {}) or {}).get("mask_u8"),
+        dtype=np.uint8,
+    )
+    if semantic_mask.shape != depth_mm.shape or not np.any(semantic_mask > 0):
+        return None, {"reason": "semantic detection has no native pixel mask"}
+    semantic_pixels = semantic_mask > 0
+    semantic_count = int(np.count_nonzero(semantic_pixels))
+    objects = segment_objects(
+        color_bgr, depth_mm, intr,
+        near_mm=near_mm, far_mm=far_mm,
+        max_height_mm=220.0,
+        min_area_px=max(60.0, 0.3 * float(MIN_AREA_PX)),
+    )
+    candidates: list[
+        tuple[float, float, float, Detection, int, float]
+    ] = []
+    for physical in objects:
+        raw_physical_mask = np.asarray(
+            (getattr(physical, "info", {}) or {}).get("mask_u8"),
+            dtype=np.uint8,
+        )
+        if raw_physical_mask.shape != depth_mm.shape:
+            continue
+        physical_mask, separation = \
+            _separate_semantic_seeded_component(
+                raw_physical_mask, semantic_mask
+            )
+        overlap = int(np.count_nonzero(
+            semantic_pixels & (physical_mask > 0)
+        ))
+        overlap_fraction = overlap / max(1, semantic_count)
+        if overlap < 12 or overlap_fraction < 0.20:
+            continue
+        depth_delta = abs(float(physical.z_mm) - float(semantic.z_mm))
+        if depth_delta > 45.0:
+            continue
+        mask_area = int(np.count_nonzero(physical_mask > 0))
+        area_ratio = float(mask_area) / max(1.0, float(semantic.area_px))
+        contours, _ = cv2.findContours(
+            physical_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            continue
+        contour = max(contours, key=cv2.contourArea)
+        moments = cv2.moments(contour)
+        if moments["m00"] <= 0:
+            continue
+        u = float(moments["m10"] / moments["m00"])
+        v = float(moments["m01"] / moments["m00"])
+        valid_pixels = (physical_mask > 0) & depth_gate(
+            depth_mm, near_mm, far_mm
+        )
+        values = np.asarray(depth_mm[valid_pixels], dtype=float)
+        if values.size < 10:
+            continue
+        z_mm = float(np.median(values))
+        x, y, bw, bh = cv2.boundingRect(contour)
+        (_, _), (rw, rh), _ = cv2.minAreaRect(contour)
+        min_width_mm, max_width_mm = _metric_size(rw, rh, z_mm, intr)
+        physical = Detection(
+            box=(x, y, x + bw, y + bh), uv=(u, v), z_mm=z_mm,
+            p_cam_mm=deproject(u, v, z_mm, intr), source=physical.source,
+            area_px=float(mask_area), min_width_mm=min_width_mm,
+            max_width_mm=max_width_mm,
+            info={
+                **(getattr(physical, "info", {}) or {}),
+                "mask_u8": physical_mask,
+                "semantic_seeded_instance_separation": separation,
+                **rect_geometry(contour),
+            },
+        )
+        # The completion may be much larger than a cap/label, but an enormous
+        # component is more likely a merged support or scene surface.
+        center_delta_mm = float(np.linalg.norm(
+            np.asarray(physical.p_cam_mm, dtype=float)
+            - np.asarray(semantic.p_cam_mm, dtype=float)
+        ))
+        if area_ratio > 10.0 or center_delta_mm > 75.0:
+            continue
+        candidates.append((
+            -overlap_fraction, center_delta_mm, depth_delta, physical,
+            overlap, area_ratio,
+        ))
+    if not candidates:
+        return None, {
+            "reason": "no depth-connected tabletop object contained the semantic mask",
+            "physical_candidates": len(objects),
+        }
+    _negative_overlap, center_delta_mm, depth_delta, physical, overlap, \
+        area_ratio = min(
+        candidates, key=lambda item: (item[0], item[1], item[2])
+    )
+    physical_info = getattr(physical, "info", {}) or {}
+    completed = Detection(
+        box=physical.box,
+        uv=physical.uv,
+        z_mm=physical.z_mm,
+        p_cam_mm=physical.p_cam_mm,
+        source=semantic.source,
+        area_px=physical.area_px,
+        min_width_mm=physical.min_width_mm,
+        max_width_mm=physical.max_width_mm,
+        info={
+            **(getattr(semantic, "info", {}) or {}),
+            **physical_info,
+            "mask_u8": np.asarray(physical_info["mask_u8"], dtype=np.uint8),
+            "segmentation_source": "semantic_seeded_rgbd_object_completion",
+            "depth_basis": "semantic_seeded_rgbd_object",
+            "object_completion_validated": True,
+            "semantic_identity_source": semantic.source,
+            "semantic_box": list(semantic.box),
+            "semantic_anchor_uv": [float(v) for v in semantic.uv],
+            "semantic_anchor_xyz_mm": [float(v) for v in semantic.p_cam_mm],
+            "semantic_overlap_pixels": overlap,
+            "semantic_overlap_fraction": round(-_negative_overlap, 4),
+            "semantic_to_object_depth_delta_mm": round(depth_delta, 2),
+            "semantic_to_object_center_delta_mm": round(center_delta_mm, 2),
+            "completion_area_ratio": round(area_ratio, 3),
+        },
+    )
+    return completed, {
+        "reason": "semantic identity expanded to its overlapping RGB-D object component",
+        "overlap_fraction": round(-_negative_overlap, 4),
+        "area_ratio": round(area_ratio, 3),
+        "depth_delta_mm": round(depth_delta, 2),
+        "center_delta_mm": round(center_delta_mm, 2),
+    }
+
+
+def _separate_semantic_seeded_component(
+    physical_mask_u8: np.ndarray,
+    semantic_mask_u8: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Split thin bridges and retain only the object containing the SAM seed."""
+    physical = np.where(
+        np.asarray(physical_mask_u8) > 0, 255, 0
+    ).astype(np.uint8)
+    semantic = np.asarray(semantic_mask_u8) > 0
+    original_area = int(np.count_nonzero(physical))
+    best = physical
+    best_area = original_area
+    best_iterations = 0
+    kernel = np.ones((3, 3), np.uint8)
+    for iterations in range(1, 5):
+        eroded = cv2.erode(physical, kernel, iterations=iterations)
+        count, labels = cv2.connectedComponents(
+            (eroded > 0).astype(np.uint8), connectivity=8
+        )
+        if count <= 1:
+            continue
+        overlaps = [
+            int(np.count_nonzero((labels == label) & semantic))
+            for label in range(1, count)
+        ]
+        if not overlaps or max(overlaps) <= 0:
+            continue
+        selected_label = int(np.argmax(overlaps)) + 1
+        core = (labels == selected_label).astype(np.uint8) * 255
+        restored = cv2.dilate(core, kernel, iterations=iterations)
+        restored &= physical
+        semantic_overlap = int(np.count_nonzero((restored > 0) & semantic))
+        if semantic_overlap < max(12, int(0.20 * np.count_nonzero(semantic))):
+            continue
+        area = int(np.count_nonzero(restored))
+        if 0 < area < best_area:
+            best, best_area, best_iterations = restored, area, iterations
+    return best, {
+        "applied": best_iterations > 0,
+        "erosion_iterations": best_iterations,
+        "pixels_before": original_area,
+        "pixels_after": best_area,
+        "removed_fraction": round(
+            1.0 - best_area / max(1, original_area), 4
+        ),
+    }
+
+
+def validate_full_object_semantic_query(
+    identifier: Detection,
+    complete: Detection | None,
+) -> tuple[Detection | None, dict[str, Any]]:
+    """Require a complete-instance query to contain the identifier instance."""
+    if complete is None:
+        return None, {"reason": "complete-object semantic query found nothing"}
+    identifier_mask = np.asarray(
+        (getattr(identifier, "info", {}) or {}).get("mask_u8"),
+        dtype=np.uint8,
+    )
+    complete_mask = np.asarray(
+        (getattr(complete, "info", {}) or {}).get("mask_u8"),
+        dtype=np.uint8,
+    )
+    if identifier_mask.shape != complete_mask.shape \
+            or identifier_mask.ndim != 2:
+        return None, {"reason": "semantic query masks are unavailable or mismatched"}
+    identifier_pixels = identifier_mask > 0
+    complete_pixels = complete_mask > 0
+    identifier_count = int(np.count_nonzero(identifier_pixels))
+    complete_count = int(np.count_nonzero(complete_pixels))
+    overlap = int(np.count_nonzero(identifier_pixels & complete_pixels))
+    overlap_fraction = overlap / max(1, identifier_count)
+    area_ratio = complete_count / max(1, identifier_count)
+    depth_delta = abs(float(complete.z_mm) - float(identifier.z_mm))
+    center_delta = float(np.linalg.norm(
+        np.asarray(complete.p_cam_mm, dtype=float)
+        - np.asarray(identifier.p_cam_mm, dtype=float)
+    ))
+    accepted = bool(
+        overlap >= 12
+        and overlap_fraction >= 0.35
+        and 1.10 <= area_ratio <= 10.0
+        and depth_delta <= 45.0
+        and center_delta <= 75.0
+    )
+    detail = {
+        "reason": (
+            "complete-object semantic mask contains the identifier instance"
+            if accepted else
+            "complete-object semantic mask did not safely match the identifier"
+        ),
+        "overlap_fraction": round(overlap_fraction, 4),
+        "area_ratio": round(area_ratio, 3),
+        "depth_delta_mm": round(depth_delta, 2),
+        "center_delta_mm": round(center_delta, 2),
+    }
+    if not accepted:
+        return None, detail
+    return Detection(
+        box=complete.box, uv=complete.uv, z_mm=complete.z_mm,
+        p_cam_mm=complete.p_cam_mm, source=identifier.source,
+        area_px=complete.area_px,
+        min_width_mm=complete.min_width_mm,
+        max_width_mm=complete.max_width_mm,
+        info={
+            **(getattr(complete, "info", {}) or {}),
+            "object_completion_validated": True,
+            "semantic_identity_source": identifier.source,
+            "segmentation_source": "complete_object_semantic_query:native_mask",
+            "depth_basis": "native_semantic_mask",
+            "semantic_box": list(identifier.box),
+            "semantic_anchor_uv": [float(v) for v in identifier.uv],
+            "semantic_anchor_xyz_mm": [float(v) for v in identifier.p_cam_mm],
+            "completion_query_overlap_fraction": round(overlap_fraction, 4),
+            "completion_query_area_ratio": round(area_ratio, 3),
+        },
+    ), detail
+
+
 def segment_target_envelope(
     color_bgr: np.ndarray,
     depth_mm: np.ndarray,
@@ -976,10 +1243,21 @@ def segment_semantic_envelope(
     # A grounded SAM backend supplies a true promptable object mask.  Retain the
     # deterministic GrabCut path as a fallback for cached LocateAnything users.
     from .local_vision import segment_box as segment_local_box
-    component = segment_local_box(
-        color_bgr, (x1, y1, x2, y2)
+    embedded_mask = (getattr(semantic_box, "info", {}) or {}).get("mask_u8")
+    component = None
+    if embedded_mask is not None:
+        embedded_mask = np.asarray(embedded_mask, dtype=np.uint8)
+        if embedded_mask.shape == depth_mm.shape:
+            component = np.where(embedded_mask > 0, 255, 0).astype(np.uint8)
+    if component is None:
+        component = segment_local_box(
+            color_bgr, (x1, y1, x2, y2)
+        )
+    segmentation_source = str(
+        (getattr(semantic_box, "info", {}) or {}).get(
+            "segmentation_source", f"{semantic_box.source}:native_mask"
+        )
     )
-    segmentation_source = f"{semantic_box.source}:native_mask"
     diag["native_mask_available"] = component is not None
     if component is None:
         segmentation_source = "grabcut"
@@ -1140,6 +1418,16 @@ def segment_semantic_envelope(
             "semantic_box": list(semantic_box.box),
             "segmentation_source": segmentation_source,
             "identifier_source": identifier.source,
+            "semantic_identity_source": (
+                (getattr(semantic_box, "info", {}) or {}).get(
+                    "semantic_identity_source", identifier.source
+                )
+            ),
+            "object_completion_validated": bool(
+                (getattr(semantic_box, "info", {}) or {}).get(
+                    "object_completion_validated", False
+                )
+            ),
             "depth_edge_mm": depth_edge_mm,
             "mask_pixels_before_cleanup": diag.get(
                 "mask_pixels_before_cleanup"
@@ -1288,6 +1576,9 @@ def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, descri
     vision_primary = os.getenv(
         "REBOT_VISION_PRIMARY", "0"
     ).strip().lower() in {"1", "true", "yes", "on"}
+    hybrid_identity = os.getenv(
+        "REBOT_OBJECT_GEOMETRY_MODE", "legacy"
+    ).strip().lower() == "hybrid"
     names = colors_of(description)
     require_all_colors = _requires_all_colors(description)
     if allow_vlm and vision_enabled and vision_primary:
@@ -1297,6 +1588,27 @@ def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, descri
         )
         why["semantic_result"] = found.source if found else "not found"
         if found is not None:
+            if hybrid_identity:
+                complete_query = detect_vlm(
+                    color_bgr, depth_mm, intr,
+                    f"the complete physical {description}, including its "
+                    "entire body and all connected parts",
+                    near_mm=near_mm, far_mm=far_mm,
+                )
+                completed, completion_why = \
+                    validate_full_object_semantic_query(
+                        found, complete_query
+                    )
+                why["semantic_complete_object_query"] = completion_why
+                if completed is None:
+                    completed, completion_why = \
+                        complete_semantic_with_rgbd_object(
+                            color_bgr, depth_mm, intr, found,
+                            near_mm=near_mm, far_mm=far_mm,
+                        )
+                    why["semantic_rgbd_object_completion"] = completion_why
+                if completed is not None:
+                    found = completed
             if require_all_colors:
                 # Semantic grounding understands the noun (for example,
                 # ``sponge``); HSV does not reliably see every named colour on
@@ -1312,9 +1624,6 @@ def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, descri
     # Hybrid identity needs a physical object candidate even when open-vocabulary
     # grounding misses. The depth/table component is authoritative here; HSV is
     # only evidence inside that component. Legacy detection order is untouched.
-    hybrid_identity = os.getenv(
-        "REBOT_OBJECT_GEOMETRY_MODE", "legacy"
-    ).strip().lower() == "hybrid"
     if hybrid_identity and names:
         found = detect_colored_tabletop_object(
             color_bgr, depth_mm, intr, names,

@@ -7,7 +7,9 @@ import cv2
 import numpy as np
 
 from arm_agent.wrist_detect import (
+    _separate_semantic_seeded_component,
     Detection,
+    complete_semantic_with_rgbd_object,
     detect,
     detect_color,
     detect_color_conjunction,
@@ -17,10 +19,156 @@ from arm_agent.wrist_detect import (
     segment_target_envelope,
     segment_semantic_envelope,
     track_detection_flow,
+    validate_full_object_semantic_query,
 )
 
 
 class BlueDetectionTest(TestCase):
+    def test_semantic_seed_separates_thin_bridge_to_neighbor(self):
+        physical = np.zeros((80, 120), dtype=np.uint8)
+        physical[15:65, 15:40] = 255
+        physical[20:70, 70:110] = 255
+        physical[38:41, 40:70] = 255
+        semantic = np.zeros_like(physical)
+        semantic[20:35, 20:35] = 255
+
+        separated, detail = _separate_semantic_seeded_component(
+            physical, semantic
+        )
+
+        self.assertTrue(detail["applied"])
+        self.assertGreater(np.count_nonzero(separated[:, 15:40]), 0)
+        self.assertEqual(np.count_nonzero(separated[:, 70:110]), 0)
+        self.assertGreater(detail["removed_fraction"], 0.4)
+
+    def test_semantic_part_expands_to_overlapping_physical_object(self):
+        color = np.zeros((100, 120, 3), dtype=np.uint8)
+        depth = np.full((100, 120), 500.0, dtype=np.float32)
+        semantic_mask = np.zeros((100, 120), dtype=np.uint8)
+        semantic_mask[20:35, 50:70] = 255
+        physical_mask = np.zeros((100, 120), dtype=np.uint8)
+        physical_mask[20:85, 48:72] = 255
+        depth[physical_mask > 0] = 220.0
+        semantic = Detection(
+            box=(50, 20, 70, 35), uv=(60.0, 27.0), z_mm=220.0,
+            p_cam_mm=(0.0, -10.0, 220.0), source="sam3",
+            area_px=300.0, min_width_mm=11.0, max_width_mm=15.0,
+            info={"mask_u8": semantic_mask,
+                  "depth_basis": "native_semantic_mask"},
+        )
+        physical = Detection(
+            box=(48, 20, 72, 85), uv=(60.0, 52.0), z_mm=222.0,
+            p_cam_mm=(0.0, 2.0, 222.0), source="depth:object",
+            area_px=1500.0, min_width_mm=13.0, max_width_mm=36.0,
+            info={"mask_u8": physical_mask,
+                  "segmentation_source": "table_plane_depth_component"},
+        )
+
+        with patch(
+            "arm_agent.wrist_detect.segment_objects",
+            return_value=[physical],
+        ):
+            completed, detail = complete_semantic_with_rgbd_object(
+                color, depth, (300.0, 300.0, 60.0, 50.0), semantic,
+                near_mm=60.0, far_mm=600.0,
+            )
+
+        self.assertIsNotNone(completed)
+        assert completed is not None
+        self.assertEqual(completed.source, "sam3")
+        self.assertEqual(completed.box, physical.box)
+        self.assertEqual(
+            np.count_nonzero(completed.info["mask_u8"]),
+            np.count_nonzero(physical_mask),
+        )
+        self.assertTrue(completed.info["object_completion_validated"])
+        self.assertIn("expanded", detail["reason"])
+
+    def test_semantic_part_does_not_attach_to_nonoverlapping_object(self):
+        shape = (80, 100)
+        semantic_mask = np.zeros(shape, dtype=np.uint8)
+        semantic_mask[10:25, 10:25] = 255
+        other_mask = np.zeros(shape, dtype=np.uint8)
+        other_mask[35:70, 55:85] = 255
+        semantic = Detection(
+            box=(10, 10, 25, 25), uv=(17.0, 17.0), z_mm=220.0,
+            p_cam_mm=(0.0, 0.0, 220.0), source="sam3",
+            area_px=225.0, info={"mask_u8": semantic_mask},
+        )
+        other = Detection(
+            box=(55, 35, 85, 70), uv=(70.0, 52.0), z_mm=220.0,
+            p_cam_mm=(20.0, 10.0, 220.0), source="depth:object",
+            area_px=1000.0, info={"mask_u8": other_mask},
+        )
+
+        with patch(
+            "arm_agent.wrist_detect.segment_objects", return_value=[other]
+        ):
+            completed, detail = complete_semantic_with_rgbd_object(
+                np.zeros((*shape, 3), dtype=np.uint8),
+                np.full(shape, 220.0, dtype=np.float32),
+                (300.0, 300.0, 50.0, 40.0), semantic,
+            )
+
+        self.assertIsNone(completed)
+        self.assertIn("no depth-connected", detail["reason"])
+
+    def test_complete_semantic_query_must_contain_identifier_mask(self):
+        shape = (80, 100)
+        identifier_mask = np.zeros(shape, dtype=np.uint8)
+        identifier_mask[10:25, 40:60] = 255
+        complete_mask = np.zeros(shape, dtype=np.uint8)
+        complete_mask[10:65, 37:63] = 255
+        identifier = Detection(
+            box=(40, 10, 60, 25), uv=(50.0, 17.0), z_mm=220.0,
+            p_cam_mm=(0.0, -10.0, 220.0), source="sam3",
+            area_px=300.0, info={"mask_u8": identifier_mask},
+        )
+        complete = Detection(
+            box=(37, 10, 63, 65), uv=(50.0, 37.0), z_mm=222.0,
+            p_cam_mm=(0.0, 4.0, 222.0), source="sam3",
+            area_px=1400.0, min_width_mm=14.0, max_width_mm=32.0,
+            info={"mask_u8": complete_mask,
+                  "depth_basis": "native_semantic_mask"},
+        )
+
+        selected, detail = validate_full_object_semantic_query(
+            identifier, complete
+        )
+
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertTrue(selected.info["object_completion_validated"])
+        self.assertEqual(
+            selected.info["segmentation_source"],
+            "complete_object_semantic_query:native_mask",
+        )
+        self.assertIn("contains", detail["reason"])
+
+    def test_complete_semantic_query_rejects_different_instance(self):
+        shape = (80, 100)
+        a = np.zeros(shape, dtype=np.uint8)
+        b = np.zeros(shape, dtype=np.uint8)
+        a[10:25, 10:25] = 255
+        b[40:70, 60:90] = 255
+        identifier = Detection(
+            box=(10, 10, 25, 25), uv=(17.0, 17.0), z_mm=220.0,
+            p_cam_mm=(0.0, 0.0, 220.0), source="sam3",
+            area_px=225.0, info={"mask_u8": a},
+        )
+        other = Detection(
+            box=(60, 40, 90, 70), uv=(75.0, 55.0), z_mm=220.0,
+            p_cam_mm=(60.0, 30.0, 220.0), source="sam3",
+            area_px=900.0, info={"mask_u8": b},
+        )
+
+        selected, detail = validate_full_object_semantic_query(
+            identifier, other
+        )
+
+        self.assertIsNone(selected)
+        self.assertIn("did not safely match", detail["reason"])
+
     def test_sam3_anchor_uses_native_mask_depth_not_background_box(self):
         color = np.zeros((100, 140, 3), dtype=np.uint8)
         depth = np.full((100, 140), 590.0, dtype=np.float32)

@@ -182,8 +182,14 @@ DYNAMIC_WIDTH_CONSENSUS_MAX_SPREAD_MM = float(
 DYNAMIC_MICRO_LIFT_M = float(os.getenv("REBOT_DYNAMIC_MICRO_LIFT_M", "0.015"))
 DYNAMIC_HOLD_TOL_MM = float(os.getenv("REBOT_DYNAMIC_HOLD_TOL_MM", "6.0"))
 DYNAMIC_SLOT_TOL_MM = float(os.getenv("REBOT_DYNAMIC_SLOT_TOL_MM", "6.0"))
+DYNAMIC_SLOT_BOUNDARY_SLOP_MM = float(os.getenv(
+    "REBOT_DYNAMIC_SLOT_BOUNDARY_SLOP_MM", "0.5"
+))
 DYNAMIC_SLOT_DEPTH_SLACK_MM = float(os.getenv(
     "REBOT_DYNAMIC_SLOT_DEPTH_SLACK_MM", "3.0"
+))
+DYNAMIC_SLOT_DEPTH_BOUNDARY_SLOP_MM = float(os.getenv(
+    "REBOT_DYNAMIC_SLOT_DEPTH_BOUNDARY_SLOP_MM", "0.5"
 ))
 DYNAMIC_BODY_MAX_CORRECTIONS = int(os.getenv(
     "REBOT_DYNAMIC_BODY_MAX_CORRECTIONS", "2"
@@ -407,7 +413,6 @@ SETTLE_S = 0.35          # let the arm settle before re-observing
 LOST_RETRIES = 3         # re-grabs before declaring the object lost mid-servo
 GRASP_GAP_RAD = 0.09     # gripper stopped >this short of full close => holding
 GRIPPER_NEAR_RAD = 0.12  # gripper within this of the open target => released
-MIN_SIZED_GRASP_MM = float(os.getenv("REBOT_GRIPPER_MIN_OBJECT_MM", "8"))
 SIZE_TARGET_TOL_MM = float(os.getenv("REBOT_GRIPPER_SIZE_TARGET_TOL_MM", "1.5"))
 SIZE_SAFETY_MARGIN_MM = float(os.getenv("REBOT_GRIPPER_SIZE_MARGIN_MM", "0"))
 SIZE_COMPRESSION_MM = float(os.getenv("REBOT_GRIPPER_SIZE_COMPRESSION_MM", "0"))
@@ -2060,6 +2065,22 @@ def _startup_close_gripper() -> dict[str, Any]:
     return _gripper("close", close_rad)
 
 
+def _minimum_commandable_aperture_mm() -> float | None:
+    """Return the calibrated jaw gap at the immutable safe close command.
+
+    Object eligibility must follow the gripper's measured capability.  The old
+    fixed 8 mm object-size floor rejected narrow objects even though the hard
+    15 degree command limit still leaves only about a 5 mm gap.  This helper
+    keeps the decision tied to both the current calibration and the same hard
+    angle clamp used by every real gripper command.
+    """
+    from arm_agent import gripper_model as gm
+
+    close_rad, open_rad = _wrist_limits()
+    safe_close_rad = gm.target_for("close", (close_rad, open_rad))
+    return gm.aperture_mm(safe_close_rad)
+
+
 def _plan_aperture(det: Any) -> dict[str, Any]:
     """Plan pre-open and final grasp positions from measured depth size only.
 
@@ -2069,10 +2090,12 @@ def _plan_aperture(det: Any) -> dict[str, Any]:
     from arm_agent import gripper_model as gm
 
     max_ap = gm.max_aperture_mm(_wrist_limits())
+    min_ap = _minimum_commandable_aperture_mm()
     base = {"ok": False, "preopen_rad": None, "grasp_rad": None,
             "min_width_mm": None, "max_width_mm": None,
-            "max_aperture_mm": max_ap}
-    if max_ap is None:
+            "max_aperture_mm": max_ap,
+            "min_commandable_aperture_mm": min_ap}
+    if max_ap is None or min_ap is None:
         return {**base, "reason": "jaw millimetre calibration is missing; refusing to pick"}
     if det is None or det.min_width_mm is None or det.max_width_mm is None:
         return {**base, "reason": "detector did not produce a reliable metric object size; "
@@ -2082,16 +2105,24 @@ def _plan_aperture(det: Any) -> dict[str, Any]:
     if not (math.isfinite(narrow) and math.isfinite(wide)) or narrow <= 0 or wide < narrow:
         return {**base, "reason": f"invalid detected size {narrow:.1f}x{wide:.1f}mm; "
                                   "refusing to pick"}
-    if narrow < MIN_SIZED_GRASP_MM:
-        return {**base, "reason": f"object is only {narrow:.1f}mm across; below the "
-                                  f"conservative {MIN_SIZED_GRASP_MM:.1f}mm minimum"}
+    if narrow <= min_ap:
+        return {**base, "reason": f"object is only {narrow:.1f}mm across; the "
+                                  f"smallest safe commanded jaw opening is "
+                                  f"{min_ap:.1f}mm"}
     # Position-only closing has no force/contact inference. Keep the requested
     # undersize correction tightly bounded even when an environment value is
     # mistyped. Four millimetres is the tested maximum: one millimetre tighter
     # than the previous profile, while all calibrated angle/hard-limit gates
     # below remain unchanged.
     compression_mm = float(np.clip(SIZE_COMPRESSION_MM, 0.0, 4.0))
-    grasp_request_mm = narrow + SIZE_SAFETY_MARGIN_MM - compression_mm
+    raw_grasp_request_mm = (
+        narrow + SIZE_SAFETY_MARGIN_MM - compression_mm
+    )
+    # Never request an aperture below the immutable angle-bounded close
+    # position. For narrow but still graspable objects, reduce the requested
+    # compression automatically instead of rejecting them or commanding the
+    # motor against its stop.
+    grasp_request_mm = max(min_ap, raw_grasp_request_mm)
     if grasp_request_mm <= 0:
         return {**base, "reason": f"computed grasp target "
                                   f"{grasp_request_mm:.1f}mm is not positive; "
@@ -2102,8 +2133,8 @@ def _plan_aperture(det: Any) -> dict[str, Any]:
                                   f"{grasp_request_mm:.1f}mm, beyond the "
                                   f"{max_ap:.1f}mm jaw limit"}
 
-    # Open as generously as possible for approach, but close only to the measured
-    # narrow width. This deliberately commands zero planned compression.
+    # Open generously for approach. The final position is the measured width
+    # minus only the bounded, angle-representable compression computed above.
     preopen_mm = min(max_ap, max(narrow + gm.CLEARANCE_MM, wide + gm.CLEARANCE_MM))
     preopen_rad = gm.rad_for_aperture(preopen_mm, _wrist_limits())
     grasp_rad = gm.rad_for_aperture(grasp_request_mm, _wrist_limits())
@@ -2115,10 +2146,14 @@ def _plan_aperture(det: Any) -> dict[str, Any]:
         return {**base, "reason": f"safe jaw limits cannot represent the "
                                   f"{grasp_request_mm:.1f}mm "
                                   f"grasp target (nearest is {actual_grasp_mm}); refusing"}
-    if compression_mm > 0:
+    effective_compression_mm = max(
+        0.0, narrow + SIZE_SAFETY_MARGIN_MM - float(actual_grasp_mm)
+    )
+    if effective_compression_mm > 1e-6:
         grasp_basis = (
-            f"{compression_mm:.1f}mm smaller than the detected width; "
-            f"{compression_mm:.1f}mm planned position compression"
+            f"{effective_compression_mm:.1f}mm smaller than the detected "
+            f"width; {effective_compression_mm:.1f}mm planned position "
+            "compression"
         )
     elif SIZE_SAFETY_MARGIN_MM == 0:
         grasp_basis = "exact detected width; zero planned compression"
@@ -2137,7 +2172,7 @@ def _plan_aperture(det: Any) -> dict[str, Any]:
     return {**base, "ok": True, "reason": note, "preopen_rad": preopen_rad,
             "grasp_rad": grasp_rad, "preopen_mm": actual_preopen_mm,
             "grasp_mm": actual_grasp_mm,
-            "planned_compression_mm": compression_mm}
+            "planned_compression_mm": effective_compression_mm}
 
 
 def _validate_object_gripper_fit(
@@ -2456,6 +2491,7 @@ def _geometry_with_3d_jaw_width(
 def _jaw_slot_fit(
     observed_cam_mm: Any, expected_cam_mm: Any,
     jaw_plan: dict[str, Any], geometry: GG.GraspGeometry,
+    object_box_3d: dict[str, Any] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """Check jaw capture by physical axes instead of a spherical error norm."""
     error = np.asarray(observed_cam_mm, dtype=float) - np.asarray(
@@ -2482,9 +2518,25 @@ def _jaw_slot_fit(
     depth_mm = abs(float(error[2]))
     width_mm = float(jaw_plan["min_width_mm"])
     preopen_mm = float(jaw_plan["preopen_mm"])
-    half_open_clearance = max(0.0, 0.5 * (preopen_mm - width_mm) - 1.0)
-    across_limit = min(12.0, half_open_clearance)
-    fit_ok, fit_detail = _validate_object_gripper_fit(geometry, jaw_plan)
+    physical_half_clearance = max(0.0, 0.5 * (preopen_mm - width_mm))
+    # Keep a real capture margin inside each open finger, but do not command a
+    # multi-millimetre arm recentering move for sub-millimetre RGB-D boundary
+    # noise.  The allowance is capped below the 1 mm physical reserve, so a
+    # passing observation is still inside the measured open-jaw envelope.
+    boundary_slop = float(np.clip(
+        DYNAMIC_SLOT_BOUNDARY_SLOP_MM, 0.0, 0.75
+    ))
+    capture_reserve = 1.0 - boundary_slop
+    across_limit = min(
+        12.0, max(0.0, physical_half_clearance - capture_reserve)
+    )
+    # Use the same registered object box that authorized the approach. A close
+    # view is often cropped by the fingers; re-running the complete-object fit
+    # on that partial view can contradict the already validated 3-D geometry
+    # and turn a 0.2 mm slot residual into an infinite violation.
+    fit_ok, fit_detail = _validate_object_gripper_fit(
+        geometry, jaw_plan, object_box_3d
+    )
     end_clearance = float(fit_detail.get("end_clearance_mm", base_tol))
     along_limit = min(20.0, max(base_tol, end_clearance - 5.0))
     # Optical depth carries systematic hand-eye/TCP error that is not visible
@@ -2494,7 +2546,15 @@ def _jaw_slot_fit(
     # arm from translating 8--16 mm to chase a final sub-millimetre depth
     # residual while the object is visibly between the jaws.
     depth_slack = float(np.clip(DYNAMIC_SLOT_DEPTH_SLACK_MM, 0.0, 3.0))
-    depth_limit = base_tol + depth_slack
+    # Treat only a sub-millimetre reading at the depth boundary as sensor
+    # quantisation. This is deliberately separate from the 3 mm systematic
+    # depth allowance and capped at 0.5 mm: the logged 9.2 mm observation can
+    # close without an unnecessary recentering move, while a genuine 11.1 mm
+    # miss remains outside the unchanged capture region.
+    depth_boundary_slop = float(np.clip(
+        DYNAMIC_SLOT_DEPTH_BOUNDARY_SLOP_MM, 0.0, 0.5
+    ))
+    depth_limit = base_tol + depth_slack + depth_boundary_slop
     ok = bool(
         fit_ok
         and across_limit > 0.0
@@ -2510,13 +2570,18 @@ def _jaw_slot_fit(
         ),
         "across_error_mm": across_mm,
         "across_limit_mm": across_limit,
+        "physical_across_limit_mm": physical_half_clearance,
+        "boundary_slop_mm": boundary_slop,
+        "capture_reserve_mm": capture_reserve,
         "along_error_mm": along_mm,
         "along_limit_mm": along_limit,
         "depth_error_mm": depth_mm,
         "depth_limit_mm": depth_limit,
         "depth_base_limit_mm": base_tol,
         "depth_slack_mm": depth_slack,
+        "depth_boundary_slop_mm": depth_boundary_slop,
         "fit_ok": fit_ok,
+        "fit_reason": fit_detail.get("reason"),
     }
 
 
@@ -2543,6 +2608,7 @@ def _propagate_locked_body_after_alignment(
     geometry: GG.GraspGeometry,
     previous_violation_mm: float,
     *, identity_frames: int,
+    object_box_3d: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Transport a locked grasp point through one measured tool correction.
 
@@ -2589,7 +2655,7 @@ def _propagate_locked_body_after_alignment(
         )
     predicted = body + mapping @ motion_m
     slot_ok, slot_detail = _jaw_slot_fit(
-        predicted, requested_cam_mm, jaw_plan, geometry
+        predicted, requested_cam_mm, jaw_plan, geometry, object_box_3d
     )
     violation = _jaw_slot_violation_mm(slot_detail)
     improved = bool(slot_ok or violation < previous - 0.5)
@@ -2620,6 +2686,7 @@ def _jaw_slot_depth_occupancy_detection(
     requested_body_cam_mm: Any,
     jaw_plan: dict[str, Any],
     geometry: GG.GraspGeometry,
+    object_box_3d: dict[str, Any] | None = None,
 ) -> tuple[WD.Detection | None, str]:
     """Detect anonymous foreground only inside the calibrated open-jaw slot.
 
@@ -2721,7 +2788,7 @@ def _jaw_slot_depth_occupancy_detection(
     v = float(np.median(component_rows))
     p_cam = WD.deproject(u, v, centre_z, intr)
     slot_ok, slot_detail = _jaw_slot_fit(
-        p_cam, target, jaw_plan, geometry
+        p_cam, target, jaw_plan, geometry, object_box_3d
     )
     if not slot_ok:
         return None, str(slot_detail.get("reason"))
@@ -3620,6 +3687,9 @@ def _endpoint_width_consensus(
     lower = float(ready_min_mm) - tolerance
     upper = float(ready_max_mm) + tolerance
     ordinarily_compatible = lower <= median_mm <= upper
+    minimum_graspable_mm = _minimum_commandable_aperture_mm()
+    if minimum_graspable_mm is None:
+        minimum_graspable_mm = math.inf
     # A close-range measurement is made at the exact stationary jaw pose and
     # can legitimately see a narrower local section than the distant ready
     # view. Let it override only downward, only when all five independent
@@ -3632,8 +3702,8 @@ def _endpoint_width_consensus(
         and len(cluster) >= 5
         and len(cluster) == len(valid)
         and cluster[-1][0] - cluster[0][0] <= min(1.0, spread_limit)
-        and median_mm >= max(
-            float(MIN_SIZED_GRASP_MM), 0.60 * float(ready_min_mm)
+        and median_mm > max(
+            float(minimum_graspable_mm), 0.60 * float(ready_min_mm)
         )
         and median_mm <= float(ready_max_mm)
     )
@@ -3649,7 +3719,7 @@ def _endpoint_width_consensus(
         and median_mm < lower
         and len(cluster) >= max(required, int(math.ceil(0.8 * len(valid))))
         and cluster[-1][0] - cluster[0][0] <= min(1.5, spread_limit)
-        and median_mm >= float(MIN_SIZED_GRASP_MM)
+        and median_mm > float(minimum_graspable_mm)
         and median_mm <= float(ready_max_mm)
     )
     authoritative_override = all_frame_override or stable_body_override
@@ -4080,6 +4150,7 @@ def _locked_identifier_body_slot_fallback(
     identifier_cam: Any, identifier_detail: dict[str, Any],
     feature_to_body_cam: Any, requested_cam: Any,
     jaw_plan: dict[str, Any], geometry: GG.GraspGeometry,
+    object_box_3d: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Recover body XYZ when open fingers destabilize only the body mask.
 
@@ -4105,7 +4176,7 @@ def _locked_identifier_body_slot_fallback(
         )
     body_cam = identifier - offset
     slot_ok, slot_detail = _jaw_slot_fit(
-        body_cam, requested_cam, jaw_plan, geometry,
+        body_cam, requested_cam, jaw_plan, geometry, object_box_3d,
     )
     return {
         "ok": bool(slot_ok),
@@ -4556,6 +4627,68 @@ def _hold_observation_pair(
                 and np.all(np.isfinite(after)):
             return before, after, basis
     return None, None, "unobserved"
+
+
+def _post_close_hold_baseline(
+    post_close_body_cam_mm: Any | None,
+    post_close_detail: dict[str, Any],
+) -> dict[str, Any]:
+    """Select evidence for a bounded lift without requiring visible fingers.
+
+    The physical grasp section has already passed multi-frame width, position,
+    full-object fit, and jaw-slot gates immediately before closure. Closing the
+    jaws often hides that exact section. A stable, identity-gated semantic
+    feature observed *after* closure is therefore sufficient as the before-lift
+    witness, but never as proof that the object is held. The following visual
+    micro-lift must still classify that witness as rigid with the wrist rather
+    than static on the table.
+    """
+    def finite_point(raw: Any | None) -> np.ndarray | None:
+        if raw is None:
+            return None
+        try:
+            point = np.asarray(raw, dtype=float)
+        except (TypeError, ValueError):
+            return None
+        if point.shape != (3,) or not np.all(np.isfinite(point)):
+            return None
+        return point
+
+    body = finite_point(post_close_body_cam_mm)
+    feature = finite_point(post_close_detail.get("feature_cam_mm"))
+    if body is not None:
+        return {
+            "ok": True,
+            "body_cam_mm": body,
+            "feature_cam_mm": feature,
+            "basis": "post_close_physical_body",
+            "reason": (
+                "stable post-close physical grasp section retained as the "
+                "micro-lift baseline"
+            ),
+        }
+    if feature is not None:
+        return {
+            "ok": True,
+            "body_cam_mm": None,
+            "feature_cam_mm": feature,
+            "basis": "post_close_semantic_identifier",
+            "reason": (
+                "closed fingers occluded the pre-validated grasp section; "
+                "stable identity-gated post-close semantic feature retained "
+                "only as the micro-lift motion witness"
+            ),
+        }
+    return {
+        "ok": False,
+        "body_cam_mm": None,
+        "feature_cam_mm": None,
+        "basis": "unobserved",
+        "reason": (
+            "neither the physical grasp section nor a stable identity-gated "
+            "semantic feature was measurable after closure"
+        ),
+    }
 
 
 def _locked_body_from_feature(
@@ -6649,6 +6782,116 @@ def _plan_endpoint_alignment_correction(
     return waypoints, detail
 
 
+def _update_alignment_jacobian_from_feedback(
+    rigid_jacobian: Any,
+    tool_delta_m: Any,
+    body_before_cam_mm: Any,
+    body_after_cam_mm: Any,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Adapt the *local* fine-alignment map from one measured response.
+
+    The saved rigid camera map remains the geometric prior and is never
+    overwritten.  Near the open fingers, segmentation and the selected local
+    body section can respond differently from that prior.  Once the same
+    section has been locked and remeasured after a successful bounded move, a
+    rank-one secant update makes the next (and only the next) correction agree
+    with the response that was actually observed.
+
+    Contradictory, tiny, excessive, or ill-conditioned responses are rejected.
+    This helper does not plan motion, relax the jaw slot, or increase any
+    displacement limit.
+    """
+    failure = lambda reason, **extra: {
+        "ok": False, "reason": reason, **extra,
+    }
+    try:
+        mapping = np.asarray(rigid_jacobian, dtype=float)
+        delta = np.asarray(tool_delta_m, dtype=float)
+        before = np.asarray(body_before_cam_mm, dtype=float)
+        after = np.asarray(body_after_cam_mm, dtype=float)
+    except (TypeError, ValueError):
+        return None, failure("visual-feedback alignment inputs are invalid")
+    if mapping.shape != (3, 3) or delta.shape != (3,) \
+            or before.shape != (3,) or after.shape != (3,) \
+            or not all(np.all(np.isfinite(value)) for value in (
+                mapping, delta, before, after,
+            )):
+        return None, failure(
+            "visual-feedback alignment inputs are incomplete or non-finite"
+        )
+
+    motion_mm = float(np.linalg.norm(delta) * 1000.0)
+    if motion_mm < 0.5 or motion_mm > 15.0:
+        return None, failure(
+            f"measured tool motion {motion_mm:.1f}mm is outside the "
+            "0.5-15.0mm feedback bound",
+            tool_motion_mm=motion_mm,
+        )
+    predicted_shift = mapping @ delta
+    observed_shift = after - before
+    predicted_norm = float(np.linalg.norm(predicted_shift))
+    observed_norm = float(np.linalg.norm(observed_shift))
+    if predicted_norm < 0.5 or observed_norm < 0.25:
+        return None, failure(
+            "camera response was too small to update the alignment map",
+            predicted_shift_mm=predicted_shift.round(2).tolist(),
+            observed_shift_mm=observed_shift.round(2).tolist(),
+        )
+    if observed_norm > 25.0:
+        return None, failure(
+            f"observed camera response {observed_norm:.1f}mm exceeds the "
+            "25.0mm feedback bound",
+            predicted_shift_mm=predicted_shift.round(2).tolist(),
+            observed_shift_mm=observed_shift.round(2).tolist(),
+        )
+    cosine = float(np.dot(predicted_shift, observed_shift) /
+                   (predicted_norm * observed_norm))
+    if cosine < 0.20:
+        return None, failure(
+            f"observed camera response contradicts the geometric prior "
+            f"(direction cosine {cosine:.2f})",
+            predicted_shift_mm=predicted_shift.round(2).tolist(),
+            observed_shift_mm=observed_shift.round(2).tolist(),
+            direction_cosine=cosine,
+        )
+
+    denominator = float(np.dot(delta, delta))
+    candidate = mapping + np.outer(
+        observed_shift - predicted_shift, delta
+    ) / denominator
+    try:
+        condition = float(np.linalg.cond(candidate))
+        singular_values = np.linalg.svd(candidate, compute_uv=False)
+    except np.linalg.LinAlgError:
+        return None, failure("feedback-updated camera mapping is singular")
+    if not np.all(np.isfinite(candidate)) or not math.isfinite(condition) \
+            or condition > 20.0 \
+            or float(np.min(singular_values)) < 75.0 \
+            or float(np.max(singular_values)) > 1800.0:
+        return None, failure(
+            "feedback-updated camera mapping failed conditioning bounds",
+            condition_number=condition,
+            singular_values=[float(value) for value in singular_values],
+            predicted_shift_mm=predicted_shift.round(2).tolist(),
+            observed_shift_mm=observed_shift.round(2).tolist(),
+        )
+
+    fitted_shift = candidate @ delta
+    return candidate, {
+        "ok": True,
+        "reason": (
+            "accepted a local measured-response update for the next bounded "
+            "open-jaw correction; saved camera calibration is unchanged"
+        ),
+        "tool_motion_mm": round(motion_mm, 2),
+        "predicted_shift_mm": predicted_shift.round(2).tolist(),
+        "observed_shift_mm": observed_shift.round(2).tolist(),
+        "fitted_shift_mm": fitted_shift.round(2).tolist(),
+        "direction_cosine": round(cosine, 3),
+        "condition_number": round(condition, 3),
+    }
+
+
 def _plan_partial_slot_alignment_correction(
     observed_cam_mm: Any,
     expected_cam_mm: Any,
@@ -6656,6 +6899,7 @@ def _plan_partial_slot_alignment_correction(
     fixed_rpy: tuple[float, float, float],
     jaw_plan: dict[str, Any],
     geometry: GG.GraspGeometry,
+    object_box_3d: dict[str, Any] | None = None,
 ) -> tuple[Any | None, dict[str, Any]]:
     """Find a smaller clear correction that still satisfies the jaw slot.
 
@@ -6668,7 +6912,10 @@ def _plan_partial_slot_alignment_correction(
     expected = np.asarray(expected_cam_mm, dtype=float)
     mapping = np.asarray(rigid_jacobian, dtype=float)
     failures: list[str] = []
-    for fraction in (0.90, 0.75, 0.60, 0.55, 0.50):
+    # Try the smallest useful displacement first.  A correction only needs to
+    # put the body inside the capture box; centring it wastes clearance and can
+    # move a correctly positioned object out of the jaws.
+    for fraction in (0.50, 0.55, 0.60, 0.75, 0.90):
         intermediate_target = observed + fraction * (expected - observed)
         route, detail = _plan_endpoint_alignment_correction(
             observed, intermediate_target, mapping, fixed_rpy,
@@ -6684,7 +6931,7 @@ def _plan_partial_slot_alignment_correction(
         ) / 1000.0
         predicted = observed + mapping @ delta_base
         slot_ok, slot_detail = _jaw_slot_fit(
-            predicted, expected, jaw_plan, geometry
+            predicted, expected, jaw_plan, geometry, object_box_3d
         )
         if not slot_ok:
             failures.append(
@@ -7165,31 +7412,99 @@ def _exact_semantic_geometry_mask(
     detection_source = str(getattr(detection, "source", ""))
     if detection_source in _SEMANTIC_IDENTITY_SOURCES \
             and detection_info.get("mask_u8") is not None \
-            and detection_info.get("depth_basis") == "native_semantic_mask":
-        return True, "exact native semantic target detection mask"
+            and detection_info.get("depth_basis") in {
+                "native_semantic_mask", "semantic_seeded_rgbd_object"
+            }:
+        if detection_info.get("depth_basis") == "semantic_seeded_rgbd_object" \
+                and not detection_info.get("object_completion_validated"):
+            return False, "RGB-D object completion was not identity-validated"
+        return True, (
+            "semantic-seeded complete RGB-D object mask"
+            if detection_info.get("object_completion_validated") else
+            "exact native semantic target detection mask"
+        )
     if geometry is None:
         return False, "grasp observation is unavailable"
     envelope = getattr(geometry, "envelope_detection", None)
     info = getattr(envelope, "info", {}) or {}
     identity_source = (
         str(getattr(detection, "source", "")) if detection is not None else
-        str(info.get("identifier_source", ""))
+        str(info.get("semantic_identity_source")
+            or info.get("identifier_source", ""))
     )
     if identity_source not in _SEMANTIC_IDENTITY_SOURCES:
         return False, "target position came from non-semantic RGB-D tracking"
     if str(getattr(envelope, "source", "")) != "rgbd:semantic_envelope":
         return False, "accepted geometry does not use a semantic envelope"
-    if not str(info.get("segmentation_source", "")).endswith(":native_mask"):
+    completion_validated = bool(info.get("object_completion_validated"))
+    if not completion_validated and not str(
+        info.get("segmentation_source", "")
+    ).endswith(":native_mask"):
         return False, "semantic envelope does not carry a native model mask"
     if info.get("mask_u8") is None:
         return False, "native semantic object mask is unavailable"
-    return True, "exact native semantic target mask"
+    return True, (
+        "semantic-seeded complete RGB-D object mask"
+        if completion_validated else "exact native semantic target mask"
+    )
+
+
+def _filter_target_points_to_identity_cluster(
+    points_base_m: Any,
+    anchor_base_m: Any | None,
+    radius_m: float | None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Remove semantic-mask spill outside the established target identity.
+
+    The same metric radius used to reject a wrong semantic detection is also a
+    natural bound for its 3-D mask points. This keeps nearby scene points from
+    turning a valid small object into a huge fused OBB without introducing any
+    object-name or dimension-specific threshold.
+    """
+    points = np.asarray(points_base_m, dtype=float)
+    if points.ndim != 2 or points.shape[1:] != (3,):
+        return np.empty((0, 3), dtype=float), {
+            "ok": False, "reason": "target points have invalid dimensions"
+        }
+    if anchor_base_m is None or radius_m is None:
+        return points, {
+            "ok": True, "reason": "identity-cluster filtering not requested",
+            "kept": int(len(points)), "removed": 0,
+        }
+    try:
+        anchor = np.asarray(anchor_base_m, dtype=float)
+        radius = float(radius_m)
+    except (TypeError, ValueError):
+        return np.empty((0, 3), dtype=float), {
+            "ok": False, "reason": "target identity cluster is invalid"
+        }
+    if anchor.shape != (3,) or not np.all(np.isfinite(anchor)) \
+            or not math.isfinite(radius) or radius <= 0.0:
+        return np.empty((0, 3), dtype=float), {
+            "ok": False, "reason": "target identity cluster is invalid"
+        }
+    finite = np.all(np.isfinite(points), axis=1)
+    distances = np.full(len(points), math.inf, dtype=float)
+    distances[finite] = np.linalg.norm(points[finite] - anchor, axis=1)
+    kept = points[distances <= radius]
+    return kept, {
+        "ok": len(kept) >= 20,
+        "reason": (
+            f"kept {len(kept)}/{len(points)} semantic target points within "
+            f"the established {radius * 1000.0:.1f}mm identity cluster"
+        ),
+        "kept": int(len(kept)),
+        "removed": int(len(points) - len(kept)),
+        "radius_mm": radius * 1000.0,
+    }
 
 
 def _export_discovery_cloud(
     captured_views: list[dict[str, Any]], log: Callable[[str], None],
     *, force_geometry: bool = False,
     require_semantic_target_masks: bool = False,
+    target_anchor_base_m: Any | None = None,
+    target_anchor_radius_m: float | None = None,
 ) -> dict[str, Any]:
     """Fuse valid swept views even when 2D grasp planning stops early.
 
@@ -7272,6 +7587,18 @@ def _export_discovery_cloud(
                         tool_camera_mm=tool_camera,
                         near_mm=float(WD.NEAR_MM), far_mm=float(WD.FAR_MM),
                     )
+                    target_points, cluster_detail = \
+                        _filter_target_points_to_identity_cluster(
+                            target_points, target_anchor_base_m,
+                            target_anchor_radius_m,
+                        )
+                    if cluster_detail.get("removed", 0):
+                        log(
+                            "stage=discovery_target_identity_filter "
+                            f"view={view_name!r} "
+                            f"ok={cluster_detail.get('ok')} "
+                            f"detail={cluster_detail.get('reason')}"
+                        )
                     if len(target_points) >= 20:
                         target_point_sets.append((
                             len(clouds) - 1, target_points
@@ -7898,7 +8225,12 @@ def _install_scene_collision_map(
         target_detection = geometry.envelope_detection or geometry.grasp_detection
         if target_detection is not None:
             native_mask = getattr(target_detection, "info", {}).get("mask_u8")
-            if native_mask is not None:
+            # A verified stationary metric OBB is the authoritative target
+            # ownership test. Do not also apply a stochastic semantic mask:
+            # close masks can spill into a neighbouring object and erase it
+            # from the collision map. The OBB test happens after deprojection,
+            # so it remains tied to measured 3D target volume in every frame.
+            if native_mask is not None and not target_obbs:
                 native_mask = np.asarray(native_mask, dtype=np.uint8)
                 if native_mask.shape != np.asarray(depth).shape:
                     return False, {
@@ -9230,6 +9562,8 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 hybrid_cloud = _export_discovery_cloud(
                     scene_discovery_views, log, force_geometry=True,
                     require_semantic_target_masks=True,
+                    target_anchor_base_m=hybrid_identity_gate.anchor_base_m,
+                    target_anchor_radius_m=hybrid_identity_gate.radius_m,
                 )
                 hybrid_object_box_3d = hybrid_cloud.get("object_box_3d")
                 fused_view_count = int(hybrid_cloud.get("fused_views", 0))
@@ -9349,12 +9683,18 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     f"{float(retained_detail['observed_width_mm']):.1f}"
                 )
             else:
+                # A wrist RGB-D cloud observes only the camera-facing object
+                # surface. Its thinnest horizontal OBB extent can therefore be
+                # merely visible surface relief, not the object's complete jaw
+                # thickness. Keep the registered box for identity, length and
+                # collision geometry, but size the initial jaws from the
+                # depth-backed image silhouette. The later camera-axis 3-D
+                # projection may still replace that width after it proves the
+                # selected OBB axis is both visible and aligned with closure.
                 geometry = _plan_scene_grasp_geometry(
                     frame, det,
                     current_rpy=tuple(float(v) for v in A.ee_rpy()),
                     object_name=object_name,
-                    metric_jaw_width_mm=hybrid_metric_width_mm,
-                    metric_major_mm=hybrid_metric_major_mm,
                 )
                 if not geometry.ok or geometry.grasp_detection is None \
                         or geometry.rpy_rad is None:
@@ -9363,11 +9703,15 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                         f"proposal: {geometry.reason}",
                         discovery_cloud=hybrid_cloud,
                     )
-            log(
-                "stage=hybrid_object_geometry_applied "
-                f"width_mm={hybrid_metric_width_mm:.1f} "
-                f"major_mm={hybrid_metric_major_mm:.1f}"
-            )
+            if not recovered_metric_pose:
+                log(
+                    "stage=hybrid_object_geometry_applied "
+                    "mode=registered_shape_with_silhouette_jaw_width "
+                    f"surface_lower_bound_mm={hybrid_metric_width_mm:.1f} "
+                    f"major_mm={hybrid_metric_major_mm:.1f} "
+                    f"silhouette_width_mm="
+                    f"{float(geometry.grasp_detection.min_width_mm):.1f}"
+                )
         grasp_geometry_summary = geometry.summary()
         approach_rpy = tuple(float(v) for v in geometry.rpy_rad)
         live_rpy = np.asarray(A.ee_rpy(), dtype=float)
@@ -9478,8 +9822,6 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 _observe_full_geometry_consensus(
                     eye, object_name, approach_rpy, log,
                     max_frames=6,
-                    metric_jaw_width_mm=hybrid_metric_width_mm,
-                    metric_major_mm=hybrid_metric_major_mm,
                     allow_registered_box_fallback=(
                         object_geometry_mode == "hybrid"
                     ),
@@ -9573,8 +9915,6 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 camera_mapping=J, tool_camera_mm=tcp_cam,
                 table_z_m=load_safety_calibration().get("table_z_m"),
                 stationary_ee_xyz_m=geometry_stationary_xyz,
-                metric_jaw_width_mm=hybrid_metric_width_mm,
-                metric_major_mm=hybrid_metric_major_mm,
                 prefer_exact_target_mask=(object_geometry_mode == "hybrid"),
                 allow_registered_box_fallback=(
                     object_geometry_mode == "hybrid"
@@ -9882,18 +10222,32 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     "target could not be isolated in the collision-map frame; "
                     "refusing to treat it as generic free space"
                 )
-            map_geometry = _plan_scene_grasp_geometry(
-                map_frame, map_det,
-                current_rpy=tuple(float(v) for v in A.ee_rpy()),
-                allow_orientation=False, object_name=object_name,
-            )
-            if not map_geometry.ok:
-                steps.append(("scene_collision_map", False,
-                              map_geometry.reason))
-                return recover(
-                    "the grasp target could not be separated from scene "
-                    f"obstacles: {map_geometry.reason}"
+            if isinstance(full_object_box_3d, dict):
+                # The fresh observation above is still required so a missing
+                # or identity-mismatched target fails closed. Its stochastic
+                # close-view mask must not reopen a grasp decision that was
+                # already established by stable geometry, aligned metric jaw
+                # projection, and the complete-object fit gate.
+                map_geometry = plan_geometry
+                log(
+                    "stage=scene_collision_target status=verified_metric_reuse "
+                    "detail=fresh target identity present; stationary measured "
+                    "3D OBB is the sole target exclusion and grasp geometry "
+                    "was not reinterpreted"
                 )
+            else:
+                map_geometry = _plan_scene_grasp_geometry(
+                    map_frame, map_det,
+                    current_rpy=tuple(float(v) for v in A.ee_rpy()),
+                    allow_orientation=False, object_name=object_name,
+                )
+                if not map_geometry.ok:
+                    steps.append(("scene_collision_map", False,
+                                  map_geometry.reason))
+                    return recover(
+                        "the grasp target could not be separated from scene "
+                        f"obstacles: {map_geometry.reason}"
+                    )
             fusion_count = int(np.clip(
                 int(os.getenv("REBOT_SCENE_FUSION_FRAMES", "3")), 1, 5
             ))
@@ -11131,7 +11485,8 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             try:
                 slot_frame = eye.frame()
                 slot_det, slot_why = _jaw_slot_depth_occupancy_detection(
-                    slot_frame, requested_cam, jaw_plan, plan_geometry
+                    slot_frame, requested_cam, jaw_plan, plan_geometry,
+                    full_object_box_3d,
                 )
             except Exception as exc:  # noqa: BLE001
                 slot_det, slot_frame = None, None
@@ -11212,14 +11567,13 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                       f"capacity {retry_envelope_mm:.1f}mm; compared the "
                       "identifier feature against its planned offset from the "
                       "grasp region"))
-        if not retry_eligible and FIXED_SCENE_TRAJECTORY:
-            return recover(
-                "object is not safely observable at the endpoint of the fixed "
-                "scene trajectory; refusing a new arm route or blind gripper "
-                "closure",
-                grasp_error_mm=round(grasp_error, 1),
-            )
         if not retry_eligible:
+            # Fixed-scene mode freezes the macro trajectory, not recovery from
+            # expected open-finger occlusion at its endpoint. Retreat only to
+            # the already visited visible checkpoint, obtain a fresh stationary
+            # target observation, and prevalidate a replacement short leg. This
+            # is bounded replanning inside the existing grasp workflow—not a
+            # new scene-level route—and it never permits blind jaw closure.
             max_visible_replans = int(np.clip(HYBRID_MAX_REPLANS, 0, 2))
             for replan_attempt in range(1, max_visible_replans + 1):
                 log("stage=visible_checkpoint_retry "
@@ -11295,6 +11649,34 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 grasp_det, grasp_frame, grasp_why = _observe(
                     eye, object_name
                 )
+                if grasp_det is None and DYNAMIC_GRASP_ENABLED:
+                    try:
+                        slot_frame = eye.frame()
+                        slot_det, slot_why = \
+                            _jaw_slot_depth_occupancy_detection(
+                                slot_frame, requested_cam, jaw_plan,
+                                plan_geometry, full_object_box_3d,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        slot_det, slot_frame = None, None
+                        slot_why = (
+                            "retried jaw-slot RGB-D read failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    if slot_det is not None and slot_frame is not None:
+                        grasp_det, grasp_frame = slot_det, slot_frame
+                        grasp_why = slot_why
+                        log(
+                            "stage=endpoint_jaw_slot_depth_fallback "
+                            f"phase=retry_{replan_attempt} ok=True "
+                            f"detail={slot_why}"
+                        )
+                    else:
+                        log(
+                            "stage=endpoint_jaw_slot_depth_fallback "
+                            f"phase=retry_{replan_attempt} ok=False "
+                            f"detail={slot_why}"
+                        )
                 if grasp_frame is not None:
                     _show(
                         *grasp_frame,
@@ -11329,9 +11711,16 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     ))
                     retry_eligible = True
                     break
+                retry_expected = (
+                    requested_cam
+                    if (getattr(grasp_det, "info", {}) or {}).get(
+                        "endpoint_width_basis"
+                    ) == "registered_shape_plus_slot_occupancy"
+                    else expected_feature_cam
+                )
                 grasp_error = float(np.linalg.norm(
                     np.asarray(grasp_det.p_cam_mm, dtype=float)
-                    - expected_feature_cam
+                    - retry_expected
                 ))
                 retry_gate = _endpoint_retry_eligibility(
                     grasp_error, object_visible=True
@@ -11379,7 +11768,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             )
             identifier_slot_ok, identifier_slot_detail = _jaw_slot_fit(
                 grasp_det.p_cam_mm, advisory_target, jaw_plan,
-                plan_geometry,
+                plan_geometry, full_object_box_3d,
             )
             steps.append((
                 "dynamic_identifier_alignment_advisory", True,
@@ -11471,7 +11860,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                                 slot_det, slot_why = \
                                     _jaw_slot_depth_occupancy_detection(
                                         slot_frame, requested_cam, jaw_plan,
-                                        plan_geometry,
+                                        plan_geometry, full_object_box_3d,
                                     )
                             except Exception as exc:  # noqa: BLE001
                                 slot_det, slot_frame = None, None
@@ -11566,7 +11955,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 if selected is not None and body_cam_local is not None:
                     slot_ok, slot_detail = _jaw_slot_fit(
                         body_cam_local, requested_cam, selected["plan"],
-                        selected["geometry"],
+                        selected["geometry"], full_object_box_3d,
                     )
                 return {
                     **consensus,
@@ -11639,7 +12028,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                         identifier_slot_ok, identifier_slot_detail = \
                             _jaw_slot_fit(
                                 identifier_body_cam, requested_cam,
-                                jaw_plan, plan_geometry,
+                                jaw_plan, plan_geometry, full_object_box_3d,
                             )
                     identifier_fallback_ok = bool(
                         identifier_cam is not None and identifier_slot_ok
@@ -11702,7 +12091,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     fallback_slot_ok, fallback_slot_detail = _jaw_slot_fit(
                         body_cam_fallback, requested_cam,
                         selected_endpoint["plan"],
-                        selected_endpoint["geometry"],
+                        selected_endpoint["geometry"], full_object_box_3d,
                     )
                     measurement = {
                         **measurement,
@@ -11713,6 +12102,38 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                         "slot_detail": fallback_slot_detail,
                         "used_ready_geometry_fallback": True,
                     }
+                    endpoint_measure_ok = True
+
+            # Width can form a valid cluster while a single stochastic mask
+            # makes the corresponding body XYZ cluster unstable. Before using
+            # a semantic-offset fallback or moving the arm, take one entirely
+            # fresh stationary batch. This reuses the existing strict width,
+            # identity, full-object, and 3 mm body-spread gates; it only gives
+            # transient segmentation jitter another observation window.
+            if measurement.get("selected") is not None \
+                    and measurement.get("body_cam") is None:
+                retry_measurement = measure_grasp_body(
+                    "stationary_consensus_retry"
+                )
+                retry_ok = bool(
+                    retry_measurement.get("selected") is not None
+                    and retry_measurement.get("body_cam") is not None
+                )
+                retry_reason = (
+                    f"width={retry_measurement.get('width_detail', {}).get('reason')}; "
+                    f"body={retry_measurement.get('body_detail', {}).get('reason')}"
+                )
+                steps.append((
+                    "dynamic_endpoint_stationary_consensus_retry",
+                    retry_ok, retry_reason,
+                ))
+                log(
+                    "stage=dynamic_endpoint_stationary_consensus_retry "
+                    f"ok={retry_ok} detail={retry_reason}"
+                )
+                if retry_ok:
+                    measurement = retry_measurement
+                    selected_endpoint = measurement["selected"]
                     endpoint_measure_ok = True
 
             body_cam = measurement["body_cam"]
@@ -11773,6 +12194,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                         feature_to_grasp_cam, requested_cam,
                         selected_endpoint["plan"],
                         selected_endpoint["geometry"],
+                        full_object_box_3d,
                     )
                 fallback_ok = bool(locked_body_fallback.get("ok"))
                 steps.append((
@@ -11805,40 +12227,46 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             body_correction_limit = int(np.clip(
                 DYNAMIC_BODY_MAX_CORRECTIONS, 0, 2
             ))
+            # Keep adaptation local to this endpoint. The persistent rigid
+            # camera calibration is the prior for every new run and is never
+            # modified by close-range segmentation feedback.
+            body_alignment_J = np.asarray(J, dtype=float).copy()
             previous_violation = _jaw_slot_violation_mm(body_slot_detail)
             for body_attempt in range(1, body_correction_limit + 1):
                 if body_slot_ok:
                     break
                 if body_cam is None:
                     break
+                # First seek the minimum motion that crosses the unchanged
+                # jaw-slot boundary. Fall back to full centring only when no
+                # smaller, fully validated correction exists.
                 body_waypoints, body_correction = \
-                    _plan_endpoint_alignment_correction(
-                        body_cam, requested_cam, J, approach_rpy
+                    _plan_partial_slot_alignment_correction(
+                        body_cam, requested_cam, body_alignment_J, approach_rpy,
+                        selected_endpoint["plan"],
+                        selected_endpoint["geometry"],
+                        full_object_box_3d,
                     )
+                log("stage=grasp_body_alignment_minimum "
+                    f"attempt={body_attempt}/{body_correction_limit} "
+                    f"ok={body_waypoints is not None} "
+                    f"detail={body_correction.get('reason')}")
                 if body_waypoints is None:
-                    partial_waypoints, partial_correction = \
-                        _plan_partial_slot_alignment_correction(
-                            body_cam, requested_cam, J, approach_rpy,
-                            selected_endpoint["plan"],
-                            selected_endpoint["geometry"],
+                    partial_correction = body_correction
+                    body_waypoints, body_correction = \
+                        _plan_endpoint_alignment_correction(
+                            body_cam, requested_cam, body_alignment_J,
+                            approach_rpy
                         )
-                    log("stage=grasp_body_alignment_alternative "
-                        f"attempt={body_attempt}/{body_correction_limit} "
-                        f"ok={partial_waypoints is not None} "
-                        f"detail={partial_correction.get('reason')}")
-                    if partial_waypoints is not None:
-                        body_waypoints = partial_waypoints
-                        body_correction = partial_correction
-                    else:
-                        body_correction = {
-                            **body_correction,
-                            "partial_alternative": partial_correction,
-                            "reason": (
-                                f"{body_correction.get('reason')}; partial "
-                                f"alternative: "
-                                f"{partial_correction.get('reason')}"
-                            ),
-                        }
+                    body_correction = {
+                        **body_correction,
+                        "minimum_alternative": partial_correction,
+                        "reason": (
+                            f"{body_correction.get('reason')}; minimum-motion "
+                            f"alternative unavailable: "
+                            f"{partial_correction.get('reason')}"
+                        ),
+                    }
                 planned = body_waypoints is not None
                 steps.append((
                     f"prevalidate_grasp_body_alignment_{body_attempt}",
@@ -11893,7 +12321,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                         and hybrid_identity_gate is not None \
                         and isinstance(full_object_box_3d, dict):
                     propagation = _propagate_locked_body_after_alignment(
-                        prior_body_cam, J,
+                        prior_body_cam, body_alignment_J,
                         correction_start_xyz, correction_end_xyz,
                         body_correction.get("endpoint_m"), requested_cam,
                         prior_selected_endpoint["plan"],
@@ -11902,6 +12330,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                         identity_frames=len(
                             measurement.get("identifier_samples", [])
                         ),
+                        object_box_3d=full_object_box_3d,
                     )
                     propagation_ok = bool(propagation.get("ok"))
                     steps.append((
@@ -12035,6 +12464,50 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                         "physical jaw-slot fit; refusing to close",
                         corrections=corrections,
                     )
+                # Only learn a response when another correction is required.
+                # A successful final alignment needs no model update, while a
+                # contradictory response must stop instead of repeating the
+                # same misleading geometric prediction.
+                if not body_slot_ok and body_attempt < body_correction_limit:
+                    feedback_mapping = None
+                    feedback_detail = {
+                        "ok": False,
+                        "reason": (
+                            "fresh stable grasp-body position unavailable"
+                        ),
+                    }
+                    if body_cam is not None:
+                        feedback_mapping, feedback_detail = \
+                            _update_alignment_jacobian_from_feedback(
+                                body_alignment_J,
+                                correction_end_xyz - correction_start_xyz,
+                                prior_body_cam, body_cam,
+                            )
+                    feedback_ok = feedback_mapping is not None
+                    body_correction[
+                        "visual_feedback_update"
+                    ] = feedback_detail
+                    steps.append((
+                        f"grasp_body_alignment_feedback_{body_attempt}",
+                        feedback_ok, str(feedback_detail.get("reason")),
+                    ))
+                    log("stage=grasp_body_alignment_feedback "
+                        f"attempt={body_attempt}/{body_correction_limit} "
+                        f"ok={feedback_ok} "
+                        f"predicted_shift_mm="
+                        f"{feedback_detail.get('predicted_shift_mm')} "
+                        f"observed_shift_mm="
+                        f"{feedback_detail.get('observed_shift_mm')} "
+                        f"detail={feedback_detail.get('reason')}")
+                    if feedback_mapping is None:
+                        return recover(
+                            "the first bounded grasp-body correction improved "
+                            "the slot fit, but its measured camera response "
+                            "could not safely calibrate the remaining fine "
+                            f"motion: {feedback_detail.get('reason')}",
+                            corrections=corrections,
+                        )
+                    body_alignment_J = feedback_mapping
                 previous_violation = current_violation
 
             steps.append((
@@ -12288,7 +12761,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 if post_close_fallback is not None:
                     fallback_slot_ok, fallback_slot_detail = _jaw_slot_fit(
                         post_close_fallback, requested_cam, jaw_plan,
-                        endpoint_geometry,
+                        endpoint_geometry, full_object_box_3d,
                     )
                 steps.append((
                     "dynamic_post_close_semantic_body_fallback",
@@ -12309,21 +12782,25 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                         f"{fallback_detail.get('reason')}; stable semantic "
                         "fallback remains inside the calibrated jaw slot"
                     )
-            baseline_ok = post_close_body is not None
+            hold_baseline = _post_close_hold_baseline(
+                post_close_body, post_close_detail
+            )
+            baseline_ok = bool(hold_baseline["ok"])
             steps.append((
                 "dynamic_post_close_body_baseline", baseline_ok,
-                str(post_close_detail.get("reason")),
+                str(hold_baseline["reason"]),
             ))
             log("stage=dynamic_post_close_body_baseline "
                 f"attempt={retry_count + 1} ok={baseline_ok} "
-                f"detail={post_close_detail.get('reason')}")
-            if post_close_body is None:
+                f"basis={hold_baseline['basis']} "
+                f"detail={hold_baseline['reason']}")
+            if not baseline_ok:
                 return recover(
-                    "could not establish a stable physical-body baseline after "
-                    "closing; refusing an unverifiable lift"
+                    "could not establish a stable identity-gated visual "
+                    "baseline after closing; refusing an unverifiable lift"
                 )
-            before_lift_cam = np.asarray(post_close_body, dtype=float)
-            before_lift_feature_cam = post_close_detail.get("feature_cam_mm")
+            before_lift_cam = hold_baseline["body_cam_mm"]
+            before_lift_feature_cam = hold_baseline["feature_cam_mm"]
             pre_lift_xyz = np.asarray(A.ee_pos(), dtype=float)
             lift_distance = (
                 float(np.clip(DYNAMIC_MICRO_LIFT_M, 0.010, 0.020))
@@ -12496,7 +12973,9 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             if lifted_frame is not None:
                 _show(*lifted_frame,
                       tag=f"dynamic_lift_attempt_{retry_count + 1}",
-                      det=lifted_hold_det, target_cam=before_lift_cam,
+                      det=lifted_hold_det,
+                      target_cam=(before_lift_cam if before_lift_cam is not None
+                                  else requested_cam),
                       note="visual hold check after micro-lift")
             hold_tol = (
                 float(np.clip(DYNAMIC_HOLD_TOL_MM, 3.0, 8.0))
@@ -12543,7 +13022,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             # lift, do one extra 10 mm validated lift. Object seating happens on
             # close/first lift; incremental motion after that cleanly separates
             # the two hypotheses without tightening the jaws.
-            if classification == "ambiguous" and lifted_body is not None:
+            if classification == "ambiguous" and hold_after is not None:
                 confirm_start = np.asarray(A.ee_pos(), dtype=float)
                 confirm_endpoint = confirm_start.copy()
                 confirm_endpoint[2] = min(
@@ -12661,7 +13140,9 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             if retry_frame is not None:
                 _show(*retry_frame,
                       tag=f"dynamic_retry_endpoint_{retry_count + 1}",
-                      det=retry_det, target_cam=before_lift_cam,
+                      det=retry_det,
+                      target_cam=(before_lift_cam if before_lift_cam is not None
+                                  else requested_cam),
                       note="returned endpoint before tighter close")
             retry_basis = "exact locked grasp section"
             if retry_body is None:
@@ -12682,19 +13163,25 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             # already proven inside the calibrated slot. On return, compare to
             # that actual captured position—not the ideal empty-jaw target—or
             # harmless seating is counted twice and a safe retry is refused.
+            retry_slot_reference = (
+                before_lift_cam if before_lift_cam is not None
+                else requested_cam
+            )
             retry_body_slot_ok, retry_body_slot = _jaw_slot_fit(
-                retry_body, before_lift_cam, jaw_plan, endpoint_geometry,
+                retry_body, retry_slot_reference, jaw_plan, endpoint_geometry,
+                full_object_box_3d,
             )
             steps.append((
                 "dynamic_retry_grasp_body_inside_jaw_slot",
                 retry_body_slot_ok,
-                f"basis={retry_basis}; reference=post_close_body_baseline; "
+                f"basis={retry_basis}; reference="
+                f"{'post_close_body_baseline' if before_lift_cam is not None else 'calibrated_jaw_slot'}; "
                 f"{retry_body_slot.get('reason')}",
             ))
             log("stage=dynamic_retry_grasp_body_slot_gate "
                 f"ok={retry_body_slot_ok} "
                 f"basis={retry_basis} "
-                "reference=post_close_body_baseline "
+                f"reference={'post_close_body_baseline' if before_lift_cam is not None else 'calibrated_jaw_slot'} "
                 f"detail={retry_body_slot.get('reason')}")
             if not retry_body_slot_ok:
                 return recover(
@@ -15525,9 +16012,22 @@ def watch(object_name: str | None = None, *, seconds: float | None = None,
             if object_name:
                 det, _ = eye.object(object_name, color, depth, intr)
                 found += det is not None
+                det_info = (getattr(det, "info", {}) or {}) \
+                    if det is not None else {}
+                completion_source = str(det_info.get(
+                    "segmentation_source", ""
+                ))
+                completion = ""
+                if det_info.get("object_completion_validated"):
+                    completion = (
+                        " full_object=sam_complete_query"
+                        if completion_source.startswith(
+                            "complete_object_semantic_query"
+                        ) else " full_object=rgbd_completed"
+                    )
                 latest_detection = (
                     f"{det.source} depth_mm={det.z_mm:.0f} "
-                    f"uv=({det.uv[0]:.0f},{det.uv[1]:.0f})"
+                    f"uv=({det.uv[0]:.0f},{det.uv[1]:.0f}){completion}"
                     if det else "not detected"
                 )
             frames += 1
