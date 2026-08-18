@@ -14,9 +14,19 @@ export REBOT_FIXED_SCENE_TRAJECTORY="${REBOT_FIXED_SCENE_TRAJECTORY:-1}"
 export REBOT_WRIST_CLOSE_GRIPPER_AT_START=1
 export REBOT_CAN_BITRATE=1000000
 export REBOT_ENABLE_LOCATE_ANYTHING=1
-export REBOT_VISION_BACKEND=sam3
+export REBOT_VISION_BACKEND="${REBOT_VISION_BACKEND:-sam3_1}"
+# Full SAM 3.1 video propagation exceeds this machine's 8 GB VRAM. The
+# improved 3.1 model supplies each exact mask; the existing multi-view RGB-D
+# registration retains temporal identity and metric geometry.
+export REBOT_VISION_TRACKER="${REBOT_VISION_TRACKER:-none}"
 export REBOT_VISION_PRIMARY=1
 export REBOT_SAM3_MODEL=facebook/sam3
+export REBOT_SAM31_SCORE_THRESHOLD="${REBOT_SAM31_SCORE_THRESHOLD:-0.30}"
+# SAM 3.1 establishes the named target once. Its independent per-frame masks
+# were empirically unstable under the large viewpoint sweep, so the proven
+# SAM3 image backend takes over metric multi-view geometry after that anchor.
+# The base-frame hybrid identity gate remains authoritative across the switch.
+export REBOT_SAM31_BOOTSTRAP_ONLY="${REBOT_SAM31_BOOTSTRAP_ONLY:-1}"
 export REBOT_VISION_DEVICE=cuda
 export REBOT_VISION_DTYPE=bfloat16
 export REBOT_SAM3_SCORE_THRESHOLD=0.30

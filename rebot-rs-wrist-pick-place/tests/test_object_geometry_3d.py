@@ -140,6 +140,26 @@ class ObjectGeometry3DTest(unittest.TestCase):
 
         self.assertEqual(box.orientation_mode, "measured_3d_pca")
 
+    def test_trusted_axes_refit_extents_without_pca_shear(self):
+        rng = np.random.default_rng(33)
+        first = rng.uniform(
+            [-0.04, -0.02, -0.01], [0.04, 0.02, 0.01], size=(1800, 3)
+        ) + np.array([0.40, 0.03, 0.04])
+        # Registration error shears the aggregate enough to tempt a fresh PCA
+        # axis, but the trusted frame must remain gravity aligned.
+        second = first + np.array([0.008, -0.004, 0.008])
+        axes = np.eye(3)
+
+        box = og.fit_tabletop_box_with_axes(
+            [first, second], table_z_m=0.012, axes_base=axes,
+            orientation_mode="test_consensus_lock",
+        )
+
+        np.testing.assert_allclose(np.asarray(box.axes_base).T, axes)
+        self.assertEqual(box.orientation_mode, "test_consensus_lock")
+        self.assertGreater(box.observed_size_m[0], 0.07)
+        self.assertLess(box.observed_size_m[2], 0.04)
+
     def test_measured_box_does_not_extend_an_elevated_object_to_table(self):
         rng = np.random.default_rng(12)
         points = rng.uniform(

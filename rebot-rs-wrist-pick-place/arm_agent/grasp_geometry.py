@@ -196,9 +196,14 @@ def plan_grasp_geometry(
         # 2D cross-section. Apply it before deciding that the envelope is too
         # large; applying it later leaves the feature-prominence rejection in
         # control and discards the very 3D evidence intended to resolve it.
+        # The metric OBB is stronger evidence about *how wide* the object is.
+        # It says nothing about *where along the object* to grasp, and dropping
+        # the ranked candidate here also threw away the chosen station, leaving
+        # the grasp point at the whole-mask centroid.  On a long object that is
+        # the difference between the middle and an end.  Keep the ranked
+        # station; let the metric width govern the aperture.
         if metric_width is not None:
             local_width = metric_width
-            chosen_candidate = None
         area_ratio = envelope.area_px / max(1.0, target.area_px)
         # A color blob is merely an identifier, so its associated envelope must
         # be materially larger before replacing it.  A Grounding DINO result is
@@ -214,7 +219,10 @@ def plan_grasp_geometry(
         )
         if substantially_larger and envelope_fits:
             if chosen_candidate is not None:
-                local_width = float(chosen_candidate["width_mm"])
+                local_width = (
+                    metric_width if metric_width is not None
+                    else float(chosen_candidate["width_mm"])
+                )
                 candidate_uv = tuple(float(value) for value in chosen_candidate["uv"])
                 grasp = replace(
                     envelope,
@@ -222,9 +230,16 @@ def plan_grasp_geometry(
                     p_cam_mm=deproject(candidate_uv[0], candidate_uv[1],
                                       float(envelope.z_mm), intr),
                     min_width_mm=local_width,
+                    max_width_mm=(
+                        metric_major if metric_major is not None
+                        else envelope.max_width_mm
+                    ),
                     source="depth:ranked_cross_section",
                     info={**envelope.info, "jaw_sizing_basis":
-                          "ranked local cross-section",
+                          ("multiview metric 3D horizontal axes at the ranked "
+                           "local cross-section"
+                           if metric_width is not None
+                           else "ranked local cross-section"),
                           "selected_candidate": chosen_candidate},
                 )
             if not math.isclose(local_width, float(envelope.min_width_mm),
@@ -378,6 +393,12 @@ def plan_grasp_geometry(
             grasp = replace(
                 grasp,
                 min_width_mm=projected_width_mm,
+                # The residual-yaw projection is now the authoritative jaw
+                # width. At large residual angles the support-function sum can
+                # exceed the stale 2D major-axis crop; preserve the size
+                # invariant consumed by aperture planning instead of emitting
+                # an impossible min_width > max_width pair.
+                max_width_mm=max(major_mm, projected_width_mm),
                 info=grasp_info,
             )
             width = projected_width_mm

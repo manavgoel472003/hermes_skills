@@ -335,6 +335,9 @@ GEOMETRY_MIN_FEATURE_PROMINENCE_MM = float(
 GRASP_MIN_OPEN_CLEARANCE_MM = float(
     os.getenv("REBOT_GRASP_MIN_OPEN_CLEARANCE_MM", "8.0")
 )
+GRASP_OPEN_CLEARANCE_BOUNDARY_SLOP_MM = float(os.getenv(
+    "REBOT_GRASP_OPEN_CLEARANCE_BOUNDARY_SLOP_MM", "0.75"
+))
 GRASP_MIN_END_CLEARANCE_MM = float(
     os.getenv("REBOT_GRASP_MIN_END_CLEARANCE_MM", "12.0")
 )
@@ -405,6 +408,9 @@ SCENE_DENSE_REGISTRATION_MIN_OVERLAP = float(np.clip(float(os.getenv(
 SCENE_DENSE_REGISTRATION_MAX_TRANSLATION_M = float(np.clip(float(os.getenv(
     "REBOT_SCENE_DENSE_REGISTRATION_MAX_TRANSLATION_M", "0.012"
 )), 0.0, 0.015))
+HYBRID_REGISTRATION_MAX_TRANSLATION_M = float(np.clip(float(os.getenv(
+    "REBOT_HYBRID_REGISTRATION_MAX_TRANSLATION_M", "0.020"
+)), SCENE_DENSE_REGISTRATION_MAX_TRANSLATION_M, 0.024))
 ALIGN_TOL_MM = 8.0       # camera-frame object<->target error we call "aligned"
 STALL_ITERS = 3          # no improvement for this many steps => at the sensor's noise floor
 GAIN = 0.6               # servo step = GAIN * Jinv @ error (then step-capped)
@@ -666,10 +672,13 @@ def _save_grasp_fit_diagnostic(
     selected_uv = selected.get("uv") if isinstance(selected, dict) else None
     width = float(grasp.min_width_mm or 0.0)
     aperture = float(jaw_plan.get("max_aperture_mm", 0.0))
-    required = width + max(0.0, GRASP_MIN_OPEN_CLEARANCE_MM)
+    effective_clearance, boundary_slop = _effective_open_clearance_mm()
+    required = width + effective_clearance
     decision_lines = [
         f"selected local width={width:.1f}mm + clearance="
-        f"{GRASP_MIN_OPEN_CLEARANCE_MM:.1f}mm => required={required:.1f}mm",
+        f"{effective_clearance:.2f}mm effective "
+        f"({GRASP_MIN_OPEN_CLEARANCE_MM:.1f}mm configured, "
+        f"{boundary_slop:.2f}mm sensor boundary) => required={required:.1f}mm",
         f"measured gripper maximum={aperture:.1f}mm; decision=REFUSE",
         "blue circles=other cross-sections; red X=selected section",
         box_reason,
@@ -864,6 +873,33 @@ def _payload_collision_box_plan(
     return payload_size, long_axis_ee, center_offset_ee_m
 
 
+_ACTIVE_CAMERA_ENVELOPE_DEG: float | None = None
+
+
+def _set_active_camera_envelope(envelope_deg: float | None) -> None:
+    """Widen the default camera envelope for an already-validated wrist pose.
+
+    The saved transform is a *rigid mount*: rotating it to the current wrist is
+    exact at any angle, so the default envelope is a staleness guard on the
+    calibration, not an accuracy limit.  It nevertheless applies to every
+    observation, which means the arm can be commanded to a bounded, IK- and
+    collision-validated orientation that it is then not allowed to interpret
+    the camera from.  Deliberately reaching such a pose may raise the default
+    for the observations that follow; the explicit 45deg ceiling still applies,
+    and every exit clears this back to None.
+    """
+    global _ACTIVE_CAMERA_ENVELOPE_DEG
+    if envelope_deg is None:
+        _ACTIVE_CAMERA_ENVELOPE_DEG = None
+        return
+    try:
+        _ACTIVE_CAMERA_ENVELOPE_DEG = float(np.clip(
+            float(envelope_deg), 0.25, 45.0
+        ))
+    except (TypeError, ValueError):
+        _ACTIVE_CAMERA_ENVELOPE_DEG = None
+
+
 def load_saved_camera_jacobian(
     current_rpy: tuple[float, float, float],
     *, maximum_orientation_delta_deg: float | None = None,
@@ -898,19 +934,26 @@ def load_saved_camera_jacobian(
     # Do not let this post-orientation gate contradict the bounded grasp
     # planner. The rigid camera mount is rotated analytically below, so the
     # configured grasp envelope is also the default camera-geometry envelope.
+    # An explicit request wins; otherwise an already-validated large wrist pose
+    # may have raised the default for the observations taken at it.
+    requested_delta_deg = (
+        maximum_orientation_delta_deg
+        if maximum_orientation_delta_deg is not None
+        else _ACTIVE_CAMERA_ENVELOPE_DEG
+    )
     configured_allowed = (
         float(os.getenv(
             "REBOT_WRIST_SAVED_ROTATION_MAX_RPY_DELTA_DEG",
             str(GEOMETRY_MAX_YAW_DELTA_DEG),
         ))
-        if maximum_orientation_delta_deg is None
-        else float(maximum_orientation_delta_deg)
+        if requested_delta_deg is None
+        else float(requested_delta_deg)
     )
     # Ordinary visual servoing retains its existing 25deg ceiling. A caller
     # may explicitly request a larger bounded envelope for a fully preplanned
     # collision-escape grasp; the rigid mount transform is rotated
     # analytically, and that path still needs complete IK/collision validation.
-    hard_ceiling_deg = 25.0 if maximum_orientation_delta_deg is None else 45.0
+    hard_ceiling_deg = 25.0 if requested_delta_deg is None else 45.0
     allowed_deg = float(np.clip(
         configured_allowed, 0.25, hard_ceiling_deg
     ))
@@ -1499,6 +1542,13 @@ class WristEye:
     _live_stop: Any = field(default_factory=threading.Event, repr=False)
     _live_thread: Any = field(default=None, repr=False)
     _identity_filters: dict[str, Any] = field(default_factory=dict, repr=False)
+    # A rejected first semantic mask may still carry enough image/depth
+    # information to move the camera *away/sideways/up* and obtain a complete
+    # view.  It remains private to discovery and can never be returned as an
+    # accepted target, used for geometry, or authorize an approach.
+    _deferred_identity_candidates: dict[str, Any] = field(
+        default_factory=dict, repr=False
+    )
 
     def frame(self):
         # RealSense wait_for_frames must have exactly one caller at a time. The
@@ -1586,18 +1636,31 @@ class WristEye:
             allow_vlm=self.allow_vlm,
             **bounds,
         )
-        identity_filter = self._identity_filters.get(
-            description.strip().lower()
-        )
+        identity_key = description.strip().lower()
+        # Never let an older frame survive a new detector attempt.
+        self._deferred_identity_candidates.pop(identity_key, None)
+        identity_filter = self._identity_filters.get(identity_key)
         if found is not None and callable(identity_filter):
             accepted, identity_detail = identity_filter(
                 found, (color, depth, intr)
             )
             why = {**why, "identity_gate": identity_detail}
             if not accepted:
+                if bool(identity_detail.get("anchor_deferred")):
+                    self._deferred_identity_candidates[identity_key] = (
+                        found, (color, depth, intr), dict(identity_detail)
+                    )
                 why["used"] = None
                 return None, why
         return found, why
+
+    def take_deferred_identity_candidate(
+        self, description: str
+    ) -> tuple[Any, Any, dict[str, Any]] | None:
+        """Consume a non-authoritative semantic hint for safe reframing only."""
+        return self._deferred_identity_candidates.pop(
+            description.strip().lower(), None
+        )
 
     def set_identity_filter(
         self, description: str, identity_filter: Any | None
@@ -1687,6 +1750,59 @@ class _HybridTargetIdentity:
             return None, "mapped target point is non-finite"
         return point_base, "mapped"
 
+    def _semantic_anchor_plausibility(
+        self, point_base: np.ndarray, detection: Any,
+        frame: tuple[np.ndarray, np.ndarray, Any],
+    ) -> tuple[bool, str]:
+        """Reject clipped or physically impossible first semantic anchors."""
+        partial_reason = _detection_partial(detection, frame)
+        if partial_reason is not None:
+            return False, (
+                "semantic candidate cannot establish identity because "
+                f"{partial_reason}"
+            )
+        # A semantic model can confidently name a matching object in the room
+        # background.  Previously, one such mask just inside the camera's far
+        # depth cutoff could become the permanent target anchor even though its
+        # mapped base-frame point was far beyond the arm workspace.  Every later
+        # view was then (correctly but unhelpfully) cluster-gated to that false
+        # anchor.  Keep a small allowance for hand-eye and mask-centroid error at
+        # the workspace faces, but never establish identity around an object the
+        # arm cannot physically approach.
+        workspace_slop = float(np.clip(float(os.getenv(
+            "REBOT_HYBRID_ANCHOR_WORKSPACE_SLOP_M", "0.025"
+        )), 0.005, 0.050))
+        guarded_lo = np.asarray([A.X_MIN, A.Y_MIN], dtype=float) \
+            - workspace_slop
+        guarded_hi = np.asarray([A.X_MAX, A.Y_MAX], dtype=float) \
+            + workspace_slop
+        if np.any(point_base[:2] < guarded_lo) \
+                or np.any(point_base[:2] > guarded_hi):
+            return False, (
+                "mapped semantic point "
+                f"{np.asarray(point_base).round(4).tolist()}m is outside the "
+                "reachable workspace (including "
+                f"{workspace_slop * 1000.0:.0f}mm calibration slop)"
+            )
+        table_z_raw = load_safety_calibration().get("table_z_m")
+        if table_z_raw is not None:
+            try:
+                table_z = float(table_z_raw)
+                below_slop = float(np.clip(float(os.getenv(
+                    "REBOT_HYBRID_ANCHOR_BELOW_TABLE_SLOP_M", "0.008"
+                )), 0.003, 0.012))
+            except (TypeError, ValueError):
+                table_z = math.nan
+                below_slop = 0.008
+            if math.isfinite(table_z) \
+                    and float(point_base[2]) < table_z - below_slop:
+                return False, (
+                    f"mapped semantic point z={float(point_base[2]):.4f}m is "
+                    f"below calibrated table z={table_z:.4f}m by more than "
+                    f"{below_slop * 1000.0:.1f}mm"
+                )
+        return True, "complete semantic candidate is physically plausible"
+
     def reanchor_from_metric_box(
         self, object_box_3d: dict[str, Any]
     ) -> tuple[bool, dict[str, Any]]:
@@ -1752,7 +1868,7 @@ class _HybridTargetIdentity:
         }
 
     def __call__(
-        self, detection: Any, _frame: tuple[np.ndarray, np.ndarray, Any]
+        self, detection: Any, frame: tuple[np.ndarray, np.ndarray, Any]
     ) -> tuple[bool, dict[str, Any]]:
         source = str(getattr(detection, "source", ""))
         semantic = source in _SEMANTIC_IDENTITY_SOURCES
@@ -1836,6 +1952,24 @@ class _HybridTargetIdentity:
                     f"source={source} detail={reason}"
                 )
                 return False, detail
+            plausible, plausibility_reason = \
+                self._semantic_anchor_plausibility(
+                    point_base, detection, frame
+                )
+            if not plausible:
+                self.rejected += 1
+                detail = {
+                    "accepted": False, "source": source,
+                    "reason": plausibility_reason,
+                    "candidate_base_m": point_base.round(4).tolist(),
+                    "anchor_deferred": True,
+                }
+                self.log(
+                    "stage=hybrid_target_identity accepted=false "
+                    f"source={source} action=defer_anchor "
+                    f"detail={plausibility_reason}"
+                )
+                return False, detail
             self.semantic_points_base_m.append(point_base)
             self.anchor_base_m = point_base.copy()
             self.anchor_kind = "semantic"
@@ -1880,7 +2014,15 @@ class _HybridTargetIdentity:
                 f"source={source} detail={reason}"
             )
             return False, detail
-        if semantic:
+        # Once repeated RGB-D views have replaced the mask centroid with a
+        # verified metric-OBB centre, that centre is the physical identity
+        # reference.  Close-range semantic masks are often partly occluded by
+        # the jaws or connected to a neighbour; allowing their centroids to
+        # update the anchor made the reference drift by centimetres precisely
+        # when the arm reached its visible checkpoint.  Such observations may
+        # confirm membership inside the existing cluster, but can never move a
+        # verified 3-D anchor.
+        if semantic and self.anchor_kind != "verified_metric_obb_center":
             self.semantic_points_base_m.append(point_base)
             recent = self.semantic_points_base_m[-5:]
             self.anchor_base_m = np.median(np.vstack(recent), axis=0)
@@ -2081,6 +2223,15 @@ def _minimum_commandable_aperture_mm() -> float | None:
     return gm.aperture_mm(safe_close_rad)
 
 
+def _effective_open_clearance_mm() -> tuple[float, float]:
+    """Return entry clearance and its capped RGB-D boundary allowance."""
+    configured = max(0.0, float(GRASP_MIN_OPEN_CLEARANCE_MM))
+    boundary = float(np.clip(
+        GRASP_OPEN_CLEARANCE_BOUNDARY_SLOP_MM, 0.0, 0.75
+    ))
+    return max(0.0, configured - boundary), boundary
+
+
 def _plan_aperture(det: Any) -> dict[str, Any]:
     """Plan pre-open and final grasp positions from measured depth size only.
 
@@ -2229,7 +2380,9 @@ def _validate_object_gripper_fit(
         width_mm, major_mm, aperture_mm, preopen_mm
     )):
         return False, {"reason": "object or jaw dimensions are invalid"}
-    required_open_mm = width_mm + max(0.0, GRASP_MIN_OPEN_CLEARANCE_MM)
+    effective_clearance_mm, clearance_boundary_slop_mm = \
+        _effective_open_clearance_mm()
+    required_open_mm = width_mm + effective_clearance_mm
     if required_open_mm > aperture_mm + 1e-6:
         return False, {
             "reason": (
@@ -2242,6 +2395,11 @@ def _validate_object_gripper_fit(
             "box_dimensions_mm": None if box_dimensions_mm is None else
                 box_dimensions_mm.round(1).tolist(),
             "major_basis": major_basis,
+            "configured_clearance_mm": max(
+                0.0, GRASP_MIN_OPEN_CLEARANCE_MM
+            ),
+            "effective_clearance_mm": effective_clearance_mm,
+            "clearance_boundary_slop_mm": clearance_boundary_slop_mm,
         }
     if major_mm > max(1.0, GRASP_MAX_MAJOR_MM):
         return False, {
@@ -2288,6 +2446,9 @@ def _validate_object_gripper_fit(
         "box_dimensions_mm": None if box_dimensions_mm is None else
             box_dimensions_mm.round(1).tolist(),
         "major_basis": major_basis,
+        "configured_clearance_mm": max(0.0, GRASP_MIN_OPEN_CLEARANCE_MM),
+        "effective_clearance_mm": effective_clearance_mm,
+        "clearance_boundary_slop_mm": clearance_boundary_slop_mm,
         "end_clearance_mm": end_clearance_mm,
         "preopen_mm": preopen_mm,
     }
@@ -2403,6 +2564,576 @@ def _aligned_3d_jaw_width(
     }
 
 
+def _find_3d_axis_yaw_refinement(
+    object_box_3d: dict[str, Any], current_rpy: Any,
+    max_aperture_mm: float,
+) -> dict[str, Any]:
+    """Find a bounded wrist yaw that puts a measured object axis in the jaws.
+
+    A local 2D cross-section can fit the aperture even while an elongated
+    object is presented diagonally to the fingers.  Search only yaw at the
+    already elevated, stationary geometry pose and accept a candidate only
+    when the rigid camera transform, measured 3D axis, and conservative jaw
+    aperture all agree.  Motion planning/execution remains the caller's job.
+    """
+    try:
+        base_rpy = np.asarray(current_rpy, dtype=float)
+        aperture = float(max_aperture_mm)
+    except (TypeError, ValueError):
+        return {"ok": False, "reason": "3D axis-refinement inputs are invalid"}
+    if base_rpy.shape != (3,) or not np.all(np.isfinite(base_rpy)) \
+            or not math.isfinite(aperture) or aperture <= 0.0:
+        return {"ok": False, "reason": "3D axis-refinement inputs are non-finite"}
+    try:
+        step_deg = float(os.getenv("REBOT_3D_AXIS_REFINE_STEP_DEG", "1.0"))
+        limit_deg = float(os.getenv(
+            "REBOT_3D_AXIS_REFINE_MAX_YAW_DEG",
+            str(GEOMETRY_MAX_YAW_DELTA_DEG),
+        ))
+        camera_envelope_deg = float(os.getenv(
+            "REBOT_3D_AXIS_REFINE_CAMERA_ENVELOPE_DEG", "35.0"
+        ))
+    except (TypeError, ValueError):
+        step_deg, limit_deg, camera_envelope_deg = 1.0, 20.0, 35.0
+    step_deg = float(np.clip(step_deg, 0.5, 3.0))
+    limit_deg = float(np.clip(
+        limit_deg, step_deg, max(step_deg, GEOMETRY_MAX_YAW_DELTA_DEG)
+    ))
+    # The bolted-camera transform is rotated analytically.  This enlarged
+    # envelope is available only to this stationary, completely prevalidated
+    # 3D-axis refinement and remains below the explicit 45deg hard ceiling in
+    # ``load_saved_camera_jacobian``.
+    camera_envelope_deg = float(np.clip(camera_envelope_deg, 25.0, 45.0))
+    open_clearance_mm = _effective_open_clearance_mm()[0]
+    offsets = [0.0]
+    for magnitude in np.arange(
+        step_deg, limit_deg + 0.5 * step_deg, step_deg
+    ):
+        offsets.extend((float(magnitude), -float(magnitude)))
+    candidates: list[dict[str, Any]] = []
+    for offset_deg in offsets:
+        candidate_rpy_array = base_rpy.copy()
+        candidate_rpy_array[2] += math.radians(offset_deg)
+        candidate_rpy = tuple(float(value) for value in candidate_rpy_array)
+        mapping, mapping_detail = load_saved_camera_jacobian(
+            candidate_rpy,
+            maximum_orientation_delta_deg=camera_envelope_deg,
+        )
+        if mapping is None:
+            continue
+        aligned = _aligned_3d_jaw_width(object_box_3d, mapping)
+        if not aligned.get("ok"):
+            continue
+        observed = float(aligned["observed_width_mm"])
+        conservative = float(aligned["conservative_width_mm"])
+        if conservative > aperture + 1e-6 \
+                or observed + open_clearance_mm > aperture + 1e-6:
+            continue
+        candidates.append({
+            "offset_deg": offset_deg,
+            "target_rpy": candidate_rpy,
+            "camera_mapping": mapping,
+            "camera_mapping_detail": mapping_detail,
+            "aligned_width": aligned,
+        })
+    if not candidates:
+        return {
+            "ok": False,
+            "reason": (
+                "no bounded stationary wrist yaw aligned a measured 3D object "
+                f"axis with the jaws inside the {aperture:.1f}mm aperture"
+            ),
+            "searched_yaw_deg": limit_deg,
+            "camera_envelope_deg": camera_envelope_deg,
+        }
+    selected = min(
+        candidates,
+        key=lambda candidate: (
+            float(candidate["aligned_width"]["conservative_width_mm"]),
+            float(candidate["aligned_width"]["image_alignment_error_deg"]),
+            abs(float(candidate["offset_deg"])),
+        ),
+    )
+    return {
+        "ok": True,
+        **selected,
+        "searched_yaw_deg": limit_deg,
+        "camera_envelope_deg": camera_envelope_deg,
+        "reason": (
+            f"bounded 3D-axis refinement selected {selected['offset_deg']:+.1f}deg "
+            f"wrist yaw; {selected['aligned_width']['reason']}"
+        ),
+    }
+
+
+def _axis_alignment_angle_deg(detail: dict[str, Any]) -> float | None:
+    """True 3D angle between a measured object axis and jaw closure.
+
+    The shipped gate reports this as two separate numbers — agreement inside
+    the image plane and tilt out of it — because they answer different
+    questions. Their combination is the physical misalignment the fingers
+    actually see, and passing both individually can still leave the jaws over
+    25deg off the axis.
+    """
+    try:
+        image_deg = float(detail["image_alignment_error_deg"])
+        optical_deg = float(detail["optical_tilt_deg"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (math.isfinite(image_deg) and math.isfinite(optical_deg)):
+        return None
+    combined = (
+        math.cos(math.radians(image_deg)) * math.cos(math.radians(optical_deg))
+    )
+    return math.degrees(math.acos(float(np.clip(combined, -1.0, 1.0))))
+
+
+def _tool_frame_jaw_closing_axis(
+    current_rpy: Any,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Express the calibrated jaw-closing direction in the tool frame.
+
+    The jaw axis is persisted as an angle in the camera image plane, which only
+    describes a direction once you also fix the wrist orientation.  The camera
+    is bolted to the tool, so that image direction corresponds to one constant
+    vector in the *tool* frame; recovering it lets the closing direction be
+    predicted for any candidate wrist orientation with a matrix product instead
+    of a per-candidate calibration lookup.
+    """
+    axis_raw = os.getenv("REBOT_WRIST_JAW_LONG_AXIS_CAMERA_DEG")
+    if axis_raw is None:
+        axis_raw = load_grasp_target_detail().get("jaw_long_axis_camera_deg")
+    try:
+        jaw_long_deg = float(axis_raw)
+        base_rpy = np.asarray(current_rpy, dtype=float)
+    except (TypeError, ValueError):
+        return None, {"reason": "calibrated jaw axis is unavailable"}
+    if base_rpy.shape != (3,) or not np.all(np.isfinite(base_rpy)):
+        return None, {"reason": "current wrist orientation is invalid"}
+    mapping, detail = load_saved_camera_jacobian(
+        tuple(float(value) for value in base_rpy),
+        maximum_orientation_delta_deg=45.0,
+    )
+    if mapping is None:
+        return None, {"reason": str(detail.get("reason"))}
+    close_angle = math.radians(jaw_long_deg + 90.0)
+    closing_cam = np.array([math.cos(close_angle), math.sin(close_angle), 0.0])
+    try:
+        closing_base = np.linalg.solve(np.asarray(mapping, dtype=float),
+                                       closing_cam)
+    except np.linalg.LinAlgError:
+        return None, {"reason": "camera mapping is singular"}
+    norm = float(np.linalg.norm(closing_base))
+    if norm <= 1e-9 or not np.all(np.isfinite(closing_base)):
+        return None, {"reason": "jaw closing direction is degenerate"}
+    closing_base = closing_base / norm
+    tool_axis = _rpy_rotation_matrix(
+        tuple(float(value) for value in base_rpy)
+    ).T @ closing_base
+    return tool_axis, {"reason": "tool-frame jaw closing direction recovered"}
+
+
+def _find_3d_axis_orientation_refinement(
+    object_box_3d: dict[str, Any], current_rpy: Any,
+    max_aperture_mm: float,
+) -> dict[str, Any]:
+    """Align the jaws with a measured object axis at any object tilt.
+
+    Yaw alone rotates the closing direction within the horizontal plane, so it
+    can only reach object axes that are already close to horizontal.  An object
+    resting on an edge, leaning, or simply dropped at an angle presents its
+    narrow axis out of that plane, and no yaw exists that both points the jaws
+    along it and keeps it observable — the two conditions move in opposite
+    directions.  That is a limitation of the search, not of the gripper: adding
+    bounded roll and pitch lets the closing direction meet the axis squarely.
+
+    Objects arrive in arbitrary poses, so the search is over orientation, not
+    over an assumed resting face.  Yaw-only is still tried first because it is
+    the smallest motion.  Every candidate returned here is re-validated by the
+    unchanged camera-envelope, aperture and alignment gates, and the caller
+    still IK/collision-prevalidates the orientation path before any motion.
+    """
+    yaw_only = _find_3d_axis_yaw_refinement(
+        object_box_3d, current_rpy, max_aperture_mm
+    )
+    if yaw_only.get("ok"):
+        return {**yaw_only, "refinement_mode": "yaw_only"}
+    try:
+        base_rpy = np.asarray(current_rpy, dtype=float)
+        aperture = float(max_aperture_mm)
+        axes_base = np.asarray(object_box_3d["axes_base"], dtype=float)
+        observed_mm = np.asarray(
+            object_box_3d["observed_size_m"], dtype=float) * 1000.0
+        conservative_mm = np.asarray(
+            object_box_3d["conservative_size_m"], dtype=float) * 1000.0
+    except (KeyError, TypeError, ValueError):
+        return {**yaw_only, "reason": f"{yaw_only.get('reason')}; "
+                "full-orientation refinement inputs are invalid"}
+    if base_rpy.shape != (3,) or axes_base.shape != (3, 3) \
+            or observed_mm.shape != (3,) or conservative_mm.shape != (3,) \
+            or not math.isfinite(aperture) or aperture <= 0.0:
+        return {**yaw_only, "reason": f"{yaw_only.get('reason')}; "
+                "full-orientation refinement geometry is malformed"}
+    tool_axis, tool_detail = _tool_frame_jaw_closing_axis(base_rpy)
+    if tool_axis is None:
+        return {**yaw_only, "reason": f"{yaw_only.get('reason')}; "
+                f"{tool_detail.get('reason')}"}
+
+    def _limit(name: str, default: float, ceiling: float) -> float:
+        try:
+            value = float(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            value = default
+        return float(np.clip(value, 0.0, ceiling))
+
+    # Roll is disabled by default. The refinement rotates the wrist *before*
+    # the scene collision map is captured, and the discovery clouds were all
+    # captured unrolled: a large roll leaves the map's anchor view sharing
+    # almost no occupancy with them, every discovery view is dropped from the
+    # fusion, and the map that should have stopped the gripper hitting the
+    # table is built from a single viewpoint. Rolling therefore removes the
+    # protection it needs. Until the rotation can be deferred until after the
+    # scene is built, keep the wrist level and let pitch/yaw do the aligning;
+    # a genuinely edge-on object is refused rather than approached blind.
+    roll_limit = _limit("REBOT_3D_AXIS_REFINE_MAX_ROLL_DEG", 0.0, 60.0)
+    pitch_limit = _limit("REBOT_3D_AXIS_REFINE_MAX_PITCH_DEG", 20.0, 45.0)
+    yaw_limit = _limit(
+        "REBOT_3D_AXIS_REFINE_MAX_YAW_DEG", GEOMETRY_MAX_YAW_DELTA_DEG, 45.0
+    )
+    align_tol_deg = float(np.clip(_limit(
+        "REBOT_3D_AXIS_ALIGN_TOL_DEG", 15.0, 25.0
+    ), 5.0, 25.0))
+    # Aligning the jaws with an arbitrarily posed object routinely needs more
+    # rotation than the 35deg this started at — a run refused at 38.6deg with a
+    # pose that satisfied every other gate. Use the same 45deg ceiling that
+    # ``load_saved_camera_jacobian`` already allows an explicit bounded request,
+    # since the rigid mount transform is rotated analytically and the pose is
+    # IK/collision prevalidated before any motion.
+    camera_envelope_deg = float(np.clip(_limit(
+        "REBOT_3D_AXIS_REFINE_CAMERA_ENVELOPE_DEG", 45.0, 45.0
+    ), 25.0, 45.0))
+    open_clearance_mm = _effective_open_clearance_mm()[0]
+    # Only axes that physically fit the jaws are worth aiming at.
+    usable = [
+        index for index in range(3)
+        if float(conservative_mm[index]) <= aperture + 1e-6
+        and float(observed_mm[index]) + open_clearance_mm <= aperture + 1e-6
+    ]
+    if not usable:
+        return {
+            **yaw_only,
+            "reason": (
+                "no measured object axis fits the "
+                f"{aperture:.1f}mm aperture at any wrist orientation"
+            ),
+        }
+
+    def _sweep(centre: np.ndarray, spans: tuple[float, float, float],
+               step: float) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        grids = []
+        for span in spans:
+            if span <= 1e-9:
+                grids.append(np.array([0.0]))
+            else:
+                count = int(math.floor(span / step))
+                grids.append(np.arange(-count, count + 1) * step)
+        for d_roll in grids[0]:
+            for d_pitch in grids[1]:
+                for d_yaw in grids[2]:
+                    candidate = centre + np.radians(
+                        np.array([d_roll, d_pitch, d_yaw])
+                    )
+                    # Stay inside the absolute bounds measured from the pose
+                    # the object was observed at, not from the sweep centre.
+                    offset_deg = np.degrees(candidate - base_rpy)
+                    if abs(offset_deg[0]) > roll_limit + 1e-6 \
+                            or abs(offset_deg[1]) > pitch_limit + 1e-6 \
+                            or abs(offset_deg[2]) > yaw_limit + 1e-6:
+                        continue
+                    closing = _rpy_rotation_matrix(
+                        tuple(float(v) for v in candidate)
+                    ) @ tool_axis
+                    for index in usable:
+                        alignment = float(np.clip(abs(float(np.dot(
+                            closing, axes_base[index]
+                        ))), 0.0, 1.0))
+                        angle_deg = math.degrees(math.acos(alignment))
+                        if angle_deg > align_tol_deg:
+                            continue
+                        found.append({
+                            "axis_index": index,
+                            "angle_deg": angle_deg,
+                            "target_rpy": tuple(float(v) for v in candidate),
+                            "offset_deg": float(offset_deg[2]),
+                            "roll_offset_deg": float(offset_deg[0]),
+                            "pitch_offset_deg": float(offset_deg[1]),
+                            "orientation_delta_deg": float(
+                                np.linalg.norm(offset_deg)
+                            ),
+                            "observed_width_mm": float(observed_mm[index]),
+                            "conservative_width_mm": float(
+                                conservative_mm[index]
+                            ),
+                        })
+        return found
+
+    coarse_step = float(np.clip(_limit(
+        "REBOT_3D_AXIS_REFINE_COARSE_STEP_DEG", 3.0, 10.0
+    ), 1.0, 10.0))
+    fine_step = float(np.clip(_limit(
+        "REBOT_3D_AXIS_REFINE_STEP_DEG", 1.0, 3.0
+    ), 0.5, 3.0))
+    candidates = _sweep(
+        base_rpy, (roll_limit, pitch_limit, yaw_limit), coarse_step
+    )
+    if not candidates:
+        return {
+            **yaw_only,
+            "reason": (
+                "no bounded wrist orientation within "
+                f"{roll_limit:.0f}deg roll, {pitch_limit:.0f}deg pitch and "
+                f"{yaw_limit:.0f}deg yaw pointed the jaws along a measured "
+                f"object axis inside {align_tol_deg:.0f}deg"
+            ),
+            "searched_roll_deg": roll_limit,
+            "searched_pitch_deg": pitch_limit,
+            "searched_yaw_deg": yaw_limit,
+        }
+    # Anything inside the tolerance passes the gate, so bucket the alignment
+    # and prefer the smallest wrist motion within a bucket.  Chasing a
+    # perfectly parallel axis is worth little once there is margin, and the
+    # extra rotation it costs is what makes IK or the collision map refuse.
+    def _rank(item: dict[str, Any]) -> tuple[float, float]:
+        return (math.floor(item["angle_deg"] / 5.0),
+                item["orientation_delta_deg"])
+
+    candidates.sort(key=_rank)
+    # Refine locally around the best coarse pose, then validate in order
+    # through the unchanged camera/aperture/alignment gates.
+    best = candidates[0]
+    refined = _sweep(
+        np.asarray(best["target_rpy"], dtype=float),
+        (coarse_step, coarse_step, coarse_step), fine_step,
+    )
+    # The fine sweep only produces neighbours of one pose, so use its best as
+    # the primary answer and draw the fallbacks from the coarse sweep, which
+    # actually spans the reachable orientations.
+    ranked = sorted(refined, key=_rank)[:1] + sorted(candidates, key=_rank)
+    attempts = int(np.clip(int(_limit(
+        "REBOT_3D_AXIS_REFINE_MAX_VALIDATIONS", 24.0, 96.0
+    )), 4, 96))
+    alternatives = int(np.clip(int(_limit(
+        "REBOT_3D_AXIS_REFINE_ALTERNATIVES", 8.0, 24.0
+    )), 1, 24))
+    validated: list[dict[str, Any]] = []
+    last_reason = "no validated candidate"
+    for candidate in ranked[:attempts]:
+        mapping, mapping_detail = load_saved_camera_jacobian(
+            candidate["target_rpy"],
+            maximum_orientation_delta_deg=camera_envelope_deg,
+        )
+        if mapping is None:
+            last_reason = str(mapping_detail.get("reason"))
+            continue
+        aligned = _aligned_3d_jaw_width(object_box_3d, mapping)
+        if not aligned.get("ok"):
+            last_reason = str(aligned.get("reason"))
+            continue
+        observed = float(aligned["observed_width_mm"])
+        conservative = float(aligned["conservative_width_mm"])
+        if conservative > aperture + 1e-6 \
+                or observed + open_clearance_mm > aperture + 1e-6:
+            last_reason = (
+                f"aligned axis {conservative:.1f}mm exceeds the "
+                f"{aperture:.1f}mm aperture"
+            )
+            continue
+        # Alternatives are only useful if they are genuinely different poses.
+        # The local refine sweep produces near-identical neighbours, and eight
+        # poses within a degree of each other all fail the same IK solution.
+        # Require angular separation so the list spans real options.
+        separation_deg = float(np.clip(_limit(
+            "REBOT_3D_AXIS_REFINE_ALTERNATIVE_SEPARATION_DEG", 6.0, 20.0
+        ), 2.0, 20.0))
+        candidate_rpy_deg = np.degrees(
+            np.asarray(candidate["target_rpy"], dtype=float)
+        )
+        too_similar = any(
+            float(np.max(np.abs(
+                candidate_rpy_deg - np.degrees(
+                    np.asarray(existing["target_rpy"], dtype=float)
+                )
+            ))) < separation_deg
+            for existing in validated
+        )
+        if too_similar:
+            continue
+        validated.append({
+            "ok": True,
+            "refinement_mode": "bounded_full_orientation",
+            "target_rpy": candidate["target_rpy"],
+            "offset_deg": candidate["offset_deg"],
+            "roll_offset_deg": candidate["roll_offset_deg"],
+            "pitch_offset_deg": candidate["pitch_offset_deg"],
+            "axis_angle_deg": candidate["angle_deg"],
+            "orientation_delta_deg": candidate["orientation_delta_deg"],
+            "camera_mapping": mapping,
+            "camera_mapping_detail": mapping_detail,
+            "aligned_width": aligned,
+            "searched_roll_deg": roll_limit,
+            "searched_pitch_deg": pitch_limit,
+            "searched_yaw_deg": yaw_limit,
+            "camera_envelope_deg": camera_envelope_deg,
+            "reason": (
+                "bounded full-orientation refinement selected roll "
+                f"{candidate['roll_offset_deg']:+.1f}deg, pitch "
+                f"{candidate['pitch_offset_deg']:+.1f}deg, yaw "
+                f"{candidate['offset_deg']:+.1f}deg to meet a measured object "
+                f"axis {candidate['angle_deg']:.1f}deg from jaw closure; "
+                f"{aligned['reason']}"
+            ),
+        })
+        if len(validated) >= alternatives:
+            break
+    if validated:
+        # Aiming the jaws correctly and being able to reach that pose are
+        # different questions, and only the caller can answer the second: it
+        # owns the IK/collision path check. Returning a single pose meant one
+        # kinematically awkward winner aborted a run for which several other
+        # equally aligned poses existed. Hand back the ranked alternatives so
+        # the caller can walk them until a path prevalidates.
+        best_validated = dict(validated[0])
+        best_validated["alternatives"] = validated
+        return best_validated
+    return {
+        **yaw_only,
+        "reason": (
+            "bounded roll/pitch/yaw poses aimed the jaws along a measured "
+            f"object axis, but none passed the unchanged camera and aperture "
+            f"gates: {last_reason}"
+        ),
+        "searched_roll_deg": roll_limit,
+        "searched_pitch_deg": pitch_limit,
+        "searched_yaw_deg": yaw_limit,
+        "camera_envelope_deg": camera_envelope_deg,
+    }
+
+
+def _stable_visual_subsection_fallback(
+    geometry: GG.GraspGeometry,
+    geometry_consensus: dict[str, Any],
+    jaw_plan: dict[str, Any],
+    object_box_3d: dict[str, Any],
+    full_projection_detail: dict[str, Any],
+    recentre_detail: dict[str, Any],
+    *, independent_metric_crosscheck: bool,
+) -> dict[str, Any]:
+    """Authorize an image-aligned local grasp when only OBB attitude is weak.
+
+    A measured-PCA box can have stable extents but unstable minor-axis attitude
+    when RGB-D sees only the top and one side of a thin object.  In that case a
+    correct, repeated image-plane cross-section must not be discarded merely
+    because the uncertain PCA frame projects the long object through the jaws.
+    This fallback is intentionally narrow: two independent metric boxes must
+    already agree in size, the grasp point must lie on that metric object, and
+    repeated post-orientation masks must agree on a subsection that fits the
+    unchanged aperture.  The full metric box is retained for collision and
+    payload planning; only its unsnapped *orientation* is declined as grasp
+    authority.
+    """
+    body = geometry.grasp_detection
+    if body is None:
+        return {"ok": False, "reason": "visual grasp subsection is missing"}
+    try:
+        width_mm = float(body.min_width_mm)
+        aperture_mm = float(jaw_plan["max_aperture_mm"])
+        valid_frames = int(geometry_consensus.get(
+            "valid_full_geometry_frames", 0
+        ))
+        width_spread_mm = float(geometry_consensus.get(
+            "width_spread_mm", math.inf
+        ))
+        projected_mm = float(full_projection_detail["observed_width_mm"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "reason": "subsection evidence is incomplete"}
+    if not independent_metric_crosscheck:
+        return {
+            "ok": False,
+            "reason": "independent registered/stationary metric boxes did not agree",
+        }
+    if not bool(recentre_detail.get("ok")):
+        return {
+            "ok": False,
+            "reason": "visual grasp point was not verified inside the metric object",
+        }
+    orientation_mode = str(object_box_3d.get("orientation_mode", ""))
+    if orientation_mode.startswith("gravity_snapped"):
+        return {
+            "ok": False,
+            "reason": "metric box has a gravity-validated orientation",
+        }
+    if not orientation_mode.startswith("measured_3d_pca"):
+        return {
+            "ok": False,
+            "reason": (
+                "metric box orientation is neither explicitly unsnapped PCA "
+                "nor gravity-validated"
+            ),
+        }
+    if valid_frames < 2 or not math.isfinite(width_spread_mm):
+        return {
+            "ok": False,
+            "reason": "fewer than two stable post-orientation visual sections",
+        }
+    width_limit_mm = max(3.0, 0.20 * max(1.0, width_mm))
+    if width_spread_mm > width_limit_mm:
+        return {
+            "ok": False,
+            "reason": (
+                f"visual subsection spread {width_spread_mm:.1f}mm exceeds "
+                f"the {width_limit_mm:.1f}mm stability limit"
+            ),
+        }
+    effective_clearance_mm = _effective_open_clearance_mm()[0]
+    required_open_mm = width_mm + effective_clearance_mm
+    if required_open_mm > aperture_mm + 1e-6:
+        return {
+            "ok": False,
+            "reason": (
+                f"stable visual subsection needs {required_open_mm:.1f}mm "
+                f"including clearance, beyond the {aperture_mm:.1f}mm jaw limit"
+            ),
+        }
+    disagreement_mm = projected_mm - width_mm
+    minimum_disagreement_mm = max(10.0, 0.25 * projected_mm)
+    if disagreement_mm < minimum_disagreement_mm:
+        return {
+            "ok": False,
+            "reason": (
+                "visual and metric projections do not disagree enough to "
+                "override the measured 3D attitude"
+            ),
+        }
+    return {
+        "ok": True,
+        "reason": (
+            f"{valid_frames} stable post-orientation masks agree on a "
+            f"{width_mm:.1f}mm local subsection (spread "
+            f"{width_spread_mm:.1f}mm), requiring {required_open_mm:.1f}/"
+            f"{aperture_mm:.1f}mm opening; the unsnapped PCA attitude alone "
+            f"predicted {projected_mm:.1f}mm, so image alignment controls the "
+            "local grasp while the complete metric box remains collision-only"
+        ),
+        "width_mm": width_mm,
+        "width_spread_mm": width_spread_mm,
+        "required_open_mm": required_open_mm,
+        "max_aperture_mm": aperture_mm,
+        "metric_projection_mm": projected_mm,
+        "orientation_mode": orientation_mode,
+    }
+
+
 def _metric_horizontal_box_dimensions(
     object_box_3d: dict[str, Any] | None,
 ) -> tuple[float | None, float | None, dict[str, Any]]:
@@ -2466,6 +3197,156 @@ def _metric_horizontal_box_dimensions(
     }
 
 
+def _metric_box_extent_convergence(
+    previous_box: dict[str, Any] | None,
+    current_box: dict[str, Any] | None,
+) -> tuple[bool, dict[str, Any]]:
+    """Require the measured multi-view target box to stop changing.
+
+    Gravity-locked tabletop boxes are compared by physical role instead of by
+    blindly sorting all three extents.  Sorting can pair the earlier vertical
+    thickness with the later horizontal width as a partial mask fills in,
+    rejecting an otherwise stable long-object footprint.  Horizontal width
+    and length remain strict; the vertical thickness gets a separately bounded
+    tolerance because it is the least observable axis from a wrist camera.
+    """
+    try:
+        previous = np.sort(np.asarray(
+            previous_box["observed_size_m"], dtype=float
+        ))
+        current = np.sort(np.asarray(
+            current_box["observed_size_m"], dtype=float
+        ))
+        previous_views = int(previous_box.get("views", 0))
+        current_views = int(current_box.get("views", 0))
+    except (KeyError, TypeError, ValueError):
+        return False, {"reason": "a previous and current metric box are required"}
+    if previous.shape != (3,) or current.shape != (3,) \
+            or not np.all(np.isfinite(previous)) \
+            or not np.all(np.isfinite(current)):
+        return False, {"reason": "metric box extents are invalid"}
+    if current_views < previous_views:
+        return False, {
+            "reason": "registered target-mask count went backwards",
+            "previous_views": previous_views,
+            "current_views": current_views,
+        }
+    repeated_view_set = current_views == previous_views
+    if repeated_view_set and current_views < 2:
+        return False, {
+            "reason": "no newly registered target mask was added",
+            "previous_views": previous_views,
+            "current_views": current_views,
+        }
+    relative_limit = float(np.clip(float(os.getenv(
+        "REBOT_HYBRID_BOX_CONVERGENCE_FRACTION", "0.20"
+    )), 0.10, 0.30))
+    absolute_limit_m = float(np.clip(float(os.getenv(
+        "REBOT_HYBRID_BOX_CONVERGENCE_ABS_M", "0.005"
+    )), 0.003, 0.010))
+    delta = np.abs(current - previous)
+    limit = np.maximum(absolute_limit_m, relative_limit * current)
+    converged = bool(np.all(delta <= limit))
+    comparison_mode = "sorted_3d_extents"
+
+    # Once several exact-mask views have established a gravity-locked,
+    # horizontal long object, compare the two tabletop axes to one another and
+    # the vertical axis to itself.  This preserves the original strict fallback
+    # for tilted/standing/underspecified boxes.
+    try:
+        previous_axes = np.asarray(previous_box["axes_base"], dtype=float)
+        current_axes = np.asarray(current_box["axes_base"], dtype=float)
+        previous_sizes = np.asarray(
+            previous_box["observed_size_m"], dtype=float
+        )
+        current_sizes = np.asarray(
+            current_box["observed_size_m"], dtype=float
+        )
+        previous_horizontal = [
+            index for index, axis in enumerate(previous_axes)
+            if abs(float(axis[2])) <= 0.25
+        ]
+        current_horizontal = [
+            index for index, axis in enumerate(current_axes)
+            if abs(float(axis[2])) <= 0.25
+        ]
+        previous_vertical = [
+            index for index, axis in enumerate(previous_axes)
+            if abs(float(axis[2])) >= 0.90
+        ]
+        current_vertical = [
+            index for index, axis in enumerate(current_axes)
+            if abs(float(axis[2])) >= 0.90
+        ]
+        gravity_locked = (
+            "gravity" in str(previous_box.get("orientation_mode", ""))
+            and "gravity" in str(current_box.get("orientation_mode", ""))
+        )
+        if gravity_locked and previous_views >= 3 and current_views >= 3 \
+                and len(previous_horizontal) == 2 \
+                and len(current_horizontal) == 2 \
+                and len(previous_vertical) == 1 \
+                and len(current_vertical) == 1:
+            previous_xy = np.sort(previous_sizes[previous_horizontal])
+            current_xy = np.sort(current_sizes[current_horizontal])
+            xy_delta = np.abs(current_xy - previous_xy)
+            xy_limit = np.maximum(
+                absolute_limit_m, relative_limit * current_xy
+            )
+            previous_z = float(previous_sizes[previous_vertical[0]])
+            current_z = float(current_sizes[current_vertical[0]])
+            z_delta = abs(current_z - previous_z)
+            z_limit = max(
+                absolute_limit_m,
+                float(np.clip(float(os.getenv(
+                    "REBOT_HYBRID_BOX_VERTICAL_CONVERGENCE_ABS_M", "0.010"
+                )), 0.006, 0.015)),
+                0.40 * current_z,
+            )
+            horizontal_long_object = bool(
+                current_xy[-1] >= max(0.040, 1.5 * current_z)
+            )
+            # This role-aware comparison exists for horizontal long objects
+            # (for example a sponge or marker lying on the table), where
+            # sorting all three dimensions can swap vertical thickness with a
+            # tabletop width.  A standing object has its long axis vertical;
+            # applying the horizontal-object predicate to it used to overwrite
+            # an already-valid generic convergence result with False.  Keep
+            # the ordinary orientation-independent 3-D extent comparison for
+            # upright objects.
+            if horizontal_long_object:
+                converged = bool(
+                    np.all(xy_delta <= xy_limit)
+                    and z_delta <= z_limit
+                )
+                comparison_mode = "gravity_locked_tabletop_axes"
+                delta = np.asarray([xy_delta[0], xy_delta[1], z_delta])
+                limit = np.asarray([xy_limit[0], xy_limit[1], z_limit])
+    except (KeyError, TypeError, ValueError, IndexError):
+        # The sorted three-axis policy above remains the safe generic fallback.
+        pass
+    return converged, {
+        "reason": (
+            "bounded discovery added no new target mask, but the existing "
+            "multi-view metric box remained stable"
+            if converged and repeated_view_set else
+            "new target view left the measured tabletop axes stable"
+            if converged and comparison_mode == "gravity_locked_tabletop_axes"
+            else "new target view left all measured box extents stable"
+            if converged else
+            "measured target box is still changing as discovery views are added"
+        ),
+        "previous_mm": (previous * 1000.0).round(1).tolist(),
+        "current_mm": (current * 1000.0).round(1).tolist(),
+        "delta_mm": (delta * 1000.0).round(1).tolist(),
+        "limit_mm": (limit * 1000.0).round(1).tolist(),
+        "previous_views": previous_views,
+        "current_views": current_views,
+        "repeated_view_set": repeated_view_set,
+        "comparison_mode": comparison_mode,
+    }
+
+
 def _geometry_with_3d_jaw_width(
     geometry: GG.GraspGeometry, width_detail: dict[str, Any],
 ) -> GG.GraspGeometry:
@@ -2486,6 +3367,299 @@ def _geometry_with_3d_jaw_width(
         reason=(f"{geometry.reason}; jaw width replaced by aligned measured "
                 f"3D thickness {measured_width:.1f}mm"),
     )
+
+
+def _grasp_point_at_metric_subsection(
+    geometry: GG.GraspGeometry, object_box_3d: dict[str, Any] | None, *,
+    camera_mapping: Any, ee_xyz_m: Any, tool_camera_mm: Any, intr: Any,
+) -> tuple[GG.GraspGeometry, dict[str, Any]]:
+    """Put the grasp point at the metric centre of the selected subsection.
+
+    The mask-derived grasp point mixes two different measurements: the (u,v) of
+    the visible mask and a deliberately *near-surface* depth (the median of the
+    nearest 60% of in-mask depths, which exists to suppress table pixels around
+    a flush object).  Deprojecting that (u, v) at that depth yields a point on
+    the object's near face, not inside its body.
+
+    For the thin marker the open-jaw slot was calibrated with, the two are
+    within a few millimetres and the error is invisible.  For an object with
+    real depth extent the grasp point lands roughly half the object's depth in
+    front of the body it represents, so the jaws are commanded to a pocket
+    centred on the near face.  Closing there pushes a light object over instead
+    of capturing it, and the bias changes with viewing angle, so two
+    observations of the same object disagree.
+
+    A verified metric OBB already carries the object's true centre, in base
+    coordinates, independent of viewpoint.  Rebuild the grasp point from it:
+    start at the box centre and slide along the measured major axis to the
+    station the cross-section ranking selected.  The correction is bounded and
+    fails closed, so a bad box cannot silently relocate the grasp.
+    """
+    grasp = getattr(geometry, "grasp_detection", None)
+    if grasp is None or not isinstance(object_box_3d, dict):
+        return geometry, {"ok": False, "reason": "no metric box or grasp point"}
+    try:
+        centre_base = np.asarray(object_box_3d["center_m"], dtype=float)
+        axes_base = np.asarray(object_box_3d["axes_base"], dtype=float)
+        observed_m = np.asarray(object_box_3d["observed_size_m"], dtype=float)
+        mapping = np.asarray(camera_mapping, dtype=float)
+        ee_xyz = np.asarray(ee_xyz_m, dtype=float)
+        tool_cam = np.asarray(tool_camera_mm, dtype=float)
+        observed_cam = np.asarray(grasp.p_cam_mm, dtype=float)
+    except (KeyError, TypeError, ValueError):
+        return geometry, {"ok": False, "reason": "metric subsection inputs are invalid"}
+    if centre_base.shape != (3,) or axes_base.shape != (3, 3) \
+            or observed_m.shape != (3,) or mapping.shape != (3, 3) \
+            or ee_xyz.shape != (3,) or tool_cam.shape != (3,) \
+            or observed_cam.shape != (3,) \
+            or not np.all(np.isfinite(centre_base)) \
+            or not np.all(np.isfinite(axes_base)) \
+            or not np.all(np.isfinite(mapping)):
+        return geometry, {"ok": False, "reason": "metric subsection geometry is malformed"}
+    # Station along the measured major axis. The ranked profile samples the
+    # visible silhouette, so its fraction is a relative station, not a length;
+    # clamp it well inside the object and convert with the metric major axis.
+    major_index = int(np.argmax(observed_m))
+    major_axis = axes_base[major_index]
+    major_norm = float(np.linalg.norm(major_axis))
+    if major_norm <= 1e-9:
+        return geometry, {"ok": False, "reason": "measured major axis is degenerate"}
+    major_axis = major_axis / major_norm
+    selected = (getattr(grasp, "info", {}) or {}).get("selected_candidate")
+    try:
+        fraction = float((selected or {}).get("axis_fraction", 0.0))
+    except (TypeError, ValueError):
+        fraction = 0.0
+    fraction = float(np.clip(fraction, -0.35, 0.35))
+    station_m = fraction * 0.5 * float(observed_m[major_index])
+    target_base = centre_base + major_axis * station_m
+    try:
+        target_cam = tool_cam - mapping @ (target_base - ee_xyz)
+    except ValueError:
+        return geometry, {"ok": False, "reason": "metric subsection mapping failed"}
+    if not np.all(np.isfinite(target_cam)) or float(target_cam[2]) <= 0.0:
+        return geometry, {"ok": False, "reason": "metric subsection is behind the camera"}
+    shift_mm = float(np.linalg.norm(target_cam - observed_cam))
+    limit_mm = float(np.clip(float(os.getenv(
+        "REBOT_GRASP_METRIC_RECENTRE_MAX_MM", "60"
+    )), 10.0, 90.0))
+    if shift_mm > limit_mm:
+        return geometry, {
+            "ok": False,
+            "reason": (
+                f"metric subsection centre is {shift_mm:.1f}mm from the mask "
+                f"grasp point, beyond the {limit_mm:.1f}mm recentring limit"
+            ),
+            "shift_mm": round(shift_mm, 1),
+        }
+    try:
+        uv = WD.project(target_cam, intr)
+    except Exception:  # noqa: BLE001
+        uv = None
+    if uv is None or not all(math.isfinite(float(value)) for value in uv):
+        return geometry, {"ok": False, "reason": "metric subsection did not reproject"}
+    updated = replace(
+        grasp,
+        uv=(float(uv[0]), float(uv[1])),
+        z_mm=float(target_cam[2]),
+        p_cam_mm=tuple(float(value) for value in target_cam),
+        info={
+            **(getattr(grasp, "info", {}) or {}),
+            "grasp_point_basis": "verified_metric_box_subsection",
+            "grasp_point_shift_mm": round(shift_mm, 1),
+            "grasp_point_axis_fraction": round(fraction, 3),
+            "grasp_point_mask_p_cam_mm": observed_cam.round(1).tolist(),
+        },
+    )
+    return replace(
+        geometry, grasp_detection=updated,
+        reason=(f"{geometry.reason}; grasp point recentred {shift_mm:.1f}mm "
+                "onto the verified metric object body"),
+    ), {
+        "ok": True,
+        "shift_mm": round(shift_mm, 1),
+        "axis_fraction": round(fraction, 3),
+        "station_mm": round(station_m * 1000.0, 1),
+        "mask_p_cam_mm": observed_cam.round(1).tolist(),
+        "metric_p_cam_mm": target_cam.round(1).tolist(),
+        "reason": (
+            f"grasp point moved {shift_mm:.1f}mm from the near-surface mask "
+            f"point to the measured body at axis fraction {fraction:+.2f}"
+        ),
+    }
+
+
+def _local_subsection_along_limit_mm(
+    geometry: GG.GraspGeometry,
+    jaw_plan: dict[str, Any],
+    fit_detail: dict[str, Any],
+    base_tol_mm: float,
+) -> tuple[float, dict[str, Any]]:
+    """Bound jaw-pocket alignment around one measured grasp subsection.
+
+    A long object is allowed to overhang the gripper.  That does not mean the
+    *selected cross-section* may sit near the fingertips: the old gate expanded
+    its along-finger tolerance from whole-object end clearance, so a sponge
+    with plenty of material beyond the jaws could pass while its chosen contact
+    section was 10--20 mm away from the calibrated pocket centre.
+
+    Cross-section profiles are sampled in a finite window along the object's
+    major axis.  Use the contiguous, width-consistent part of that profile as
+    evidence for local contact support, subtract a physical centring reserve,
+    and never exceed the calibrated base tolerance.  Full-object length only
+    bounds the conversion from normalized profile station to millimetres; it
+    never has to fit between the jaws.
+    """
+    base_tol = float(np.clip(base_tol_mm, 3.0, 8.0))
+    grasp = getattr(geometry, "grasp_detection", None)
+    if grasp is None:
+        return base_tol, {
+            "reason": "grasp subsection unavailable; calibrated limit retained",
+            "source": "calibrated_fallback",
+        }
+    try:
+        width_mm = float(jaw_plan["min_width_mm"])
+        major_mm = float(fit_detail["major_mm"])
+    except (KeyError, TypeError, ValueError):
+        return base_tol, {
+            "reason": "subsection dimensions unavailable; calibrated limit retained",
+            "source": "calibrated_fallback",
+        }
+    if not math.isfinite(width_mm) or width_mm <= 0.0 \
+            or not math.isfinite(major_mm) or major_mm <= 0.0:
+        return base_tol, {
+            "reason": "subsection dimensions invalid; calibrated limit retained",
+            "source": "calibrated_fallback",
+        }
+    elongated = major_mm / max(width_mm, 1e-6) >= 1.6
+    if not elongated:
+        return base_tol, {
+            "reason": "compact object uses calibrated jaw-pocket tolerance",
+            "source": "compact_object",
+            "major_mm": major_mm,
+            "width_mm": width_mm,
+        }
+
+    info = getattr(grasp, "info", {}) or {}
+    selected = info.get("selected_candidate", {})
+    try:
+        selected_fraction = float(selected.get("axis_fraction", 0.0))
+    except (AttributeError, TypeError, ValueError):
+        selected_fraction = 0.0
+    if not math.isfinite(selected_fraction):
+        selected_fraction = 0.0
+    selected_fraction = float(np.clip(selected_fraction, -1.0, 1.0))
+
+    profile = getattr(geometry, "candidates", None)
+    if not isinstance(profile, list) or not profile:
+        profile = info.get("cross_section_candidates", [])
+    usable: list[tuple[float, float]] = []
+    if isinstance(profile, list):
+        for candidate in profile:
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                fraction = float(candidate["axis_fraction"])
+                candidate_width = float(candidate["width_mm"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(fraction) and math.isfinite(candidate_width) \
+                    and candidate_width > 0.0:
+                usable.append((fraction, candidate_width))
+    if not usable:
+        return base_tol, {
+            "reason": (
+                "long object may overhang; no local profile was available, "
+                "so the calibrated subsection-centre tolerance is retained"
+            ),
+            "source": "calibrated_subsection_fallback",
+            "major_mm": major_mm,
+            "width_mm": width_mm,
+            "selected_axis_fraction": selected_fraction,
+            "whole_object_overhang_allowed": True,
+        }
+
+    half_major_mm = 0.5 * major_mm
+    # cross_section_profile measures each station over a +/-5% major-axis
+    # window.  Adjacent stations extend the trusted local patch only when their
+    # widths agree with the selected section; a changing contour is an edge,
+    # shoulder or neighbouring object and must not enlarge the capture window.
+    measured_half_window_mm = max(2.0, 0.05 * major_mm)
+    width_agreement_mm = max(2.0, 0.20 * width_mm)
+    stable = sorted(
+        (fraction, candidate_width) for fraction, candidate_width in usable
+        if abs(candidate_width - width_mm) <= width_agreement_mm
+    )
+    left_reach_mm = measured_half_window_mm
+    right_reach_mm = measured_half_window_mm
+    maximum_profile_gap = 0.20
+    left = sorted(
+        ((fraction, candidate_width) for fraction, candidate_width in stable
+         if fraction < selected_fraction), reverse=True
+    )
+    right = sorted(
+        ((fraction, candidate_width) for fraction, candidate_width in stable
+         if fraction > selected_fraction)
+    )
+    cursor = selected_fraction
+    for fraction, _candidate_width in left:
+        if cursor - fraction > maximum_profile_gap + 1e-9:
+            break
+        left_reach_mm = max(
+            left_reach_mm,
+            (selected_fraction - fraction) * half_major_mm
+            + measured_half_window_mm,
+        )
+        cursor = fraction
+    cursor = selected_fraction
+    for fraction, _candidate_width in right:
+        if fraction - cursor > maximum_profile_gap + 1e-9:
+            break
+        right_reach_mm = max(
+            right_reach_mm,
+            (fraction - selected_fraction) * half_major_mm
+            + measured_half_window_mm,
+        )
+        cursor = fraction
+
+    # Never claim support beyond the measured object ends.  This preserves the
+    # ability to grasp any interior subsection while making an end subsection
+    # demand more precise insertion.
+    left_to_end_mm = (selected_fraction + 1.0) * half_major_mm
+    right_to_end_mm = (1.0 - selected_fraction) * half_major_mm
+    left_reach_mm = min(left_reach_mm, left_to_end_mm)
+    right_reach_mm = min(right_reach_mm, right_to_end_mm)
+    local_half_support_mm = max(
+        0.0, min(left_reach_mm, right_reach_mm)
+    )
+    try:
+        reserve_mm = float(os.getenv(
+            "REBOT_GRASP_SUBSECTION_CENTER_RESERVE_MM", "2.0"
+        ))
+    except (TypeError, ValueError):
+        reserve_mm = 2.0
+    reserve_mm = float(np.clip(reserve_mm, 1.0, 4.0))
+    limit_mm = float(np.clip(
+        local_half_support_mm - reserve_mm, 3.0, base_tol
+    ))
+    return limit_mm, {
+        "reason": (
+            f"selected local subsection has {local_half_support_mm:.1f}mm "
+            f"symmetric measured support; {reserve_mm:.1f}mm centring "
+            f"reserve gives {limit_mm:.1f}mm along-finger tolerance; the "
+            "remaining object may overhang"
+        ),
+        "source": "measured_local_cross_section_profile",
+        "major_mm": major_mm,
+        "width_mm": width_mm,
+        "selected_axis_fraction": selected_fraction,
+        "stable_profile_stations": len(stable),
+        "left_support_mm": left_reach_mm,
+        "right_support_mm": right_reach_mm,
+        "local_half_support_mm": local_half_support_mm,
+        "centering_reserve_mm": reserve_mm,
+        "whole_object_overhang_allowed": True,
+    }
 
 
 def _jaw_slot_fit(
@@ -2537,8 +3711,9 @@ def _jaw_slot_fit(
     fit_ok, fit_detail = _validate_object_gripper_fit(
         geometry, jaw_plan, object_box_3d
     )
-    end_clearance = float(fit_detail.get("end_clearance_mm", base_tol))
-    along_limit = min(20.0, max(base_tol, end_clearance - 5.0))
+    along_limit, subsection_detail = _local_subsection_along_limit_mm(
+        geometry, jaw_plan, fit_detail, base_tol
+    )
     # Optical depth carries systematic hand-eye/TCP error that is not visible
     # in the sub-millimetre multi-frame spread.  The fingers already have
     # capture length along this axis, so retain the strict across/along gates
@@ -2566,7 +3741,8 @@ def _jaw_slot_fit(
         "reason": (
             f"axis-aware slot check: across {across_mm:.1f}/{across_limit:.1f}mm, "
             f"along {along_mm:.1f}/{along_limit:.1f}mm, depth "
-            f"{depth_mm:.1f}/{depth_limit:.1f}mm"
+            f"{depth_mm:.1f}/{depth_limit:.1f}mm; subsection="
+            f"{subsection_detail.get('source')}"
         ),
         "across_error_mm": across_mm,
         "across_limit_mm": across_limit,
@@ -2575,6 +3751,7 @@ def _jaw_slot_fit(
         "capture_reserve_mm": capture_reserve,
         "along_error_mm": along_mm,
         "along_limit_mm": along_limit,
+        "subsection_capture": subsection_detail,
         "depth_error_mm": depth_mm,
         "depth_limit_mm": depth_limit,
         "depth_base_limit_mm": base_tol,
@@ -2954,11 +4131,66 @@ def _projected_3d_jaw_span(
         "ok": True,
         "observed_width_mm": observed_span,
         "conservative_width_mm": conservative_span,
+        # Keep the full measured OBB extent paired with the projected jaw
+        # width. A restored close view can contain only a short visible crop;
+        # combining its stale 2D length with the larger metric jaw projection
+        # can otherwise manufacture min_width > max_width.
+        "object_major_mm": float(np.max(observed_mm)),
+        "conservative_object_major_mm": float(np.max(conservative_mm)),
         "axis_contributions": weights.round(5).tolist(),
         "reason": (
             f"measured OBB projects to {observed_span:.1f}mm between the jaws "
             f"({conservative_span:.1f}mm including RGB-D uncertainty)"
         ),
+    }
+
+
+def _projected_3d_span_fits_aperture(
+    width_detail: dict[str, Any], max_aperture_mm: float,
+) -> tuple[bool, dict[str, Any]]:
+    """Gate a full OBB projection without chasing sub-mm RGB-D padding.
+
+    The conservative OBB is intentionally padded, so its projected support can
+    land a fraction of a millimetre beyond the calibrated aperture even when
+    the measured object plus the required entry clearance is physically inside
+    it.  Treat only the existing, globally capped RGB-D boundary allowance as
+    quantisation; the commanded jaw opening itself is never enlarged.
+    """
+    try:
+        aperture = float(max_aperture_mm)
+        observed = float(width_detail["observed_width_mm"])
+        conservative = float(width_detail["conservative_width_mm"])
+    except (KeyError, TypeError, ValueError):
+        return False, {"reason": "projected 3D jaw span is incomplete"}
+    if not width_detail.get("ok") or not all(
+        math.isfinite(value) and value > 0.0
+        for value in (aperture, observed, conservative)
+    ):
+        return False, {"reason": "projected 3D jaw span is invalid"}
+    effective_clearance, boundary_slop = _effective_open_clearance_mm()
+    measured_required = observed + effective_clearance
+    conservative_excess = max(0.0, conservative - aperture)
+    safe = bool(
+        observed <= aperture + 1e-6
+        and measured_required <= aperture + 1e-6
+        and conservative_excess <= boundary_slop + 1e-6
+    )
+    return safe, {
+        "reason": (
+            f"measured projection {observed:.1f}mm plus "
+            f"{effective_clearance:.2f}mm effective entry clearance requires "
+            f"{measured_required:.2f}/{aperture:.1f}mm; conservative padding "
+            f"exceeds the aperture by {conservative_excess:.2f}/"
+            f"{boundary_slop:.2f}mm allowed RGB-D boundary slop; commanded "
+            "opening remains hard-clamped"
+        ),
+        "observed_width_mm": observed,
+        "conservative_width_mm": conservative,
+        "effective_clearance_mm": effective_clearance,
+        "measured_required_open_mm": measured_required,
+        "conservative_excess_mm": conservative_excess,
+        "boundary_slop_mm": boundary_slop,
+        "max_aperture_mm": aperture,
     }
 
 
@@ -2969,19 +4201,75 @@ def _geometry_with_projected_3d_width(
     if grasp is None or not width_detail.get("ok"):
         return geometry
     measured_width = float(width_detail["observed_width_mm"])
+    prior_major = float(grasp.max_width_mm or grasp.min_width_mm or 0.0)
+    metric_major = float(width_detail.get("object_major_mm", 0.0) or 0.0)
+    paired_major = max(measured_width, prior_major, metric_major)
     updated = replace(
-        grasp, min_width_mm=measured_width,
+        grasp, min_width_mm=measured_width, max_width_mm=paired_major,
         info={
             **getattr(grasp, "info", {}),
             "jaw_sizing_basis": "full measured 3D OBB projection",
             "projected_3d_jaw_width": dict(width_detail),
+            "projected_3d_object_major_mm": paired_major,
         },
     )
     return replace(
         geometry, grasp_detection=updated,
         reason=(f"{geometry.reason}; collision-escape jaw span "
-                f"{measured_width:.1f}mm from the measured 3D OBB"),
+                f"{measured_width:.1f}mm with {paired_major:.1f}mm paired "
+                "major extent from the measured 3D OBB"),
     )
+
+
+def _long_object_subsection_entry_safe(
+    geometry: GG.GraspGeometry,
+    jaw_plan: dict[str, Any],
+    *, metric_width_mm: float | None,
+    metric_major_mm: float | None,
+) -> tuple[bool, dict[str, Any]]:
+    """Authorize a measured local section without fitting the whole diagonal.
+
+    Parallel jaws do not need to contain the complete projected support of an
+    elongated marker or sponge: the object may continue beyond the fingers.
+    This exception is deliberately unavailable to broad objects.  It retains
+    the ordinary local aperture, entry-clearance, end-clearance, and object
+    size gates; stable semantic identity is enforced by the caller.
+    """
+    try:
+        width_mm = float(metric_width_mm)
+        major_mm = float(metric_major_mm)
+    except (TypeError, ValueError):
+        return False, {"reason": "metric subsection dimensions are unavailable"}
+    if not math.isfinite(width_mm) or not math.isfinite(major_mm) \
+            or width_mm <= 0.0 or major_mm <= 0.0:
+        return False, {"reason": "metric subsection dimensions are invalid"}
+    minimum_ratio = float(np.clip(float(os.getenv(
+        "REBOT_GRASP_SUBSECTION_MIN_ASPECT_RATIO", "1.5"
+    )), 1.4, 2.5))
+    aspect_ratio = major_mm / max(width_mm, 1e-6)
+    if aspect_ratio < minimum_ratio:
+        return False, {
+            "reason": (
+                f"object aspect ratio {aspect_ratio:.2f} is below the "
+                f"{minimum_ratio:.2f} elongated-subsection gate"
+            ),
+            "aspect_ratio": aspect_ratio,
+        }
+    if not jaw_plan.get("ok"):
+        return False, {"reason": str(jaw_plan.get("reason"))}
+    fit_ok, fit_detail = _validate_object_gripper_fit(geometry, jaw_plan)
+    return bool(fit_ok), {
+        **fit_detail,
+        "aspect_ratio": aspect_ratio,
+        "minimum_aspect_ratio": minimum_ratio,
+        "metric_width_mm": width_mm,
+        "metric_major_mm": major_mm,
+        "reason": (
+            "stable elongated-object local section fits between the jaws; "
+            "the remaining object length may continue beyond the fingers"
+            if fit_ok else str(fit_detail.get("reason"))
+        ),
+    }
 
 
 def _revalidate_recovered_metric_grasp(
@@ -3009,7 +4297,7 @@ def _revalidate_recovered_metric_grasp(
     aperture = float(max_aperture_mm)
     safe = bool(
         conservative <= aperture + 1e-6
-        and observed + max(0.0, GRASP_MIN_OPEN_CLEARANCE_MM)
+        and observed + _effective_open_clearance_mm()[0]
             <= aperture + 1e-6
     )
     if not safe:
@@ -3828,11 +5116,63 @@ def _endpoint_body_pose_consensus(
     }
 
 
+def _registered_identifier_body_for_alignment(
+    identifier_cam_mm: Any,
+    identifier_detail: dict[str, Any],
+    feature_to_grasp_cam_mm: Any,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Recover a locked grasp-body point for bounded open-jaw alignment.
+
+    This does not authorize closure.  It only bridges a stable named-object
+    observation to the previously measured rigid grasp-section offset when the
+    open fingers prevent reacquiring that exact section.  The caller must still
+    pass the unchanged jaw-slot gate after bounded IK/collision-checked motion.
+    """
+    try:
+        identifier = np.asarray(identifier_cam_mm, dtype=float)
+        offset = np.asarray(feature_to_grasp_cam_mm, dtype=float)
+        stable_frames = int(identifier_detail.get("stable_frames", 0))
+    except (TypeError, ValueError):
+        return None, {"reason": "registered identifier inputs are invalid"}
+    if identifier.shape != (3,) or offset.shape != (3,) \
+            or not np.all(np.isfinite(identifier)) \
+            or not np.all(np.isfinite(offset)):
+        return None, {"reason": "registered identifier geometry is non-finite"}
+    if stable_frames < 2:
+        return None, {
+            "reason": (
+                f"only {stable_frames}/2 stable identifier frames; refusing "
+                "registered grasp-body propagation"
+            )
+        }
+    offset_norm = float(np.linalg.norm(offset))
+    if offset_norm > 75.0:
+        return None, {
+            "reason": (
+                f"registered feature/body offset {offset_norm:.1f}mm "
+                "exceeds the 75mm identity-cluster bound"
+            )
+        }
+    body = identifier - offset
+    return body, {
+        "reason": (
+            f"{stable_frames} stable identifier frames propagated the locked "
+            "grasp section through a "
+            f"{offset_norm:.1f}mm measured rigid offset; alignment "
+            "is permitted but closure still requires the jaw-slot gate"
+        ),
+        "stable_frames": stable_frames,
+        "offset_mm": np.round(offset, 2).tolist(),
+        "body_camera_mm": np.round(body, 2).tolist(),
+    }
+
+
 def _checkpoint_section_consensus(
     locked_samples: list[dict[str, Any]],
     fresh_samples: list[dict[str, Any]],
     *, section_locked: bool, min_frames: int = 2,
     max_spread_mm: float = 4.0,
+    allow_reselection: bool = True,
 ) -> tuple[np.ndarray | None, dict[str, Any], list[dict[str, Any]]]:
     """Prefer a locked body section, or safely reselect stable fresh geometry.
 
@@ -3846,7 +5186,7 @@ def _checkpoint_section_consensus(
     )
     if locked_body is not None:
         return locked_body, locked_detail, locked_samples
-    if section_locked:
+    if section_locked and allow_reselection:
         fresh_body, fresh_detail = _endpoint_body_pose_consensus(
             fresh_samples, min_frames=min_frames,
             max_spread_mm=max_spread_mm,
@@ -3865,6 +5205,37 @@ def _checkpoint_section_consensus(
             }
             return fresh_body, detail, fresh_samples
     return None, locked_detail, locked_samples
+
+
+def _registered_section_can_use_fresh_centre(
+    axis_fraction: Any,
+) -> tuple[bool, dict[str, Any]]:
+    """Allow a lost profile index to recover only the object's centre.
+
+    A registered non-central subsection was deliberately selected to avoid an
+    end or obstacle, so replacing it with a generic close-view body centre can
+    change the grasp.  Conversely, a selected centre (fraction zero) and a
+    freshly measured centre describe the same physical subsection even when
+    perspective changes make the discrete far-view profile index disappear.
+    """
+    try:
+        fraction = float(axis_fraction)
+        threshold = float(os.getenv(
+            "REBOT_REGISTERED_CENTRE_FRACTION_TOL", "0.08"
+        ))
+    except (TypeError, ValueError):
+        return False, {"reason": "registered subsection fraction is invalid"}
+    threshold = float(np.clip(threshold, 0.04, 0.12))
+    allowed = bool(math.isfinite(fraction) and abs(fraction) <= threshold)
+    return allowed, {
+        "reason": (
+            f"registered axis fraction {fraction:+.3f} is "
+            f"{'inside' if allowed else 'outside'} the central "
+            f"+/-{threshold:.3f} recovery band"
+        ),
+        "axis_fraction": fraction,
+        "central_fraction_tolerance": threshold,
+    }
 
 
 def _checkpoint_target_position_consensus(
@@ -3945,6 +5316,48 @@ def _checkpoint_target_position_consensus(
     }, selected
 
 
+def _strict_checkpoint_identity_presence(
+    samples: list[dict[str, Any]], *, min_frames: int = 2,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Confirm a locked target without treating its mask centroid as motion.
+
+    ``_observe`` has already applied the hybrid target-identity gate before a
+    sample reaches this function.  For a partially visible elongated object,
+    SAM's centroid can shift by centimetres as different ends enter the image;
+    that is not evidence that the physical object moved.  Repeated exact
+    semantic presence may therefore validate reuse of an already frozen path,
+    but it never supplies a new endpoint or correction vector.
+    """
+    required = int(np.clip(min_frames, 2, 3))
+    semantic = []
+    for sample in samples:
+        feature = sample.get("feature") if isinstance(sample, dict) else None
+        if str(getattr(feature, "source", "")) \
+                not in _SEMANTIC_IDENTITY_SOURCES:
+            continue
+        info = getattr(feature, "info", {}) or {}
+        if info.get("mask_u8") is None:
+            continue
+        semantic.append(sample)
+    if len(semantic) < required:
+        return None, {
+            "reason": (
+                f"only {len(semantic)}/{required} exact semantic target "
+                "observations passed the hybrid identity gate"
+            ),
+            "valid_frames": len(semantic),
+        }
+    return semantic[-1], {
+        "reason": (
+            f"{len(semantic)}/{len(samples)} exact semantic observations "
+            "passed the hybrid identity gate; mask centroids were not used "
+            "to steer the locked grasp subsection"
+        ),
+        "valid_frames": len(semantic),
+        "centroid_steering": False,
+    }
+
+
 def _checkpoint_metric_width_is_authoritative(
     width_detail: dict[str, Any] | None,
     object_box_3d: dict[str, Any] | None,
@@ -3992,7 +5405,7 @@ def _endpoint_measurement_consensus(
     locked_samples: list[dict[str, Any]],
     fresh_samples: list[dict[str, Any]],
     ready_min_mm: float, ready_max_mm: float,
-    *, section_locked: bool,
+    *, section_locked: bool, allow_reselection: bool = True,
 ) -> dict[str, Any]:
     """Fuse close-range width/body data, with safe section reselection.
 
@@ -4022,7 +5435,7 @@ def _endpoint_measurement_consensus(
     locked = summarize(locked_samples)
     if locked["selected"] is not None and locked["body_cam"] is not None:
         return locked
-    if section_locked:
+    if section_locked and allow_reselection:
         fresh = summarize(fresh_samples)
         if fresh["selected"] is not None and fresh["body_cam"] is not None:
             fresh["section_reselected"] = True
@@ -4043,6 +5456,50 @@ def _endpoint_measurement_consensus(
             }
             return fresh
     return locked
+
+
+def _merge_endpoint_measurement_batches(
+    first: dict[str, Any], second: dict[str, Any],
+    ready_min_mm: float, ready_max_mm: float,
+    *, section_locked: bool, allow_reselection: bool = True,
+) -> dict[str, Any]:
+    """Merge one bounded retry without weakening endpoint consensus gates.
+
+    Open jaws can intermittently hide the previously selected body section.
+    Two extremely consistent frames are useful evidence but are deliberately
+    insufficient to close.  A second stationary batch may contribute the
+    missing independent frame; the combined data still pass through the same
+    three-frame width and body-pose consensus used by the ordinary path.
+    """
+    locked = [
+        *list(first.get("locked_samples") or []),
+        *list(second.get("locked_samples") or []),
+    ]
+    fresh = [
+        *list(first.get("fresh_samples") or []),
+        *list(second.get("fresh_samples") or []),
+    ]
+    merged = _endpoint_measurement_consensus(
+        locked, fresh, ready_min_mm, ready_max_mm,
+        section_locked=section_locked,
+        allow_reselection=allow_reselection,
+    )
+    identifier_samples = [
+        *list(first.get("identifier_samples") or []),
+        *list(second.get("identifier_samples") or []),
+    ]
+    identifier_cam, identifier_detail = _endpoint_body_pose_consensus(
+        identifier_samples, min_frames=2, max_spread_mm=4.0,
+    )
+    return {
+        **merged,
+        "locked_samples": locked,
+        "fresh_samples": fresh,
+        "identifier_samples": identifier_samples,
+        "identifier_cam": identifier_cam,
+        "identifier_detail": identifier_detail,
+        "merged_stationary_batches": 2,
+    }
 
 
 def _ready_geometry_endpoint_fallback(
@@ -4796,11 +6253,25 @@ def _home_after_interrupt(*, open_gripper: bool = True) -> dict[str, Any]:
             "home": {"ok": False, "reason": "skipped because freeze was not verified"},
             "reason": "freeze was not verified; refusing a new trajectory or motor disable",
         }
-    if open_gripper:
+    # These jaws swing through a wide arc to reach 150deg, and a run almost
+    # always aborts within centimetres of the target it failed to pick. Opening
+    # there sweeps the fingers straight through the object and knocks it over —
+    # which then changes the scene for the next attempt. When nothing is held
+    # there is nothing to drop, so defer the open until the arm has homed and
+    # the jaws are in clear space; the retry-at-home path below performs it. A
+    # held object is still released in place rather than carried home.
+    open_in_place = bool(open_gripper and _OBJECT_HELD)
+    if open_in_place:
         try:
             opened = _gripper("open")
         except BaseException as exc:
             opened = {"ok": False, "reason": f"interrupt_gripper_open_error {exc}"}
+    elif open_gripper:
+        opened = {
+            "ok": False,
+            "deferred_to_home": True,
+            "reason": "jaw opening deferred until the arm has left the object",
+        }
     else:
         opened = {"ok": True, "skipped": True,
                   "reason": "gripper intentionally untouched"}
@@ -4831,6 +6302,9 @@ def _home_after_interrupt(*, open_gripper: bool = True) -> dict[str, Any]:
             if opened.get("ok"):
                 opened["recovery_retry"] = retry_index
                 opened["initial_failure"] = first_reason
+                opened["opened_at_home"] = True
+                if SCENE_COLLISION_ENABLED:
+                    A.update_collision_payload(0.0)
                 break
     if not isinstance(opened, dict):
         opened = {"ok": False, "reason": "interrupt gripper open returned no result"}
@@ -4934,6 +6408,10 @@ def _verify_held_at_tcp(eye: WristEye, object_name: str, tcp_cam: np.ndarray,
 
 def _result(ok: bool, reason: str, steps: list[tuple[str, bool, str]],
             verified: bool | None = None, **extra: Any) -> dict[str, Any]:
+    # Every command exits through here. A widened camera envelope belongs to
+    # one validated wrist pose inside one command; it must never survive into
+    # the next call in a long-lived process.
+    _set_active_camera_envelope(None)
     out: dict[str, Any] = {
         "ok": bool(ok), "reason": reason, "verified": verified,
         "steps": [{"step": s, "ok": bool(o), "reason": r} for (s, o, r) in steps],
@@ -5001,6 +6479,23 @@ def _observe(eye: WristEye, description: str, retries: int = LOST_RETRIES):
             f"last error: {pending_frame_errors[-1]}"
         )
     return None, None, last_why
+
+
+def _take_deferred_edge_recenter_hint(
+    eye: Any, description: str,
+) -> tuple[Any, Any, str] | None:
+    """Consume a rejected clipped mask strictly as camera-reframing input."""
+    take_deferred = getattr(
+        eye, "take_deferred_identity_candidate", None
+    )
+    deferred = take_deferred(description) if callable(take_deferred) else None
+    if deferred is None:
+        return None
+    deferred_det, deferred_frame, deferred_detail = deferred
+    deferred_reason = str(deferred_detail.get("reason", ""))
+    if "image" not in deferred_reason or "edge" not in deferred_reason:
+        return None
+    return deferred_det, deferred_frame, deferred_reason
 
 
 def learn_jacobian(eye: WristEye, description: str, log: Callable[[str], None] = lambda m: None):
@@ -5682,13 +7177,29 @@ def _plan_rpy_trajectory(
     target_rpy: tuple[float, float, float],
     *,
     xyz: Any | None = None,
+    max_delta_deg: float | None = None,
 ) -> tuple[list[tuple[float, float, float]] | None, str]:
-    """Prevalidate a stationary, finely stepped wrist reorientation."""
+    """Prevalidate a stationary, finely stepped wrist reorientation.
+
+    The default per-axis budget is the grasp planner's yaw clamp, which is what
+    every ordinary reorientation needs.  Aligning the jaws with an object that
+    landed on an edge or a corner can need more rotation than a yaw budget was
+    ever meant to describe, so a caller may request a larger explicitly bounded
+    envelope.  That freedom is paid for with a stricter check: extended
+    requests validate every intermediate waypoint against the full IK *and
+    collision* gate rather than IK alone, since a larger sweep is exactly the
+    case where the gripper is most likely to find the table or a neighbour.
+    """
     position = np.asarray(A.ee_pos() if xyz is None else xyz, dtype=float)
     start = np.asarray(A.ee_rpy(), dtype=float)
     target = np.asarray(target_rpy, dtype=float)
     delta = target - start
-    max_total = math.radians(max(0.0, GEOMETRY_MAX_YAW_DELTA_DEG))
+    extended = max_delta_deg is not None
+    budget_deg = (
+        float(np.clip(float(max_delta_deg), 0.0, 45.0)) if extended
+        else GEOMETRY_MAX_YAW_DELTA_DEG
+    )
+    max_total = math.radians(max(0.0, budget_deg))
     requested_total = float(np.max(np.abs(delta)))
     # Geometry clamps its requested yaw against the capture pose, while this
     # final validator starts from fresh motor feedback. A few hundredths of a
@@ -5710,24 +7221,29 @@ def _plan_rpy_trajectory(
     if requested_total > max_total + snap + 1e-12:
         return None, (
             f"orientation change {math.degrees(requested_total):.2f}deg "
-            f"exceeds the {GEOMETRY_MAX_YAW_DELTA_DEG:.1f}deg clamp"
+            f"exceeds the {budget_deg:.1f}deg clamp"
+            + (" (explicitly requested bounded envelope)" if extended else "")
         )
     if boundary_snapped:
         delta = np.clip(delta, -max_total, max_total)
         target = start + delta
     step = math.radians(float(np.clip(GEOMETRY_RPY_STEP_DEG, 0.5, 3.0)))
     count = max(1, int(math.ceil(float(np.max(np.abs(delta))) / step)))
+    validate = A.check_pose_clearance if extended else A.check_ik
+    gate_name = "IK/collision" if extended else "IK"
     planned: list[tuple[float, float, float]] = []
     for index in range(1, count + 1):
         rpy = start + delta * (index / count)
-        ik = A.check_ik(*position, *rpy)
+        ik = validate(*position, *rpy)
         if not ik.ok:
             return None, (
-                f"orientation waypoint {index}/{count} failed IK: {ik.reason}"
+                f"orientation waypoint {index}/{count} failed {gate_name}: "
+                f"{ik.reason}"
             )
         planned.append(tuple(float(v) for v in rpy))
     reason = (
-        f"{len(planned)} orientation waypoints prevalidated at fixed XYZ; "
+        f"{len(planned)} orientation waypoints prevalidated at fixed XYZ "
+        f"against the {gate_name} gate within {budget_deg:.1f}deg; "
         f"target_rpy={[round(float(v), 4) for v in target]}"
     )
     if boundary_snapped:
@@ -6019,7 +7535,15 @@ def _recenter_clipped_placement_reference(
     for attempt in range(1, attempt_limit + 1):
         candidate, candidate_frame, why = _observe(eye, description)
         if candidate is None or candidate_frame is None:
-            reason = f"not detected: {why}"
+            deferred_edge = _take_deferred_edge_recenter_hint(
+                eye, description
+            )
+            if deferred_edge is not None:
+                deferred_det, deferred_frame, deferred_reason = deferred_edge
+                latest_clipped = (deferred_det, deferred_frame)
+                reason = deferred_reason
+            else:
+                reason = f"not detected: {why}"
             rejected.append(reason)
         else:
             reason = _detection_partial(candidate, candidate_frame)
@@ -6210,6 +7734,11 @@ def _look_around_object(
     observation_consensus_frames: int = 1,
     observation_consensus_max_spread_mm: float | None = None,
     allow_edge_recenter: bool = False,
+    minimum_translation_from_m: Any | None = None,
+    minimum_translation_m: float = 0.0,
+    detection_accept: Callable[
+        [Any, tuple[np.ndarray, np.ndarray, Any]], tuple[bool, str]
+    ] | None = None,
 ) -> tuple[Any | None, Any | None, GG.GraspGeometry | None, dict[str, Any]]:
     """Bounded elevated discovery sweep; never moves forward or descends.
 
@@ -6219,11 +7748,33 @@ def _look_around_object(
     sweep.  In that mode each candidate pose must produce multiple complete,
     position-consistent observations before it is accepted.
     """
+    previous_camera_envelope = _ACTIVE_CAMERA_ENVELOPE_DEG
+    discovery_camera_envelope_raised = False
+
+    def restore_camera_envelope() -> None:
+        _set_active_camera_envelope(previous_camera_envelope)
+
     start_xyz = np.asarray(A.ee_pos(), dtype=float)
     start_rpy = np.asarray(A.ee_rpy(), dtype=float)
     retreat = start_xyz.copy()
     retreat[0] = max(A.X_MIN + APPROACH_WORKSPACE_MARGIN_M,
                      float(start_xyz[0]) - 0.040)
+    # A 40 mm retreat is enough for small targets near the image centre, but a
+    # long object entering through the bottom/side of the wrist image can stay
+    # clipped through every yaw view because all three translated candidates
+    # share that same camera origin.  Keep the proven orientation sequence and
+    # add one farther, bounded tier.  This is still discovery-only motion: X
+    # may decrease (camera moves away), while Y/Z are unchanged here.  Every
+    # endpoint and the complete Cartesian continuation are checked below
+    # before hardware receives a command.
+    extended_retreat_m = float(np.clip(float(os.getenv(
+        "REBOT_LOOK_AROUND_EXTENDED_RETREAT_M", "0.075"
+    )), 0.050, 0.090))
+    extended_retreat = start_xyz.copy()
+    extended_retreat[0] = max(
+        A.X_MIN + APPROACH_WORKSPACE_MARGIN_M,
+        float(start_xyz[0]) - extended_retreat_m,
+    )
     # Inspect from the already elevated ready pose before translating.  A
     # level-wrist retreat from home/ready lies close to a kinematic
     # singularity on the RS arm, so planning that same translation first made
@@ -6247,6 +7798,17 @@ def _look_around_object(
          True,
          pitched_rpy + np.array([0.0, 0.0, math.radians(-12.0)])),
     ]
+    if float(np.linalg.norm(extended_retreat - retreat)) >= 0.010:
+        candidates.extend([
+            ("extended_pitched_retreat", extended_retreat,
+             True, pitched_rpy),
+            ("extended_pitched_retreat_yaw_left", extended_retreat,
+             True,
+             pitched_rpy + np.array([0.0, 0.0, math.radians(12.0)])),
+            ("extended_pitched_retreat_yaw_right", extended_retreat,
+             True,
+             pitched_rpy + np.array([0.0, 0.0, math.radians(-12.0)])),
+        ])
     attempts = []
     last_edge_observation: tuple[Any, Any] | None = None
     for index, (name, xyz, translate, rpy) in enumerate(candidates, 1):
@@ -6308,6 +7870,36 @@ def _look_around_object(
                 log(f"stage=look_around name={name} status=stopped "
                     f"phase=translation detail={move_reason}")
                 continue
+        # Every pose above has now passed the complete orientation/translation
+        # planner and executor. Hybrid target discovery may therefore interpret
+        # its rigidly mounted camera from a slightly wider angle than ordinary
+        # servoing. The old 22.5deg default rejected the useful +24..25deg
+        # yaw/pitch views before the unchanged 3-D identity gate could compare
+        # them, leaving only one target mask while repeatedly seeing a different
+        # same-colour object 145mm away. This scope is discovery-only, is
+        # restored on return, and does not enlarge the 75mm identity cluster.
+        if require_grasp and captured_views is not None \
+                and not discovery_camera_envelope_raised:
+            try:
+                discovery_envelope_deg = float(os.getenv(
+                    "REBOT_LOOK_AROUND_CAMERA_ENVELOPE_DEG", "30.0"
+                ))
+            except (TypeError, ValueError):
+                discovery_envelope_deg = 30.0
+            discovery_envelope_deg = float(np.clip(
+                discovery_envelope_deg, 25.0, 35.0
+            ))
+            active_envelope = max(
+                float(previous_camera_envelope or 0.0),
+                discovery_envelope_deg,
+            )
+            _set_active_camera_envelope(active_envelope)
+            discovery_camera_envelope_raised = True
+            log(
+                "stage=look_around_camera_envelope status=raised "
+                f"maximum_delta_deg={active_envelope:.1f} "
+                "basis=prevalidated_discovery_pose identity_radius=unchanged"
+            )
         log(f"stage=look_around name={name} status=observing "
             f"target={description!r}")
         _settle(eye, note=f"look around {name}")
@@ -6335,11 +7927,31 @@ def _look_around_object(
             )), 0.1, 2.0))
         )
         if det is None or frame is None:
+            # The hybrid identity gate must reject a clipped first mask as an
+            # anchor, but its pixel/depth location is exactly what the bounded
+            # edge-recenter planner needs.  Recover it only as a private camera
+            # reframing hint; it is never accepted as target geometry here.
+            deferred_edge = _take_deferred_edge_recenter_hint(
+                eye, description
+            )
+            if deferred_edge is not None:
+                deferred_det, deferred_frame, deferred_reason = deferred_edge
+                last_edge_observation = (deferred_det, deferred_frame)
+                log(
+                    f"stage=look_around name={name} "
+                    "status=deferred_edge_hint "
+                    f"detail={deferred_reason}; "
+                    "authority=recenter_only"
+                )
             reason = f"not detected: {why}"
             attempts.append({"pose": name, "reason": reason})
             log(f"stage=look_around name={name} status=not_found detail={reason}")
             continue
         partial = _detection_partial(det, frame)
+        if partial is None and detection_accept is not None:
+            detection_ok, detection_reason = detection_accept(det, frame)
+            if not detection_ok:
+                partial = detection_reason
         geometry = None
         if partial is None and require_grasp:
             geometry = _plan_scene_grasp_geometry(
@@ -6400,6 +8012,12 @@ def _look_around_object(
                     )
                     continue
                 sample_partial = _detection_partial(sample_det, sample_frame)
+                if sample_partial is None and detection_accept is not None:
+                    sample_ok, sample_reason = detection_accept(
+                        sample_det, sample_frame
+                    )
+                    if not sample_ok:
+                        sample_partial = sample_reason
                 if sample_partial is not None:
                     consensus_rejections.append(sample_partial)
                     log(
@@ -6488,6 +8106,35 @@ def _look_around_object(
                     f"ok=false detail={partial}"
                 )
 
+        # Multi-view geometry needs a genuinely different camera origin, not
+        # several rotations around the same optical centre.  Orientation-only
+        # detections remain useful and are captured above, but do not terminate
+        # a sweep that explicitly requested translation/parallax.
+        if partial is None and minimum_translation_from_m is not None:
+            baseline_origin = np.asarray(
+                minimum_translation_from_m, dtype=float
+            )
+            live_origin = np.asarray(A.ee_pos(), dtype=float)
+            required_baseline = float(np.clip(
+                minimum_translation_m, 0.0, 0.060
+            ))
+            baseline_m = (
+                float(np.linalg.norm(live_origin - baseline_origin))
+                if baseline_origin.shape == (3,) else 0.0
+            )
+            if baseline_origin.shape != (3,) or baseline_m + 1e-9 \
+                    < required_baseline:
+                partial = (
+                    f"complete target mask retained, but camera baseline "
+                    f"{baseline_m * 1000.0:.1f}mm is below the requested "
+                    f"{required_baseline * 1000.0:.1f}mm parallax baseline"
+                )
+                log(
+                    f"stage=look_around_parallax_gate name={name} ok=false "
+                    f"baseline_mm={baseline_m * 1000.0:.1f} "
+                    f"required_mm={required_baseline * 1000.0:.1f}"
+                )
+
         if partial is None:
             log(f"stage=look_around name={name} status=accepted "
                 f"source={det.source} depth_mm={det.z_mm:.0f}")
@@ -6497,6 +8144,7 @@ def _look_around_object(
             }
             if observation_consensus is not None:
                 detail["observation_consensus"] = observation_consensus
+            restore_camera_envelope()
             return det, frame, geometry, detail
         attempts.append({"pose": name, "reason": partial})
         log(f"stage=look_around name={name} status=partial detail={partial}")
@@ -6504,8 +8152,9 @@ def _look_around_object(
             last_edge_observation = (det, frame)
     if allow_edge_recenter and last_edge_observation is not None:
         log(
-            "stage=placement_reference_recenter status=triggered "
-            "reason=orientation sweep left the reference clipped"
+            "stage=discovery_edge_recenter status=triggered "
+            f"role={'grasp_target' if require_grasp else 'placement_reference'} "
+            "reason=orientation_and_retreat_sweep_left_target_clipped"
         )
         recenter_observation = last_edge_observation
         _mapping, _mapping_detail = load_saved_camera_jacobian(
@@ -6525,11 +8174,23 @@ def _look_around_object(
                 if restored_det is not None and restored_frame is not None:
                     recenter_observation = (restored_det, restored_frame)
                 else:
-                    mapping_restored = False
-                    mapping_restore_detail = (
-                        "reference was not detected after camera mapping "
-                        f"restore: {restored_why}"
+                    deferred_edge = _take_deferred_edge_recenter_hint(
+                        eye, description
                     )
+                    if deferred_edge is not None:
+                        recenter_observation = (
+                            deferred_edge[0], deferred_edge[1]
+                        )
+                        mapping_restore_detail = (
+                            "camera mapping restored; clipped target retained "
+                            "as recenter-only input"
+                        )
+                    else:
+                        mapping_restored = False
+                        mapping_restore_detail = (
+                            "reference was not detected after camera mapping "
+                            f"restore: {restored_why}"
+                        )
             if not mapping_restored:
                 recentered_det, recentered_frame, recentered = None, None, {
                     "ok": False,
@@ -6555,13 +8216,59 @@ def _look_around_object(
                         observation_consensus_max_spread_mm,
                 )
         if recentered_det is not None and recentered_frame is not None:
-            return recentered_det, recentered_frame, None, {
-                "ok": True,
+            recentered_geometry = None
+            recentered_rejection = None
+            if require_grasp:
+                recentered_geometry = _plan_scene_grasp_geometry(
+                    recentered_frame, recentered_det,
+                    current_rpy=tuple(float(v) for v in A.ee_rpy()),
+                    object_name=description,
+                )
+                if not recentered_geometry.ok:
+                    recentered_rejection = recentered_geometry.reason
+                elif geometry_accept is not None:
+                    accepted, accept_reason = geometry_accept(
+                        recentered_geometry
+                    )
+                    if not accepted:
+                        recentered_rejection = (
+                            f"grasp entry rejected: {accept_reason}"
+                        )
+                        if geometry_rejected is not None:
+                            geometry_rejected(
+                                recentered_frame, recentered_geometry,
+                                accept_reason, "edge_recenter",
+                            )
+                if recentered_rejection is None and captured_views is not None:
+                    _append_pose_aware_discovery_view(
+                        captured_views, name="edge_recenter",
+                        frame=recentered_frame,
+                        detection=recentered_det,
+                        geometry=recentered_geometry, log=log,
+                    )
+            if recentered_rejection is None:
+                log(
+                    "stage=discovery_edge_recenter status=accepted "
+                    f"role={'grasp_target' if require_grasp else 'placement_reference'} "
+                    f"source={recentered_det.source}"
+                )
+                restore_camera_envelope()
+                return recentered_det, recentered_frame, recentered_geometry, {
+                    "ok": True,
+                    "pose": "edge_recenter",
+                    "attempts": attempts,
+                    "moved": True,
+                    **recentered,
+                }
+            attempts.append({
                 "pose": "edge_recenter",
-                "attempts": attempts,
-                "moved": True,
-                **recentered,
-            }
+                "reason": recentered_rejection,
+            })
+            log(
+                "stage=discovery_edge_recenter status=rejected "
+                f"detail={recentered_rejection}"
+            )
+            recentered = {"reason": recentered_rejection}
         attempts.append({
             "pose": "edge_recenter",
             "reason": recentered.get("reason"),
@@ -6584,6 +8291,7 @@ def _look_around_object(
         recovery_cloud = recovered.get("discovery_cloud")
         if recovered_det is not None and recovered_frame is not None \
                 and recovered_geometry is not None:
+            restore_camera_envelope()
             return recovered_det, recovered_frame, recovered_geometry, {
                 "ok": True,
                 "pose": recovered.get("pose"),
@@ -6597,6 +8305,7 @@ def _look_around_object(
             "pose": "multiview_metric_recovery",
             "reason": recovered.get("reason"),
         })
+    restore_camera_envelope()
     return None, None, None, {
         "ok": False, "reason": "no complete view found in bounded sweep",
         "attempts": attempts, "moved": True,
@@ -7499,6 +9208,276 @@ def _filter_target_points_to_identity_cluster(
     }
 
 
+def _filter_target_points_to_reference_shape(
+    points_base_m: Any,
+    reference_box: dict[str, Any] | None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Reject multi-view mask spill using the first trusted 3-D target shape.
+
+    A centroid-radius gate cannot distinguish the requested object from a
+    nearby surface that happens to lie inside the same sphere.  Once the first
+    exact semantic mask has supplied a measured OBB, retain that OBB's two
+    transverse dimensions as the target identity signature.  The longest axis
+    remains unconstrained here so a cropped marker, bottle, or other elongated
+    object can be completed by later views; the existing identity sphere still
+    bounds that extension.
+
+    The padding is derived from the measured transverse extent (20 percent,
+    with an 8 mm RGB-D/registration floor), not from an object name or expected
+    size.  This gate can remove false-positive points but never invent hidden
+    geometry or authorize a grasp.
+    """
+    points = np.asarray(points_base_m, dtype=float)
+    if points.ndim != 2 or points.shape[1:] != (3,):
+        return np.empty((0, 3), dtype=float), {
+            "ok": False, "reason": "target points have invalid dimensions"
+        }
+    if reference_box is None:
+        return points, {
+            "ok": True, "reason": "reference-shape filtering not requested",
+            "kept": int(len(points)), "removed": 0,
+        }
+    try:
+        center = np.asarray(reference_box["center_m"], dtype=float)
+        axes = np.asarray(reference_box["axes_base"], dtype=float).T
+        size = np.asarray(reference_box["observed_size_m"], dtype=float)
+    except (KeyError, TypeError, ValueError):
+        return np.empty((0, 3), dtype=float), {
+            "ok": False, "reason": "reference target shape is malformed"
+        }
+    if center.shape != (3,) or axes.shape != (3, 3) or size.shape != (3,) \
+            or not np.all(np.isfinite(center)) \
+            or not np.all(np.isfinite(axes)) \
+            or not np.all(np.isfinite(size)) or np.any(size <= 0.0):
+        return np.empty((0, 3), dtype=float), {
+            "ok": False, "reason": "reference target shape is invalid"
+        }
+    # ObjectBox3D stores its axes as rows in JSON; after the transpose each
+    # column is one base-frame unit axis, matching the fit convention.
+    longest = int(np.argmax(size))
+    transverse = [index for index in range(3) if index != longest]
+    pad = np.maximum(0.008, 0.20 * size)
+    local = (points - center) @ axes
+    finite = np.all(np.isfinite(local), axis=1)
+    inside = finite.copy()
+    for index in transverse:
+        inside &= np.abs(local[:, index]) <= (
+            0.5 * size[index] + pad[index]
+        )
+    kept = points[inside]
+    return kept, {
+        "ok": len(kept) >= 20,
+        "reason": (
+            f"kept {len(kept)}/{len(points)} points inside the trusted "
+            "target cross-section while allowing long-axis completion"
+        ),
+        "kept": int(len(kept)),
+        "removed": int(len(points) - len(kept)),
+        "reference_size_mm": (size * 1000.0).round(1).tolist(),
+        "unbounded_axis": longest,
+        "transverse_limit_mm": [
+            round(float((0.5 * size[index] + pad[index]) * 1000.0), 1)
+            for index in transverse
+        ],
+    }
+
+
+def _target_shape_major_axis_signature(
+    box: dict[str, Any] | None,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Return an OBB's confident base-frame major axis.
+
+    A clipped rectangular object can temporarily swap which image/OBB axis is
+    longest.  Such a single view must not define the transverse dimensions used
+    to trim every later semantic mask.  Only an elongated, finite metric box
+    supplies a usable vote; the caller still requires multiple agreeing votes.
+    """
+    if not isinstance(box, dict):
+        return None, {"reason": "metric target box is unavailable"}
+    try:
+        axes = np.asarray(box["axes_base"], dtype=float)
+        size = np.asarray(box["observed_size_m"], dtype=float)
+    except (KeyError, TypeError, ValueError):
+        return None, {"reason": "metric target box is incomplete"}
+    if axes.shape != (3, 3) or size.shape != (3,) \
+            or not np.all(np.isfinite(axes)) \
+            or not np.all(np.isfinite(size)) or np.any(size <= 0.0):
+        return None, {"reason": "metric target box is invalid"}
+    order = np.argsort(size)
+    major_index = int(order[-1])
+    second_index = int(order[-2])
+    ratio = float(size[major_index] / max(size[second_index], 1e-9))
+    try:
+        minimum_ratio = float(os.getenv(
+            "REBOT_DISCOVERY_SHAPE_AXIS_MIN_RATIO", "1.35"
+        ))
+    except (TypeError, ValueError):
+        minimum_ratio = 1.35
+    minimum_ratio = float(np.clip(minimum_ratio, 1.20, 2.0))
+    if ratio < minimum_ratio:
+        return None, {
+            "reason": (
+                f"major axis is ambiguous: aspect ratio {ratio:.2f} is below "
+                f"the {minimum_ratio:.2f} consensus threshold"
+            ),
+            "aspect_ratio": ratio,
+            "size_mm": (size * 1000.0).round(1).tolist(),
+        }
+    axis = np.asarray(axes[major_index], dtype=float)
+    norm = float(np.linalg.norm(axis))
+    if not math.isfinite(norm) or norm <= 1e-9:
+        return None, {"reason": "metric target major axis is degenerate"}
+    axis = axis / norm
+    return axis, {
+        "reason": "confident elongated-view major-axis vote",
+        "aspect_ratio": ratio,
+        "major_index": major_index,
+        "size_mm": (size * 1000.0).round(1).tolist(),
+    }
+
+
+def _target_shape_axis_angle_deg(axis_a: Any, axis_b: Any) -> float:
+    """Unsigned angle between symmetric OBB axes."""
+    a = np.asarray(axis_a, dtype=float)
+    b = np.asarray(axis_b, dtype=float)
+    if a.shape != (3,) or b.shape != (3,) \
+            or not np.all(np.isfinite(a)) or not np.all(np.isfinite(b)):
+        return math.inf
+    a_norm = float(np.linalg.norm(a))
+    b_norm = float(np.linalg.norm(b))
+    if a_norm <= 1e-9 or b_norm <= 1e-9:
+        return math.inf
+    cosine = float(np.clip(abs(float((a / a_norm) @ (b / b_norm))), 0.0, 1.0))
+    return math.degrees(math.acos(cosine))
+
+
+def _target_shape_axis_consensus(
+    candidates: list[dict[str, Any]], *, required: int = 3,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select independent target views whose measured major axes agree.
+
+    Extent convergence is intentionally not required here: later views are
+    allowed to complete a cropped long axis.  What must be stable before a
+    transverse filter is installed is *which base-frame direction* is the long
+    axis.  Requiring three votes prevents a single partial sponge view from
+    calling its real width the length and deleting that width from later masks.
+    """
+    try:
+        angle_limit_deg = float(os.getenv(
+            "REBOT_DISCOVERY_SHAPE_AXIS_CONSENSUS_DEG", "20.0"
+        ))
+    except (TypeError, ValueError):
+        angle_limit_deg = 20.0
+    angle_limit_deg = float(np.clip(angle_limit_deg, 8.0, 30.0))
+    required = int(np.clip(required, 3, 5))
+    votes: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for candidate in candidates:
+        axis, detail = _target_shape_major_axis_signature(
+            candidate.get("box") if isinstance(candidate, dict) else None
+        )
+        if axis is None:
+            rejected.append({
+                "view": candidate.get("view") if isinstance(candidate, dict)
+                else None,
+                "reason": detail.get("reason"),
+            })
+            continue
+        votes.append({**candidate, "major_axis": axis, "axis_detail": detail})
+    best: tuple[float, tuple[int, ...]] | None = None
+    for indices in itertools.combinations(range(len(votes)), required):
+        angles = [
+            _target_shape_axis_angle_deg(
+                votes[left]["major_axis"], votes[right]["major_axis"]
+            )
+            for left, right in itertools.combinations(indices, 2)
+        ]
+        maximum = max(angles, default=0.0)
+        if maximum <= angle_limit_deg and (
+            best is None or maximum < best[0]
+        ):
+            best = (maximum, indices)
+    if best is None:
+        return [], {
+            "reason": (
+                f"no {required}-view base-frame major-axis consensus within "
+                f"{angle_limit_deg:.1f}deg; transverse filtering remains "
+                "disabled so a partial view cannot delete real object width"
+            ),
+            "required_views": required,
+            "usable_votes": len(votes),
+            "rejected_votes": rejected,
+        }
+    maximum, indices = best
+    selected = [votes[index] for index in indices]
+    return selected, {
+        "reason": (
+            f"{len(selected)} independent exact-mask views agree on the "
+            f"base-frame major axis within {maximum:.1f}deg"
+        ),
+        "required_views": required,
+        "maximum_axis_delta_deg": maximum,
+        "views": [item.get("view") for item in selected],
+        "rejected_votes": rejected,
+    }
+
+
+def _horizontal_major_consensus_axes(
+    consensus_votes: list[dict[str, Any]],
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Build a gravity frame only when every voted major axis is horizontal."""
+    if len(consensus_votes) < 3:
+        return None, {"reason": "fewer than three major-axis votes"}
+    try:
+        maximum_tilt_deg = float(os.getenv(
+            "REBOT_DISCOVERY_HORIZONTAL_MAJOR_MAX_TILT_DEG", "25.0"
+        ))
+    except (TypeError, ValueError):
+        maximum_tilt_deg = 25.0
+    maximum_tilt_deg = float(np.clip(maximum_tilt_deg, 12.0, 30.0))
+    horizontal: list[np.ndarray] = []
+    reference = None
+    tilts = []
+    for vote in consensus_votes:
+        axis = np.asarray(vote.get("major_axis"), dtype=float)
+        if axis.shape != (3,) or not np.all(np.isfinite(axis)):
+            return None, {"reason": "major-axis vote is invalid"}
+        axis /= max(float(np.linalg.norm(axis)), 1e-9)
+        tilt = math.degrees(math.asin(float(np.clip(abs(axis[2]), 0.0, 1.0))))
+        tilts.append(tilt)
+        if tilt > maximum_tilt_deg:
+            return None, {
+                "reason": (
+                    f"major axis tilt {tilt:.1f}deg exceeds the "
+                    f"{maximum_tilt_deg:.1f}deg tabletop lock limit"
+                ),
+                "major_axis_tilts_deg": tilts,
+            }
+        xy = np.array([axis[0], axis[1], 0.0], dtype=float)
+        xy /= max(float(np.linalg.norm(xy)), 1e-9)
+        if reference is None:
+            reference = xy
+        elif float(xy @ reference) < 0.0:
+            xy = -xy
+        horizontal.append(xy)
+    major = np.mean(horizontal, axis=0)
+    major /= max(float(np.linalg.norm(major)), 1e-9)
+    vertical = np.array([0.0, 0.0, 1.0])
+    minor = np.cross(vertical, major)
+    minor /= max(float(np.linalg.norm(minor)), 1e-9)
+    axes = np.column_stack((major, minor, vertical))
+    if float(np.linalg.det(axes)) < 0.0:
+        axes[:, 1] *= -1.0
+    return axes, {
+        "reason": (
+            "three-view major axis is consistently horizontal; gravity-"
+            "locked frame prevents registration shear from rotating the OBB"
+        ),
+        "major_axis_tilts_deg": [round(value, 1) for value in tilts],
+        "maximum_tilt_deg": maximum_tilt_deg,
+    }
+
+
 def _export_discovery_cloud(
     captured_views: list[dict[str, Any]], log: Callable[[str], None],
     *, force_geometry: bool = False,
@@ -7529,6 +9508,9 @@ def _export_discovery_cloud(
     try:
         clouds = []
         target_point_sets: list[tuple[int, np.ndarray]] = []
+        target_shape_reference: dict[str, Any] | None = None
+        target_shape_axes: np.ndarray | None = None
+        target_shape_votes: list[dict[str, Any]] = []
         names = []
         named_clouds = {}
         for view in captured_views:
@@ -7599,6 +9581,125 @@ def _export_discovery_cloud(
                             f"ok={cluster_detail.get('ok')} "
                             f"detail={cluster_detail.get('reason')}"
                         )
+                    # Do not let the first exact mask decide which dimension
+                    # is the object's long axis. A clipped rectangular object
+                    # can make its true width appear longest in that one view,
+                    # after which the old transverse filter permanently erased
+                    # the width recovered by later views. Build a per-view OBB
+                    # vote and require three agreeing base-frame major axes
+                    # before installing any transverse lock.
+                    if require_semantic_target_masks and len(target_points) >= 20:
+                        view_box = OG3.fit_tabletop_box(
+                            [target_points], table_z_m=float(table_z)
+                        ).as_dict()
+                        target_shape_votes.append({
+                            "view": view_name,
+                            "box": view_box,
+                            "points": target_points,
+                        })
+                        if target_shape_reference is None:
+                            consensus_votes, consensus_detail = \
+                                _target_shape_axis_consensus(
+                                    target_shape_votes, required=3
+                                )
+                            log(
+                                "stage=discovery_target_shape_consensus "
+                                f"view={view_name!r} "
+                                f"ok={bool(consensus_votes)} "
+                                f"detail={consensus_detail.get('reason')}"
+                            )
+                            if consensus_votes:
+                                target_shape_axes, axes_detail = \
+                                    _horizontal_major_consensus_axes(
+                                        consensus_votes
+                                    )
+                                if target_shape_axes is not None:
+                                    target_shape_reference = \
+                                        OG3.fit_tabletop_box_with_axes(
+                                            [item["points"] for item
+                                             in consensus_votes],
+                                            table_z_m=float(table_z),
+                                            axes_base=target_shape_axes,
+                                            orientation_mode=(
+                                                "three_view_gravity_locked_obb"
+                                            ),
+                                        ).as_dict()
+                                else:
+                                    target_shape_reference = \
+                                        OG3.fit_tabletop_box(
+                                            [item["points"] for item
+                                             in consensus_votes],
+                                            table_z_m=float(table_z),
+                                        ).as_dict()
+                                log(
+                                    "stage=discovery_target_shape_anchor "
+                                    f"views={consensus_detail.get('views')} "
+                                    "observed_mm="
+                                    f"{(np.asarray(target_shape_reference['observed_size_m']) * 1000.0).round(1).tolist()} "
+                                    f"orientation={target_shape_reference.get('orientation_mode')} "
+                                    f"orientation_detail={axes_detail.get('reason')} "
+                                    "policy=three_view_major_axis_consensus_"
+                                    "then_transverse_lock"
+                                )
+                        else:
+                            reference_axis, _reference_axis_detail = \
+                                _target_shape_major_axis_signature(
+                                    target_shape_reference
+                                )
+                            view_axis, view_axis_detail = \
+                                _target_shape_major_axis_signature(view_box)
+                            axis_delta = _target_shape_axis_angle_deg(
+                                reference_axis, view_axis
+                            ) if reference_axis is not None \
+                                and view_axis is not None else math.inf
+                            try:
+                                axis_limit = float(os.getenv(
+                                    "REBOT_DISCOVERY_SHAPE_AXIS_CONSENSUS_DEG",
+                                    "20.0",
+                                ))
+                            except (TypeError, ValueError):
+                                axis_limit = 20.0
+                            axis_limit = float(np.clip(axis_limit, 8.0, 30.0))
+                            # An axis that *disagrees* is evidence; an axis that
+                            # could not be measured is the absence of evidence,
+                            # and the two were being treated alike. A mask that
+                            # has swallowed the table or a neighbour is close to
+                            # square, so its major axis becomes ambiguous, so it
+                            # is retained untrimmed, so the fused box inflates —
+                            # contamination disabling the very filter meant to
+                            # remove it. One such view took the sponge's box
+                            # from 25x80x20mm to 84x87x55mm, past the aperture.
+                            # With no axis of its own, such a view cannot
+                            # justify overriding the trusted three-view anchor,
+                            # so trim it to that cross-section; long-axis
+                            # completion is still allowed.
+                            ambiguous_axis = bool(
+                                view_axis is None and reference_axis is not None
+                            )
+                            if axis_delta <= axis_limit or ambiguous_axis:
+                                target_points, shape_detail = \
+                                    _filter_target_points_to_reference_shape(
+                                        target_points, target_shape_reference
+                                    )
+                                if shape_detail.get("removed", 0):
+                                    log(
+                                        "stage=discovery_target_shape_filter "
+                                        f"view={view_name!r} "
+                                        f"ok={shape_detail.get('ok')} "
+                                        "action="
+                                        f"{'trim_ambiguous_axis' if ambiguous_axis else 'trim_to_reference'} "
+                                        f"axis_delta_deg={axis_delta:.1f} "
+                                        f"detail={shape_detail.get('reason')}"
+                                    )
+                            else:
+                                log(
+                                    "stage=discovery_target_shape_filter "
+                                    f"view={view_name!r} ok=True action="
+                                    "skip_axis_conflict axis_delta_deg="
+                                    f"{axis_delta:.1f} detail="
+                                    f"{view_axis_detail.get('reason')}; "
+                                    "exact mask retained untrimmed"
+                                )
                     if len(target_points) >= 20:
                         target_point_sets.append((
                             len(clouds) - 1, target_points
@@ -7627,6 +9728,10 @@ def _export_discovery_cloud(
         registered_clouds, registration = SC.register_dense_view_clouds(
             clouds, table_z_m=float(table_z),
             max_translation_m=SCENE_DENSE_REGISTRATION_MAX_TRANSLATION_M,
+            adaptive_max_translation_m=(
+                HYBRID_REGISTRATION_MAX_TRANSLATION_M
+                if require_semantic_target_masks else None
+            ),
             minimum_overlap=SCENE_DENSE_REGISTRATION_MIN_OVERLAP,
         )
         named_clouds = {
@@ -7639,7 +9744,9 @@ def _export_discovery_cloud(
                 f"fused={report.get('valid_for_fusion')} "
                 f"translation_mm={report.get('translation_mm')} "
                 f"overlap={report.get('zero_overlap')}->"
-                f"{report.get('best_overlap')} detail={report.get('reason')}"
+                f"{report.get('best_overlap')} adaptive="
+                f"{report.get('adaptive_search', False)} bound_mm="
+                f"{report.get('search_bound_mm')} detail={report.get('reason')}"
             )
         fusable_clouds = [
             cloud for cloud, report in zip(registered_clouds, registration)
@@ -7674,9 +9781,16 @@ def _export_discovery_cloud(
                     np.asarray(target_points, dtype=float) + translation
                 )
             if registered_targets:
-                fused_target_box = OG3.fit_tabletop_box(
-                    registered_targets, table_z_m=float(table_z)
-                ).as_dict()
+                if target_shape_axes is not None:
+                    fused_target_box = OG3.fit_tabletop_box_with_axes(
+                        registered_targets, table_z_m=float(table_z),
+                        axes_base=target_shape_axes,
+                        orientation_mode="three_view_gravity_locked_obb",
+                    ).as_dict()
+                else:
+                    fused_target_box = OG3.fit_tabletop_box(
+                        registered_targets, table_z_m=float(table_z)
+                    ).as_dict()
                 object_boxes_3d = {"discovery_target": fused_target_box}
                 log(
                     "stage=discovery_target_box ok=True "
@@ -7947,7 +10061,7 @@ def _recover_multiview_metric_grasp(
             and float(projected_width["conservative_width_mm"])
                 <= max_aperture + 1e-6
             and float(projected_width["observed_width_mm"])
-                + max(0.0, GRASP_MIN_OPEN_CLEARANCE_MM)
+                + _effective_open_clearance_mm()[0]
                 <= max_aperture + 1e-6
         )
         if not projection_safe and projected_width.get("ok"):
@@ -7998,7 +10112,7 @@ def _recover_multiview_metric_grasp(
                     float(candidate_projection["conservative_width_mm"])
                         <= max_aperture + 1e-6
                     and float(candidate_projection["observed_width_mm"])
-                        + max(0.0, GRASP_MIN_OPEN_CLEARANCE_MM)
+                        + _effective_open_clearance_mm()[0]
                         <= max_aperture + 1e-6
                 )
                 if not candidate_safe:
@@ -8091,6 +10205,17 @@ def _recover_multiview_metric_grasp(
         )
         metric_body = fresh_geometry.grasp_detection
         if metric_body is not None:
+            # The camera mapping used for this recovery pose has already
+            # passed the scoped look-around envelope and the complete RPY/IK
+            # trajectory.  Carry that exact authorization with the internal
+            # recovery marker: _look_around_object restores the global default
+            # before its caller enriches the box, and reloading the same rigid
+            # mapping under the old default would otherwise reject the pose it
+            # just validated.
+            recovery_camera_envelope_deg = (
+                float(_ACTIVE_CAMERA_ENVELOPE_DEG)
+                if _ACTIVE_CAMERA_ENVELOPE_DEG is not None else None
+            )
             fresh_geometry = replace(
                 fresh_geometry,
                 grasp_detection=replace(
@@ -8098,6 +10223,8 @@ def _recover_multiview_metric_grasp(
                     info={
                         **metric_body.info,
                         "metric_recovery_pose_validated": True,
+                        "metric_recovery_camera_envelope_deg":
+                            recovery_camera_envelope_deg,
                     },
                 ),
             )
@@ -8812,7 +10939,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
         return _result(
             False, f"unsupported placement relation: {place_relation!r}",
             [("placement_description", False,
-              "use left/right/front/behind/next_to/free_space/drop_zone")],
+              "use left/right/front/behind/next_to/stack/free_space/drop_zone")],
             homed=False, object_held=False,
         )
     scene_place = bool(
@@ -9298,6 +11425,8 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
         # only the material that must pass between the open jaws.
         scene_discovery_views: list[dict[str, Any]] = []
         grasp_fit_diagnostics: list[dict[str, Any]] = []
+        hybrid_object_box_3d: dict[str, Any] | None = None
+        hybrid_geometry_converged = False
 
         def grasp_view_entry_ok(
             candidate: GG.GraspGeometry,
@@ -9364,6 +11493,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 geometry_accept=grasp_view_entry_ok,
                 geometry_rejected=record_grasp_fit_rejection,
                 captured_views=scene_discovery_views,
+                allow_edge_recenter=True,
             )
             steps.append(("look_around_pick_target", bool(discovery.get("ok")),
                           str(discovery.get("pose") or discovery.get("reason"))))
@@ -9386,6 +11516,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     geometry_accept=grasp_view_entry_ok,
                     geometry_rejected=record_grasp_fit_rejection,
                     captured_views=scene_discovery_views,
+                    allow_edge_recenter=True,
                 )
                 steps.append(("look_around_pick_target",
                               bool(discovery.get("ok")),
@@ -9459,6 +11590,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     geometry_accept=grasp_view_entry_ok,
                     geometry_rejected=record_grasp_fit_rejection,
                     captured_views=scene_discovery_views,
+                    allow_edge_recenter=True,
                 )
             steps.append((
                 "geometry_view_sweep", bool(sweep.get("ok")),
@@ -9498,6 +11630,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     geometry_accept=grasp_view_entry_ok,
                     geometry_rejected=record_grasp_fit_rejection,
                     captured_views=scene_discovery_views,
+                    allow_edge_recenter=True,
                 )
             steps.append((
                 "alternate_grasp_view",
@@ -9558,6 +11691,16 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             last_fusion_discovery: dict[str, Any] | None = None
             fused_view_count = 0
             box_view_count = 0
+            previous_hybrid_box: dict[str, Any] | None = None
+            convergence_detail: dict[str, Any] = {
+                "reason": "another registered target view is required"
+            }
+            baseline_origin = np.asarray(
+                scene_discovery_views[0]["ee_xyz_m"], dtype=float
+            )
+            minimum_baseline_m = float(np.clip(float(os.getenv(
+                "REBOT_HYBRID_MIN_CAMERA_BASELINE_M", "0.025"
+            )), 0.015, 0.050))
             for collection_attempt in range(maximum_extra_sweeps + 1):
                 hybrid_cloud = _export_discovery_cloud(
                     scene_discovery_views, log, force_geometry=True,
@@ -9574,12 +11717,19 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     hybrid_dimension_detail = _metric_horizontal_box_dimensions(
                         hybrid_object_box_3d
                     )
-                hybrid_geometry_ok = bool(
+                base_geometry_ok = bool(
                     hybrid_cloud.get("ok")
                     and fused_view_count >= 2
                     and box_view_count >= 2
                     and hybrid_metric_width_mm is not None
                     and hybrid_metric_major_mm is not None
+                )
+                hybrid_geometry_converged, convergence_detail = \
+                    _metric_box_extent_convergence(
+                        previous_hybrid_box, hybrid_object_box_3d
+                    )
+                hybrid_geometry_ok = bool(
+                    base_geometry_ok and hybrid_geometry_converged
                 )
                 log(
                     "stage=hybrid_object_fusion status=checking "
@@ -9587,15 +11737,22 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     f"{maximum_extra_sweeps + 1} "
                     f"camera_views={len(scene_discovery_views)} "
                     f"registered_views={fused_view_count} "
-                    f"valid_target_masks={box_view_count}/2"
+                    f"valid_target_masks={box_view_count}/2 "
+                    f"extent_converged={hybrid_geometry_converged} "
+                    f"detail={convergence_detail.get('reason')}"
                 )
                 if hybrid_geometry_ok:
                     break
                 if collection_attempt >= maximum_extra_sweeps:
                     break
+                previous_hybrid_box = (
+                    dict(hybrid_object_box_3d)
+                    if isinstance(hybrid_object_box_3d, dict) else None
+                )
                 log(
                     "stage=hybrid_object_fusion status=collecting "
-                    f"reason=valid_target_masks_{box_view_count}_of_2 "
+                    f"reason="
+                    f"{'box_extents_not_converged' if base_geometry_ok else ('valid_target_masks_' + str(box_view_count) + '_of_2')} "
                     f"extra_sweep={collection_attempt + 1}/"
                     f"{maximum_extra_sweeps}"
                 )
@@ -9605,6 +11762,9 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                         geometry_accept=hybrid_semantic_view_entry_ok,
                         geometry_rejected=record_grasp_fit_rejection,
                         captured_views=scene_discovery_views,
+                        allow_edge_recenter=True,
+                        minimum_translation_from_m=baseline_origin,
+                        minimum_translation_m=minimum_baseline_m,
                     )
                 last_fusion_discovery = fusion_discovery
                 steps.append((
@@ -9630,12 +11790,14 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 "stage=hybrid_object_fusion "
                 f"ok={hybrid_geometry_ok} registered_views="
                 f"{fused_view_count} object_views={box_view_count} "
-                f"detail={hybrid_dimension_detail.get('reason')}"
+                f"extent_converged={hybrid_geometry_converged} "
+                f"detail={hybrid_dimension_detail.get('reason')}; "
+                f"convergence={convergence_detail.get('reason')}"
             )
             if not hybrid_geometry_ok:
                 return recover(
-                    "hybrid object-mask fusion did not produce a consistent "
-                    "two-target-mask metric object box after bounded extra "
+                    "hybrid object-mask fusion did not produce a converged "
+                    "multi-view metric object box after bounded translated "
                     "view collection; legacy mode remains available with "
                     "REBOT_OBJECT_GEOMETRY_MODE=legacy",
                     discovery=last_fusion_discovery,
@@ -9648,8 +11810,16 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 )
             )
             if recovered_metric_pose:
+                recovery_camera_envelope_deg = \
+                    geometry.grasp_detection.info.get(
+                        "metric_recovery_camera_envelope_deg"
+                    )
                 current_mapping, mapping_detail = load_saved_camera_jacobian(
-                    tuple(float(v) for v in A.ee_rpy())
+                    tuple(float(v) for v in A.ee_rpy()),
+                    maximum_orientation_delta_deg=(
+                        float(recovery_camera_envelope_deg)
+                        if recovery_camera_envelope_deg is not None else None
+                    ),
                 )
                 from arm_agent import gripper_model as gm
                 calibrated_aperture = gm.max_aperture_mm(_wrist_limits())
@@ -9833,12 +12003,254 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 if det_after else str(orientation_consensus.get("reason")),
             ))
             if det_after is None or frame_after is None or geometry_after is None:
-                return recover(
-                    "target lacked stable full-object geometry after the "
-                    f"bounded wrist orientation: "
-                    f"{orientation_consensus.get('reason')}",
-                    grasp_geometry=grasp_geometry_summary,
-                )
+                restored = False
+                restore_detail = {
+                    "reason": "metric viewpoint restoration was not attempted"
+                }
+                # The extra orientation is a refinement, not permission to
+                # discard a graspable measured view. If it pushes the target
+                # out of frame, return to the exact pre-refinement wrist pose,
+                # demand fresh stable identity there, and authorize that pose
+                # only through a full measured-OBB jaw projection. No stale
+                # frame, relaxed aperture, or blind approach is allowed.
+                if object_geometry_mode == "hybrid" \
+                        and isinstance(hybrid_object_box_3d, dict):
+                    restore_rpy = tuple(float(value) for value in live_rpy)
+                    restore_waypoints, restore_reason = _plan_rpy_trajectory(
+                        restore_rpy, xyz=geometry_stationary_xyz
+                    )
+                    log(
+                        "stage=orientation_visibility_restore status=planning "
+                        f"ok={restore_waypoints is not None} "
+                        f"detail={restore_reason}"
+                    )
+                    if restore_waypoints is not None:
+                        restore_ok, restore_exec_reason = \
+                            _execute_rpy_trajectory(
+                                restore_waypoints, log,
+                                fixed_xyz=geometry_stationary_xyz,
+                            )
+                        if restore_ok:
+                            _settle(
+                                eye, note="restore last visible grasp viewpoint"
+                            )
+                            restore_det, restore_frame, _restore_geometry, \
+                                restore_consensus = \
+                                _observe_full_geometry_consensus(
+                                    eye, object_name, restore_rpy, log,
+                                    max_frames=6,
+                                    allow_registered_box_fallback=True,
+                                )
+                            if restore_det is not None \
+                                    and restore_frame is not None:
+                                restored_geometry = \
+                                    _plan_scene_grasp_geometry(
+                                        restore_frame, restore_det,
+                                        current_rpy=restore_rpy,
+                                        allow_orientation=False,
+                                        object_name=object_name,
+                                        metric_jaw_width_mm=(
+                                            hybrid_metric_width_mm
+                                        ),
+                                        metric_major_mm=(
+                                            hybrid_metric_major_mm
+                                        ),
+                                    )
+                                restored_mapping, mapping_detail = \
+                                    load_saved_camera_jacobian(restore_rpy)
+                                from arm_agent import gripper_model as gm
+                                aperture = gm.max_aperture_mm(_wrist_limits())
+                                projection = (
+                                    _projected_3d_jaw_span(
+                                        hybrid_object_box_3d,
+                                        np.asarray(
+                                            restored_mapping, dtype=float
+                                        ),
+                                    )
+                                    if restored_mapping is not None else
+                                    {"ok": False, "reason":
+                                     mapping_detail.get("reason")}
+                                )
+                                projection_safe = bool(
+                                    restored_geometry.ok
+                                    and restored_geometry.grasp_detection
+                                    is not None
+                                    and projection.get("ok")
+                                    and aperture is not None
+                                    and float(projection[
+                                        "conservative_width_mm"
+                                    ]) <= float(aperture) + 1e-6
+                                    and float(projection[
+                                        "observed_width_mm"
+                                    ]) + _effective_open_clearance_mm()[0] \
+                                        <= float(aperture) + 1e-6
+                                )
+                                # A full OBB support projection asks whether
+                                # the *entire* object diagonal fits between the
+                                # fingers. That is correct for broad objects,
+                                # but unnecessarily rejects an elongated
+                                # marker/sponge whose verified local section
+                                # fits while its length continues beyond the
+                                # jaws. Permit that established grasp mode only
+                                # after stable multi-frame semantic identity and
+                                # all ordinary local fit/clearance gates pass.
+                                restored_geometry = replace(
+                                    restored_geometry,
+                                    object_box_3d=hybrid_object_box_3d,
+                                )
+                                restored_jaw_plan = (
+                                    _plan_aperture(
+                                        restored_geometry.grasp_detection
+                                    )
+                                    if restored_geometry.grasp_detection
+                                    is not None else {"ok": False,
+                                                       "reason": "no local section"}
+                                )
+                                subsection_fit, subsection_detail = \
+                                    _long_object_subsection_entry_safe(
+                                        restored_geometry,
+                                        restored_jaw_plan,
+                                        metric_width_mm=
+                                            hybrid_metric_width_mm,
+                                        metric_major_mm=
+                                            hybrid_metric_major_mm,
+                                    )
+                                semantic_ok, semantic_reason = \
+                                    _exact_semantic_geometry_mask(
+                                        restored_geometry, restore_det
+                                    )
+                                stable_frames = int(
+                                    restore_consensus.get(
+                                        "stable_frames",
+                                        restore_consensus.get(
+                                            "valid_full_geometry_frames", 0
+                                        ),
+                                    )
+                                )
+                                subsection_safe = bool(
+                                    restored_geometry.ok
+                                    and semantic_ok
+                                    and stable_frames >= 2
+                                    and hybrid_geometry_converged
+                                    and subsection_fit
+                                )
+                                if projection_safe:
+                                    restored_geometry = \
+                                        _geometry_with_projected_3d_width(
+                                            restored_geometry, projection
+                                        )
+                                    restore_basis = "full_obb_projection"
+                                elif subsection_safe:
+                                    restore_basis = \
+                                        "stable_local_elongated_subsection"
+                                    restored_geometry = replace(
+                                        restored_geometry,
+                                        reason=(
+                                            f"{restored_geometry.reason}; "
+                                            "stable elongated-object local "
+                                            "section retained after the full "
+                                            "object diagonal exceeded the jaw "
+                                            "opening"
+                                        ),
+                                    )
+                                    log(
+                                        "stage=orientation_visibility_restore "
+                                        "mode=local_subsection "
+                                        f"stable_frames={stable_frames} "
+                                        f"width_mm={hybrid_metric_width_mm:.1f} "
+                                        f"major_mm={hybrid_metric_major_mm:.1f} "
+                                        f"detail={subsection_detail.get('reason')}"
+                                    )
+                                else:
+                                    restore_basis = None
+                                if projection_safe or subsection_safe:
+                                    geometry_after = replace(
+                                        restored_geometry,
+                                        rpy_rad=restore_rpy,
+                                        yaw_correction_deg=0.0,
+                                        object_box_3d=
+                                        hybrid_object_box_3d,
+                                        reason=(
+                                            f"{restored_geometry.reason}; "
+                                            "last visible viewpoint restored "
+                                            "after refinement hid target"
+                                        ),
+                                    )
+                                    det_after = geometry_after.grasp_detection
+                                    frame_after = restore_frame
+                                    approach_rpy = restore_rpy
+                                    restored = True
+                                    restore_detail = {
+                                        **projection,
+                                        "reason": (
+                                            "fresh stable target reacquired at "
+                                            "the pre-refinement pose and "
+                                            + (
+                                                "the full metric OBB projection "
+                                                "fits the calibrated jaw aperture"
+                                                if projection_safe else
+                                                "its measured local section fits "
+                                                "the jaws while the elongated "
+                                                "object continues beyond the "
+                                                "fingers"
+                                            )
+                                        ),
+                                        "consensus": restore_consensus,
+                                        "entry_basis": restore_basis,
+                                        "subsection": subsection_detail,
+                                    }
+                                else:
+                                    restore_detail = {
+                                        **projection,
+                                        "reason": (
+                                            "restored target view did not pass "
+                                            "either the full-OBB aperture gate "
+                                            "or the stable elongated local-"
+                                            "section gate: full_obb="
+                                            f"{projection.get('reason')}; "
+                                            f"local={subsection_detail.get('reason')}; "
+                                            f"semantic={semantic_reason}; "
+                                            f"stable_frames={stable_frames}; "
+                                            "metric_box_converged="
+                                            f"{hybrid_geometry_converged}"
+                                        ),
+                                    }
+                            else:
+                                restore_detail = {
+                                    "reason": (
+                                        "target was not stably reacquired at "
+                                        "the pre-refinement viewpoint: "
+                                        f"{restore_consensus.get('reason')}"
+                                    )
+                                }
+                        else:
+                            restore_detail = {
+                                "reason": (
+                                    "could not execute the prevalidated return "
+                                    f"to the visible viewpoint: "
+                                    f"{restore_exec_reason}"
+                                )
+                            }
+                    else:
+                        restore_detail = {"reason": restore_reason}
+                    steps.append((
+                        "restore_visible_metric_grasp_view", restored,
+                        str(restore_detail.get("reason")),
+                    ))
+                    log(
+                        "stage=orientation_visibility_restore "
+                        f"status={'accepted' if restored else 'rejected'} "
+                        f"detail={restore_detail.get('reason')}"
+                    )
+                if not restored:
+                    return recover(
+                        "target lacked stable full-object geometry after the "
+                        "bounded wrist orientation and the last visible metric "
+                        "view could not be safely restored: "
+                        f"{orientation_consensus.get('reason')}; "
+                        f"restore={restore_detail.get('reason')}",
+                        grasp_geometry=grasp_geometry_summary,
+                    )
             steps.append(("geometry_after_orientation", geometry_after.ok,
                           str(orientation_consensus.get("reason"))))
             if not geometry_after.ok or \
@@ -10142,8 +12554,93 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     "the partial-view identity anchor",
                     identity_reanchor=reanchor_detail,
                 )
+        # Multi-view fusion deliberately errs on the large side so collision
+        # and carry planning never under-model the object.  Its bounded
+        # registration uncertainty must not also enlarge the precise local jaw
+        # entry when a fresh, stationary two-frame OBB has already passed the
+        # independent extent/identity cross-check above.  Keep the persistent
+        # fused box for scene exclusion and payload dimensions; use the current
+        # stationary OBB only for jaw-axis projection and aperture alignment.
+        jaw_axis_box_3d = (
+            stationary_object_box_3d
+            if isinstance(stationary_object_box_3d, dict)
+            else full_object_box_3d
+        )
+        # The extent cross-check above compares sorted magnitudes, which are
+        # orientation-independent: it cannot see that two boxes of the same size
+        # disagree about which way the object is turned.  A two-frame stationary
+        # PCA sees only the top and one side face, so its minor axes can roll
+        # ~30deg about the long axis and miss the gravity snap, while the
+        # many-view registered box does snap.  A rolled frame makes the
+        # jaw-alignment and optical-tilt gates move in opposite directions under
+        # wrist yaw, so no yaw can satisfy both and an otherwise easy grasp is
+        # refused.  Extents stay local and fresh only when the fresh orientation
+        # is itself trustworthy; otherwise defer to the snapped registered box.
+        stationary_orientation_snapped = str(
+            (stationary_object_box_3d or {}).get("orientation_mode", "")
+        ).startswith("gravity_snapped")
+        registered_orientation_snapped = str(
+            (full_object_box_3d or {}).get("orientation_mode", "")
+        ).startswith("gravity_snapped")
+        jaw_axis_orientation_deferred = bool(
+            jaw_axis_box_3d is stationary_object_box_3d
+            and not stationary_orientation_snapped
+            and registered_orientation_snapped
+            and isinstance(full_object_box_3d, dict)
+        )
+        if jaw_axis_orientation_deferred:
+            jaw_axis_box_3d = full_object_box_3d
+        jaw_axis_box_basis = (
+            "registered_gravity_snapped_obb_after_unsnapped_stationary_fit"
+            if jaw_axis_orientation_deferred
+            else "fresh_stationary_crosschecked_obb"
+            if jaw_axis_box_3d is stationary_object_box_3d
+            else "registered_multiview_obb"
+        )
+        try:
+            jaw_axis_observed_mm = (
+                1000.0 * np.asarray(
+                    jaw_axis_box_3d["observed_size_m"], dtype=float
+                )
+            ).round(1).tolist()
+        except (KeyError, TypeError, ValueError):
+            jaw_axis_observed_mm = None
+        steps.append((
+            "jaw_axis_geometry_source", True,
+            f"{jaw_axis_box_basis}; observed_mm={jaw_axis_observed_mm}; "
+            "persistent collision/payload box remains unchanged",
+        ))
+        log(
+            "stage=jaw_axis_geometry_source "
+            f"basis={jaw_axis_box_basis} "
+            f"observed_mm={jaw_axis_observed_mm} "
+            f"stationary_orientation={(stationary_object_box_3d or {}).get('orientation_mode')} "
+            f"registered_orientation={(full_object_box_3d or {}).get('orientation_mode')} "
+            "collision_box=registered_persistent"
+        )
+        # Everything downstream — the endpoint, the jaw-pocket alignment gate
+        # and post-close tracking — compares against this one point, so it must
+        # sit inside the object rather than on the face nearest the lens.
+        plan_geometry, recentre_detail = _grasp_point_at_metric_subsection(
+            plan_geometry, jaw_axis_box_3d,
+            camera_mapping=J, ee_xyz_m=A.ee_pos(),
+            tool_camera_mm=tcp_cam, intr=plan_frame[2],
+        )
+        steps.append((
+            "grasp_point_metric_recentre",
+            bool(recentre_detail.get("ok")),
+            str(recentre_detail.get("reason")),
+        ))
+        log(
+            "stage=grasp_point_metric_recentre "
+            f"ok={recentre_detail.get('ok')} "
+            f"shift_mm={recentre_detail.get('shift_mm')} "
+            f"axis_fraction={recentre_detail.get('axis_fraction')} "
+            f"mask_p_cam_mm={recentre_detail.get('mask_p_cam_mm')} "
+            f"metric_p_cam_mm={recentre_detail.get('metric_p_cam_mm')}"
+        )
         aligned_3d_width_detail = _aligned_3d_jaw_width(
-            full_object_box_3d, J
+            jaw_axis_box_3d, J
         )
         max_aperture_mm = float(jaw_plan["max_aperture_mm"])
         aligned_width_safe = bool(
@@ -10151,6 +12648,397 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             float(aligned_3d_width_detail["conservative_width_mm"])
             <= max_aperture_mm
         )
+        full_projection_detail = _projected_3d_jaw_span(
+            jaw_axis_box_3d, J
+        )
+        full_projection_safe, full_projection_gate = \
+            _projected_3d_span_fits_aperture(
+                full_projection_detail, max_aperture_mm
+            )
+        full_projection_detail = {
+            **full_projection_detail,
+            "aperture_gate": full_projection_gate,
+            "aperture_gate_reason": full_projection_gate.get("reason"),
+            "boundary_slop_applied": bool(
+                full_projection_safe
+                and full_projection_gate.get("conservative_excess_mm", 0.0)
+                > 0.0
+            ),
+        }
+        steps.append((
+            "full_3d_jaw_projection", full_projection_safe,
+            str(full_projection_gate.get("reason")),
+        ))
+        log(
+            "stage=full_3d_jaw_projection "
+            f"ok={full_projection_safe} "
+            f"detail={full_projection_gate.get('reason')}"
+        )
+        # A whole compact object may fit even when none of its PCA axes is
+        # individually parallel to jaw closure.  An elongated local-section
+        # grasp is different: if the complete projection does not fit, its
+        # measured narrow axis must be physically aligned with the fingers.
+        # Refine that yaw now, at the elevated stationary pose, rather than
+        # letting a fitting 2D slice authorize a diagonal final approach.
+        #
+        # Passing the gate is not the same as being aimed at the object. The
+        # wrist arrives here carrying whatever attitude discovery and the reach
+        # pitch happened to leave it in, and the check above only asks whether
+        # that incidental attitude is *tolerable*. It can be over 25deg off the
+        # axis and still pass, which is how the gripper ends up entering at a
+        # visibly odd tilt. Treat the orientation as something to choose for the
+        # grasp, not merely to accept: refine whenever a bounded pose is
+        # materially better aligned than the one we drifted into.
+        current_axis_angle_deg = _axis_alignment_angle_deg(
+            aligned_3d_width_detail
+        )
+        try:
+            realign_above_deg = float(np.clip(float(os.getenv(
+                "REBOT_3D_AXIS_REALIGN_ABOVE_DEG", "8"
+            )), 3.0, 25.0))
+            realign_min_gain_deg = float(np.clip(float(os.getenv(
+                "REBOT_3D_AXIS_REALIGN_MIN_GAIN_DEG", "4"
+            )), 1.0, 15.0))
+        except (TypeError, ValueError):
+            realign_above_deg, realign_min_gain_deg = 8.0, 4.0
+        alignment_required = bool(
+            not aligned_width_safe and not full_projection_safe
+        )
+        alignment_optional = bool(
+            not alignment_required
+            and current_axis_angle_deg is not None
+            and current_axis_angle_deg > realign_above_deg
+        )
+        if alignment_optional:
+            log(
+                "stage=3d_axis_orientation_refinement status=improving "
+                f"current_axis_angle_deg={current_axis_angle_deg:.1f} "
+                f"threshold_deg={realign_above_deg:.1f} "
+                "basis=inherited_discovery_attitude"
+            )
+        # Rotating the wrist tens of degrees only makes sense if we know where
+        # the object is. The recentring step immediately above answers exactly
+        # that: refusing it means the mask-derived grasp point and the measured
+        # metric box disagree by more than the recentring limit, so the object's
+        # position is not established. Committing a large roll on that evidence
+        # drives the gripper somewhere the object is not — into the object and
+        # the table. Fall back to the small, long-standing yaw-only refinement,
+        # and if that cannot solve it, fail closed rather than rotate blind.
+        geometry_trusted_for_reorientation = bool(recentre_detail.get("ok"))
+        axis_refinement = None
+        visual_subsection_authorized = False
+        if alignment_required or alignment_optional:
+            if geometry_trusted_for_reorientation:
+                axis_refinement = _find_3d_axis_orientation_refinement(
+                    jaw_axis_box_3d, A.ee_rpy(), max_aperture_mm
+                )
+            else:
+                axis_refinement = _find_3d_axis_yaw_refinement(
+                    jaw_axis_box_3d, A.ee_rpy(), max_aperture_mm
+                )
+                axis_refinement = {
+                    **axis_refinement,
+                    "refinement_mode": "yaw_only_untrusted_geometry",
+                    "reason": (
+                        f"{axis_refinement.get('reason')}; roll/pitch "
+                        "realignment withheld because the grasp point could "
+                        "not be placed on the measured object "
+                        f"({recentre_detail.get('reason')})"
+                    ),
+                }
+                log(
+                    "stage=3d_axis_orientation_refinement status=restricted "
+                    "detail=object position is not established; large "
+                    "reorientation withheld"
+                )
+            if axis_refinement.get("ok") and alignment_optional:
+                # Only spend wrist motion on a real improvement.
+                refined_angle_deg = _axis_alignment_angle_deg(
+                    axis_refinement.get("aligned_width") or {}
+                )
+                gain_deg = (
+                    None if refined_angle_deg is None
+                    else current_axis_angle_deg - refined_angle_deg
+                )
+                if gain_deg is None or gain_deg < realign_min_gain_deg:
+                    axis_refinement = {
+                        "ok": False,
+                        "refinement_mode": "improvement_declined",
+                        "reason": (
+                            "no bounded pose improved jaw alignment by at "
+                            f"least {realign_min_gain_deg:.1f}deg; retaining "
+                            f"the current {current_axis_angle_deg:.1f}deg "
+                            "alignment"
+                        ),
+                    }
+                else:
+                    axis_refinement["alignment_gain_deg"] = gain_deg
+            steps.append((
+                "plan_3d_axis_orientation_refinement",
+                bool(axis_refinement.get("ok")),
+                str(axis_refinement.get("reason")),
+            ))
+            log(
+                "stage=3d_axis_orientation_refinement status=planned "
+                f"ok={axis_refinement.get('ok')} "
+                f"mode={axis_refinement.get('refinement_mode')} "
+                f"required={alignment_required} "
+                f"detail={axis_refinement.get('reason')}"
+            )
+            if not axis_refinement.get("ok") and not alignment_required:
+                # The existing alignment already passes every gate; an optional
+                # improvement that cannot be found is not a failure.
+                axis_refinement = None
+            elif not axis_refinement.get("ok"):
+                visual_subsection = _stable_visual_subsection_fallback(
+                    plan_geometry, geometry_consensus, jaw_plan,
+                    jaw_axis_box_3d, full_projection_detail, recentre_detail,
+                    independent_metric_crosscheck=bool(
+                        object_geometry_mode == "hybrid"
+                        and isinstance(hybrid_object_box_3d, dict)
+                        and isinstance(stationary_object_box_3d, dict)
+                    ),
+                )
+                steps.append((
+                    "stable_visual_subsection_fallback",
+                    bool(visual_subsection.get("ok")),
+                    str(visual_subsection.get("reason")),
+                ))
+                log(
+                    "stage=stable_visual_subsection_fallback "
+                    f"ok={visual_subsection.get('ok')} "
+                    f"detail={visual_subsection.get('reason')}"
+                )
+                if visual_subsection.get("ok"):
+                    # Keep the already image-aligned wrist attitude and the
+                    # stable visual jaw plan. Do not pretend that an OBB axis
+                    # was aligned: its full dimensions remain installed in the
+                    # collision map and carried-object context below.
+                    axis_refinement = None
+                    visual_subsection_authorized = True
+                    aligned_width_safe = False
+                    aligned_3d_width_detail = {
+                        **aligned_3d_width_detail,
+                        "visual_subsection_fallback": visual_subsection,
+                        "reason": str(visual_subsection.get("reason")),
+                    }
+                else:
+                    return recover(
+                        "the measured object fits only as a local subsection, "
+                        "but neither its narrow 3D axis nor a repeated "
+                        "image-aligned subsection could safely authorize the "
+                        f"grasp: {axis_refinement.get('reason')}; fallback: "
+                        f"{visual_subsection.get('reason')}",
+                        aligned_3d_jaw_width=aligned_3d_width_detail,
+                        full_3d_jaw_projection=full_projection_detail,
+                    )
+        if axis_refinement is not None:
+            refined_rpy = tuple(float(value) for value in
+                                axis_refinement["target_rpy"])
+            # A yaw-only refinement keeps the ordinary clamp and IK gate it has
+            # always used. Only the roll/pitch search, which exists precisely
+            # because an arbitrarily posed object needs more than a yaw budget,
+            # requests the wider envelope — and then every waypoint is checked
+            # against the collision map as well.
+            refinement_budget_deg = (
+                max(
+                    float(axis_refinement.get("searched_roll_deg", 0.0)),
+                    float(axis_refinement.get("searched_pitch_deg", 0.0)),
+                    float(axis_refinement.get("searched_yaw_deg", 0.0)),
+                )
+                if axis_refinement.get("refinement_mode")
+                == "bounded_full_orientation"
+                else None
+            )
+            # Several poses usually align the jaws equally well while differing
+            # a lot in how awkward they are to reach. Walk the ranked
+            # alternatives rather than letting the single best-aligned one — a
+            # pose IK may simply not have a solution for — abort the run.
+            refinement_alternatives = (
+                axis_refinement.get("alternatives") or [axis_refinement]
+            )
+            refinement_path = None
+            refinement_plan_reason = "no refinement alternative was reachable"
+            for attempt_index, alternative in enumerate(
+                refinement_alternatives, 1
+            ):
+                candidate_rpy = tuple(
+                    float(value) for value in alternative["target_rpy"]
+                )
+                candidate_path, candidate_reason = _plan_rpy_trajectory(
+                    candidate_rpy, xyz=geometry_stationary_xyz,
+                    max_delta_deg=refinement_budget_deg,
+                )
+                if candidate_path is not None:
+                    axis_refinement = alternative
+                    refined_rpy = candidate_rpy
+                    refinement_path = candidate_path
+                    refinement_plan_reason = (
+                        f"{candidate_reason}; alternative {attempt_index}/"
+                        f"{len(refinement_alternatives)}"
+                    )
+                    break
+                log(
+                    "stage=3d_axis_orientation_alternative "
+                    f"attempt={attempt_index}/{len(refinement_alternatives)} "
+                    f"ok=False axis_angle_deg={alternative.get('axis_angle_deg')} "
+                    f"orientation_delta_deg={alternative.get('orientation_delta_deg')} "
+                    f"detail={candidate_reason}"
+                )
+                refinement_plan_reason = candidate_reason
+            steps.append((
+                "prevalidate_3d_axis_orientation_refinement",
+                refinement_path is not None, refinement_plan_reason,
+            ))
+            if refinement_path is None:
+                return recover(
+                    "3D jaw-axis refinement was geometrically valid but no "
+                    "aligned pose had a safe orientation path: "
+                    f"{refinement_plan_reason}"
+                )
+            refined, refinement_exec_reason = _execute_rpy_trajectory(
+                refinement_path, log, fixed_xyz=geometry_stationary_xyz
+            )
+            steps.append((
+                "execute_3d_axis_orientation_refinement", refined,
+                refinement_exec_reason,
+            ))
+            if not refined:
+                return recover(
+                    "bounded 3D jaw-axis refinement did not complete: "
+                    f"{refinement_exec_reason}"
+                )
+            # The wrist now sits at a bounded pose that was IK- and
+            # collision-validated before the move. Observations taken here must
+            # use that same envelope; otherwise the arm can reach a pose it is
+            # not permitted to interpret its own camera from.
+            refinement_envelope_deg = float(
+                axis_refinement["camera_envelope_deg"]
+            )
+            _set_active_camera_envelope(refinement_envelope_deg)
+            steps.append((
+                "observation_envelope_after_refinement", True,
+                f"camera envelope raised to {refinement_envelope_deg:.1f}deg "
+                "for observations at the validated refined wrist pose",
+            ))
+            log(
+                "stage=observation_envelope_after_refinement "
+                f"envelope_deg={refinement_envelope_deg:.1f} "
+                "basis=prevalidated_bounded_orientation"
+            )
+            _settle(eye, note="3D jaw-axis refinement")
+            refined_det, refined_frame, refined_geometry, refined_consensus = \
+                _observe_full_geometry_consensus(
+                    eye, object_name,
+                    tuple(float(value) for value in A.ee_rpy()), log,
+                    max_frames=6,
+                    allow_registered_box_fallback=True,
+                )
+            refined_visible = bool(
+                refined_det is not None and refined_frame is not None
+                and refined_geometry is not None
+            )
+            steps.append((
+                "redetect_after_3d_axis_orientation_refinement", refined_visible,
+                str(refined_consensus.get("reason")),
+            ))
+            if not refined_visible:
+                return recover(
+                    "target identity/geometry was not stable after the bounded "
+                    "3D jaw-axis refinement; refusing to approach"
+                )
+            actual_refined_rpy = tuple(float(value) for value in A.ee_rpy())
+            J_refined, refined_mapping_detail = load_saved_camera_jacobian(
+                actual_refined_rpy,
+                maximum_orientation_delta_deg=float(
+                    axis_refinement["camera_envelope_deg"]
+                ),
+            )
+            if J_refined is None:
+                return recover(
+                    "measured wrist pose after 3D jaw-axis refinement is "
+                    "outside its bounded rigid-camera envelope: "
+                    f"{refined_mapping_detail.get('reason')}"
+                )
+            aligned_3d_width_detail = _aligned_3d_jaw_width(
+                jaw_axis_box_3d, J_refined
+            )
+            aligned_width_safe = bool(
+                aligned_3d_width_detail.get("ok")
+                and float(aligned_3d_width_detail["conservative_width_mm"])
+                    <= max_aperture_mm
+            )
+            if not aligned_width_safe:
+                return recover(
+                    "hardware tracking left the measured object axis outside "
+                    "the unchanged jaw-alignment/aperture gate after refinement: "
+                    f"{aligned_3d_width_detail.get('reason')}"
+                )
+            approach_rpy = actual_refined_rpy
+            J = J_refined
+            rigid_detail = refined_mapping_detail
+            plan_geometry = replace(
+                refined_geometry,
+                rpy_rad=actual_refined_rpy,
+                yaw_correction_deg=0.0,
+                object_box_3d=full_object_box_3d,
+                reason=(
+                    f"{refined_geometry.reason}; measured 3D object axis "
+                    "aligned to calibrated jaw closure before approach"
+                ),
+            )
+            # ``refined_geometry`` is a fresh observation, so its grasp point
+            # is once again the near-surface mask point. Recentring it onto the
+            # measured body is not a one-off correction applied before the
+            # gates: it has to hold for whatever geometry actually reaches the
+            # approach, or the ~20mm forward bias returns at exactly the moment
+            # the jaws finally close on the object.
+            plan_geometry, refined_recentre = \
+                _grasp_point_at_metric_subsection(
+                    plan_geometry, jaw_axis_box_3d,
+                    camera_mapping=J, ee_xyz_m=A.ee_pos(),
+                    tool_camera_mm=tcp_cam, intr=refined_frame[2],
+                )
+            steps.append((
+                "grasp_point_metric_recentre_after_refinement",
+                bool(refined_recentre.get("ok")),
+                str(refined_recentre.get("reason")),
+            ))
+            log(
+                "stage=grasp_point_metric_recentre_after_refinement "
+                f"ok={refined_recentre.get('ok')} "
+                f"shift_mm={refined_recentre.get('shift_mm')} "
+                f"mask_p_cam_mm={refined_recentre.get('mask_p_cam_mm')} "
+                f"metric_p_cam_mm={refined_recentre.get('metric_p_cam_mm')}"
+            )
+            # Keep the complete observation tuple in one camera coordinate
+            # system.  Retaining the pre-rotation semantic feature while using
+            # the post-rotation grasp body makes
+            # ``_feature_target_for_grasp_target`` manufacture a lateral/depth
+            # offset even though both detections are individually correct.
+            # That stale-frame mix was enough for one finger to contact the
+            # sponge before it entered the jaw slot.
+            plan_det = refined_det
+            plan_frame = refined_frame
+            geometry_consensus = refined_consensus
+            geometry = plan_geometry
+            det = refined_det
+            frame = refined_frame
+            grasp_geometry_summary = plan_geometry.summary()
+            log(
+                "stage=3d_axis_observation_handoff status=atomic "
+                "coordinate_frame=post_rotation "
+                f"feature_source={refined_det.source} "
+                f"body_source={plan_geometry.grasp_detection.source}"
+            )
+            log(
+                "stage=3d_axis_orientation_refinement status=verified "
+                f"mode={axis_refinement.get('refinement_mode')} "
+                f"roll_deg={axis_refinement.get('roll_offset_deg', 0.0):+.1f} "
+                f"pitch_deg={axis_refinement.get('pitch_offset_deg', 0.0):+.1f} "
+                f"yaw_deg={axis_refinement.get('offset_deg'):+.1f} "
+                f"detail={aligned_3d_width_detail.get('reason')}"
+            )
         silhouette_width_mm = float(
             plan_geometry.grasp_detection.min_width_mm
         )
@@ -10164,12 +13052,15 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
         aligned_3d_width_detail["silhouette_width_mm"] = silhouette_width_mm
         aligned_3d_width_detail["width_reduction_mm"] = width_reduction_mm
         aligned_3d_width_detail["override_applied"] = override_useful
+        local_entry_safe = bool(
+            aligned_width_safe or visual_subsection_authorized
+        )
         steps.append((
-            "align_3d_thickness_to_jaws", aligned_width_safe,
+            "align_3d_thickness_to_jaws", local_entry_safe,
             str(aligned_3d_width_detail.get("reason")),
         ))
         log(
-            f"stage=align_3d_thickness_to_jaws ok={aligned_width_safe} "
+            f"stage=align_3d_thickness_to_jaws ok={local_entry_safe} "
             f"detail={aligned_3d_width_detail.get('reason')}"
         )
         if override_useful:
@@ -10479,7 +13370,32 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             # coarse columns to the terminal grasp can reject the intentional
             # gripper/object intersection. Preserve the proven pick behavior;
             # workspace, IK, self-collision and operator stop gates remain on.
-            A.clear_collision_scene()
+            #
+            # ``clear_collision_scene`` also drops ``table_z_m``, and the table
+            # is modelled as a collision slab rather than a workspace bound. So
+            # suspending the coarse columns was silently removing the tabletop
+            # for the whole final approach, leaving nothing to stop the fingers
+            # being driven into it. The table is not a coarse observation and it
+            # never intersects an intended grasp: re-install it on its own, with
+            # no obstacle columns, so the terminal approach keeps a hard floor.
+            suspended_table_z_m = (
+                float(_ACTIVE_SCENE_MAP.table_z_m)
+                if getattr(_ACTIVE_SCENE_MAP, "table_z_m", None) is not None
+                else None
+            )
+            table_retained = False
+            if suspended_table_z_m is not None:
+                table_only = A.configure_collision_scene(
+                    [], table_z_m=suspended_table_z_m, payload_radius_m=0.0,
+                )
+                table_retained = bool(getattr(table_only, "ok", False))
+            if not table_retained:
+                A.clear_collision_scene()
+            log(
+                "stage=scene_collision_pick_floor "
+                f"table_retained={table_retained} "
+                f"table_z_m={suspended_table_z_m}"
+            )
             steps.append((
                 "suspend_scene_for_proven_pick", True,
                 "environment columns cached for post-lift voxel navigation",
@@ -10549,7 +13465,19 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
         ))
         grasp_geometry_summary = plan_geometry.summary()
         selected_grasp_axis_fraction = _selected_axis_fraction(plan_geometry)
-        selected_grasp_section_locked = False
+        # Once native-mask multi-view geometry has converged, the selected
+        # physical subsection is authoritative. Close-range masks commonly
+        # spill onto the table or open fingers; they may confirm the target's
+        # position but must not silently select a different section.
+        registered_section_lock = bool(
+            object_geometry_mode == "hybrid" and hybrid_geometry_converged
+        )
+        selected_grasp_section_locked = registered_section_lock
+        if registered_section_lock:
+            log(
+                "stage=grasp_section_lock mode=strict_registered_subsection "
+                "close_range_reselection=disabled"
+            )
         log("stage=grasp_endpoint_plan status=checking "
             "detail=endpoint IK search; arm stationary")
         endpoint_started = time.monotonic()
@@ -10829,6 +13757,13 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             list(waypoints[len(checkpoint_prefix):])
         )
         frozen_checkpoint_endpoint = np.asarray(endpoint, dtype=float).copy()
+        # A reacquisition retreat backs the arm away from the checkpoint to see
+        # the target better. The frozen suffix still starts *at* the checkpoint,
+        # so after retreating it no longer begins where the arm is standing, and
+        # the continuation-IK validator correctly rejects its first waypoint as
+        # a joint jump. Remember the executed retreat so the suffix can be
+        # re-entered through the waypoints just travelled instead of from a gap.
+        checkpoint_return_bridge: list[Any] = []
         frozen_checkpoint_geometry = plan_geometry
         frozen_checkpoint_geometry_summary = grasp_geometry_summary
         frozen_checkpoint_jaw_plan = dict(jaw_plan)
@@ -10994,6 +13929,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
 
             def frozen_position_fallback(
                 trigger: str,
+                *, allow_identity_presence: bool = False,
             ) -> dict[str, Any] | None:
                 """Reuse the registered grasp only after identity/path gates.
 
@@ -11009,17 +13945,43 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                         target_position_samples, frozen_checkpoint_anchor,
                         min_frames=2,
                     )
+                presence_sample = None
+                if position_median is None and allow_identity_presence:
+                    presence_sample, presence_detail = \
+                        _strict_checkpoint_identity_presence(
+                            target_position_samples, min_frames=2
+                        )
+                    if presence_sample is not None:
+                        position_detail = presence_detail
+                        position_cluster = [presence_sample]
+                        # A finite sentinel means "presence confirmed" only;
+                        # it is never used to calculate or alter an endpoint.
+                        position_median = np.asarray(
+                            presence_sample["point_base_m"], dtype=float
+                        )
                 frozen_geometry_verified = bool(
                     hybrid_identity_gate is not None
                     and isinstance(full_object_box_3d, dict)
                     and fit_ok
                 )
-                frozen_suffix_ok = bool(frozen_checkpoint_suffix)
+                # Re-enter the frozen suffix through any retreat just executed,
+                # so the chain that is validated is the chain the arm can
+                # actually travel from where it now stands.
+                bridged_suffix = (
+                    list(checkpoint_return_bridge) + list(frozen_checkpoint_suffix)
+                    if frozen_checkpoint_suffix else None
+                )
+                frozen_suffix_ok = bool(bridged_suffix)
                 frozen_suffix_reason = "validated terminal suffix unavailable"
                 if frozen_suffix_ok:
                     frozen_suffix_ok, frozen_suffix_reason = \
                         _validate_fixed_waypoints(
-                            frozen_checkpoint_suffix, approach_rpy
+                            bridged_suffix, approach_rpy
+                        )
+                    if checkpoint_return_bridge:
+                        frozen_suffix_reason += (
+                            f"; re-entered through {len(checkpoint_return_bridge)}"
+                            " retreat waypoints"
                         )
                 if position_median is None or not frozen_geometry_verified \
                         or not frozen_suffix_ok:
@@ -11054,7 +14016,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     ),
                     "body_consensus": position_detail,
                     "endpoint_m": frozen_checkpoint_endpoint.copy(),
-                    "waypoints": list(frozen_checkpoint_suffix),
+                    "waypoints": list(bridged_suffix),
                     "trajectory_reason": frozen_suffix_reason,
                     "clearance": {
                         "checkpoint_position_only_fallback": True,
@@ -11081,11 +14043,217 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
             maximum_samples = 6
             for sample_index in range(1, initial_samples + 1):
                 collect_sample(sample_index, initial_samples)
+            if registered_section_lock:
+                # Keep the registered subsection, width and orientation, but
+                # do not confuse that shape lock with a position lock.  The
+                # close checkpoint can see the same physical subsection at a
+                # repeatable camera position even when the initially planned
+                # endpoint is laterally stale.  Rebuild and fully validate
+                # only the remaining XYZ path from that position.  This is
+                # deliberately stricter than the old semantic-presence
+                # fallback, which could reuse a terminal suffix despite a
+                # stable centimetre-scale jaw-slot error and push the object.
+                central_position_recovery, central_recovery_detail = \
+                    _registered_section_can_use_fresh_centre(
+                        selected_grasp_axis_fraction
+                    )
+                body_cam, body_detail, planning_samples = \
+                    _checkpoint_section_consensus(
+                        samples, fresh_samples,
+                        section_locked=True, min_frames=2,
+                        max_spread_mm=4.0,
+                        # This does not replace registered shape, width, RPY,
+                        # or jaw planning below. It supplies only the repeated
+                        # XYZ of the same central subsection when its discrete
+                        # far-view profile index is absent at close range.
+                        allow_reselection=central_position_recovery,
+                    )
+                # The strict registered-target path used to stop after the
+                # first three frames, while the ordinary checkpoint path below
+                # already had a six-frame bounded budget.  A jaw-occluded or
+                # neighbour-connected semantic mask can easily consume two of
+                # three frames even though the clean target reappears on the
+                # next frame.  Use the same bounded resampling budget here.
+                # Registered width, RPY, subsection, and payload geometry stay
+                # frozen; the added frames can only establish repeatable XYZ
+                # for a fully revalidated remaining path.
+                for sample_index in range(
+                    initial_samples + 1, maximum_samples + 1
+                ):
+                    if body_cam is not None:
+                        break
+                    log(
+                        "stage=visible_checkpoint_consensus "
+                        "status=resampling_registered_target "
+                        f"phase={phase} next_frame={sample_index}/"
+                        f"{maximum_samples} detail={body_detail.get('reason')}; "
+                        "registered_shape_locked=true arm=stationary"
+                    )
+                    collect_sample(sample_index, maximum_samples)
+                    body_cam, body_detail, planning_samples = \
+                        _checkpoint_section_consensus(
+                            samples, fresh_samples,
+                            section_locked=True, min_frames=2,
+                            max_spread_mm=4.0,
+                            allow_reselection=central_position_recovery,
+                        )
+                if body_cam is not None and body_detail.get(
+                    "section_reselected"
+                ):
+                    body_detail = {
+                        **body_detail,
+                        "registered_shape_retained": True,
+                        "central_position_recovery": True,
+                        "reason": (
+                            "registered central subsection profile index was "
+                            "not reproduced at close range; repeated fresh "
+                            "body centre used only for XYZ replanning while "
+                            "registered shape/width/orientation remain locked; "
+                            f"{central_recovery_detail.get('reason')}; "
+                            f"{body_detail.get('reason')}"
+                        ),
+                    }
+                if body_cam is not None:
+                    representative = min(
+                        planning_samples,
+                        key=lambda sample: float(np.linalg.norm(
+                            np.asarray(sample["body_cam_mm"], dtype=float)
+                            - body_cam
+                        )),
+                    )
+                    current_xyz = np.asarray(A.ee_pos(), dtype=float)
+                    corrected_endpoint = _endpoint_from_camera_body(
+                        current_xyz, body_cam,
+                        frozen_checkpoint_requested_cam, J,
+                    )
+                    if corrected_endpoint is None:
+                        return {
+                            "ok": False,
+                            "reason": (
+                                "registered subsection position was stable, "
+                                "but camera/body endpoint mapping is singular"
+                            ),
+                        }
+                    endpoint_shift_mm = 1000.0 * float(np.linalg.norm(
+                        corrected_endpoint - frozen_checkpoint_endpoint
+                    ))
+                    correction_limit_mm = _endpoint_retry_envelope_mm(
+                        object_visible=True
+                    )
+                    if endpoint_shift_mm > correction_limit_mm:
+                        log(
+                            "stage=visible_checkpoint_registered_lock "
+                            f"phase={phase} status=refused action="
+                            "position_replan detail=endpoint_shift_mm="
+                            f"{endpoint_shift_mm:.1f} exceeds bounded "
+                            f"{correction_limit_mm:.1f}mm envelope"
+                        )
+                        return {
+                            "ok": False,
+                            "reason": (
+                                "registered subsection moved "
+                                f"{endpoint_shift_mm:.1f}mm from the frozen "
+                                "endpoint, beyond the bounded "
+                                f"{correction_limit_mm:.1f}mm checkpoint "
+                                "position-replan envelope"
+                            ),
+                        }
+                    corrected_waypoints, corrected_reason, clearance = \
+                        _plan_clearance_axial_trajectory(
+                            corrected_endpoint, J, approach_rpy,
+                            log=log,
+                            phase=f"checkpoint_{phase}_registered_position",
+                        )
+                    if corrected_waypoints is None:
+                        log(
+                            "stage=visible_checkpoint_registered_lock "
+                            f"phase={phase} status=refused action="
+                            "position_replan detail="
+                            f"{corrected_reason}"
+                        )
+                        return {
+                            "ok": False,
+                            "reason": (
+                                "registered subsection position was stable, "
+                                "but its corrected final path is unsafe: "
+                                f"{corrected_reason}"
+                            ),
+                        }
+                    live_feature = representative["feature"]
+                    live_body = representative["body"]
+                    corrected_expected_feature, corrected_feature_offset = \
+                        _feature_target_for_grasp_target(
+                            frozen_checkpoint_requested_cam,
+                            live_feature, live_body,
+                        )
+                    log(
+                        "stage=visible_checkpoint_registered_lock "
+                        f"phase={phase} status=accepted action="
+                        "replan_position_keep_registered_shape "
+                        f"endpoint_shift_mm={endpoint_shift_mm:.1f} "
+                        f"detail={corrected_reason}"
+                    )
+                    return {
+                        "ok": True,
+                        "reason": (
+                            f"{body_detail.get('reason')}; retained the "
+                            "registered subsection, width and orientation; "
+                            "replanned only the remaining XYZ path by "
+                            f"{endpoint_shift_mm:.1f}mm ({corrected_reason})"
+                        ),
+                        "body_consensus": body_detail,
+                        "endpoint_m": corrected_endpoint,
+                        "waypoints": corrected_waypoints,
+                        "trajectory_reason": corrected_reason,
+                        "clearance": {
+                            **(clearance or {}),
+                            "registered_shape_live_position": True,
+                            "endpoint_shift_mm": endpoint_shift_mm,
+                        },
+                        "geometry": frozen_checkpoint_geometry,
+                        "geometry_summary":
+                            frozen_checkpoint_geometry_summary,
+                        "jaw_plan": dict(frozen_checkpoint_jaw_plan),
+                        "feature": live_feature,
+                        "expected_feature_cam":
+                            corrected_expected_feature,
+                        "feature_offset_cam": corrected_feature_offset,
+                        "requested_cam_mm":
+                            frozen_checkpoint_requested_cam.copy(),
+                        "section_locked": True,
+                        "axis_fraction": selected_grasp_axis_fraction,
+                        "checkpoint_collision_aware_grasp": None,
+                        "frame": representative["frame"],
+                        "registered_shape_live_position": True,
+                    }
+                fallback = frozen_position_fallback(
+                    "registered subsection position was not repeatable; "
+                    "close-range shape cannot replace it",
+                    allow_identity_presence=False,
+                )
+                if fallback is not None:
+                    log(
+                        "stage=visible_checkpoint_registered_lock "
+                        f"phase={phase} status=accepted action="
+                        "reuse_position_confirmed_terminal_suffix"
+                    )
+                    return fallback
+                return {
+                    "ok": False,
+                    "reason": (
+                        "strict registered grasp subsection could not be "
+                        "position-confirmed at the visible checkpoint; fresh "
+                        "close-range geometry was intentionally not allowed "
+                        "to replace it"
+                    ),
+                    "failures": failures,
+                }
             body_cam, body_detail, planning_samples = \
                 _checkpoint_section_consensus(
                     samples, fresh_samples,
                     section_locked=selected_grasp_section_locked,
                     min_frames=2, max_spread_mm=4.0,
+                    allow_reselection=not registered_section_lock,
                 )
             for sample_index in range(initial_samples + 1, maximum_samples + 1):
                 if body_cam is not None:
@@ -11099,6 +14267,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                         samples, fresh_samples,
                         section_locked=selected_grasp_section_locked,
                         min_frames=2, max_spread_mm=4.0,
+                        allow_reselection=not registered_section_lock,
                     )
             if body_cam is None:
                 fallback = frozen_position_fallback(
@@ -11355,6 +14524,15 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     f"status=failed detail={retreat_execution}"
                 )
                 break
+            # The arm is no longer at the checkpoint. Anything that reuses the
+            # frozen suffix must travel back through these same waypoints.
+            checkpoint_return_bridge = list(reversed(retreat))
+            log(
+                "stage=visible_checkpoint_return_bridge "
+                f"attempt={retry_index}/{reacquire_retries} "
+                f"waypoints={len(checkpoint_return_bridge)} "
+                "detail=frozen suffix will be re-entered through the retreat"
+            )
             _settle(
                 eye, target_cam=requested_cam,
                 note=f"checkpoint reacquisition retreat {retry_index}",
@@ -11938,6 +15116,7 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     endpoint_samples, fresh_endpoint_samples,
                     ready_min, ready_max,
                     section_locked=selected_grasp_section_locked,
+                    allow_reselection=not registered_section_lock,
                 )
                 selected = consensus["selected"]
                 width_detail = consensus["width_detail"]
@@ -11963,6 +15142,8 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     "width_detail": width_detail,
                     "body_cam": body_cam_local,
                     "body_detail": body_detail,
+                    "locked_samples": endpoint_samples,
+                    "fresh_samples": fresh_endpoint_samples,
                     "identifier_cam": identifier_cam,
                     "identifier_detail": identifier_detail,
                     "identifier_samples": identifier_samples,
@@ -11994,6 +15175,64 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 f"ok={endpoint_measure_ok} detail={consensus_detail.get('reason')} "
                 f"ready_widths_mm={[round(v, 2) for v in ready_widths]} "
                 f"endpoint_widths_mm={consensus_detail.get('widths_mm')}")
+            # A converged registered object sometimes yields exactly two
+            # excellent selected-section frames out of five because the open
+            # fingers occlude the other reads. Do not lower the three-frame
+            # requirement. Collect one more bounded stationary batch and merge
+            # its independent observations through the unchanged consensus and
+            # jaw-slot gates before considering any geometric fallback.
+            marginal_locked_frames = len(
+                measurement.get("locked_samples") or []
+            )
+            if not endpoint_measure_ok \
+                    and hybrid_geometry_converged \
+                    and selected_grasp_section_locked \
+                    and marginal_locked_frames >= 2:
+                retry_measurement = measure_grasp_body(
+                    "registered_consensus_retry"
+                )
+                measurement = _merge_endpoint_measurement_batches(
+                    measurement, retry_measurement,
+                    ready_min, ready_max,
+                    section_locked=selected_grasp_section_locked,
+                    allow_reselection=not registered_section_lock,
+                )
+                selected_endpoint = measurement.get("selected")
+                consensus_detail = measurement.get("width_detail", {})
+                endpoint_measure_ok = bool(
+                    selected_endpoint is not None
+                    and measurement.get("body_cam") is not None
+                )
+                retry_slot_ok = False
+                retry_slot_detail: dict[str, Any] = {
+                    "reason": measurement.get("body_detail", {}).get("reason")
+                }
+                if endpoint_measure_ok:
+                    retry_slot_ok, retry_slot_detail = _jaw_slot_fit(
+                        measurement["body_cam"], requested_cam,
+                        selected_endpoint["plan"],
+                        selected_endpoint["geometry"], full_object_box_3d,
+                    )
+                measurement = {
+                    **measurement,
+                    "slot_ok": retry_slot_ok,
+                    "slot_detail": retry_slot_detail,
+                }
+                steps.append((
+                    "dynamic_endpoint_registered_consensus_retry",
+                    endpoint_measure_ok,
+                    str(consensus_detail.get("reason")),
+                ))
+                log(
+                    "stage=dynamic_endpoint_width_consensus "
+                    "phase=registered_consensus_retry "
+                    f"ok={endpoint_measure_ok} "
+                    f"detail={consensus_detail.get('reason')} "
+                    f"combined_locked_frames="
+                    f"{len(measurement.get('locked_samples') or [])} "
+                    f"endpoint_widths_mm="
+                    f"{consensus_detail.get('widths_mm')}"
+                )
             if not endpoint_measure_ok:
                 fallback = _ready_geometry_endpoint_fallback(
                     measurement, jaw_plan, plan_geometry, ready_max,
@@ -12015,14 +15254,14 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                     identifier_detail = measurement.get(
                         "identifier_detail", {}
                     )
-                    identifier_body_cam = None
-                    if identifier_cam is not None:
-                        identifier_body_cam = np.asarray(
-                            identifier_cam, dtype=float
-                        ) - np.asarray(feature_to_grasp_cam, dtype=float)
+                    identifier_body_cam, identifier_model_detail = \
+                        _registered_identifier_body_for_alignment(
+                            identifier_cam, identifier_detail,
+                            feature_to_grasp_cam,
+                        )
                     identifier_slot_ok = False
                     identifier_slot_detail: dict[str, Any] = {
-                        "reason": identifier_detail.get("reason")
+                        "reason": identifier_model_detail.get("reason")
                     }
                     if identifier_body_cam is not None:
                         identifier_slot_ok, identifier_slot_detail = \
@@ -12030,19 +15269,27 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                                 identifier_body_cam, requested_cam,
                                 jaw_plan, plan_geometry, full_object_box_3d,
                             )
+                    # Being outside the slot is the reason to invoke the
+                    # existing bounded open-jaw alignment loop below, not a
+                    # reason to make that loop unreachable.  A stable rigid
+                    # body estimate is sufficient for planning; closure still
+                    # requires ``body_slot_ok`` after remeasurement.
                     identifier_fallback_ok = bool(
-                        identifier_cam is not None and identifier_slot_ok
+                        identifier_body_cam is not None
                     )
                     steps.append((
                         "registered_geometry_identifier_alignment_fallback",
                         identifier_fallback_ok,
                         f"{identifier_detail.get('reason')}; "
+                        f"{identifier_model_detail.get('reason')}; "
                         f"{identifier_slot_detail.get('reason')}",
                     ))
                     log(
                         "stage=registered_geometry_identifier_alignment_fallback "
                         f"ok={identifier_fallback_ok} "
                         f"identity={identifier_detail.get('reason')} "
+                        f"model={identifier_model_detail.get('reason')} "
+                        f"slot_fit={identifier_slot_ok} "
                         f"slot={identifier_slot_detail.get('reason')}"
                     )
                     if not identifier_fallback_ok:
@@ -12051,8 +15298,8 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                             "ready-compatible multi-frame consensus: "
                             f"{consensus_detail.get('reason')}; width fallback "
                             f"refused: {fallback.get('reason')}; registered-model "
-                            "identifier alignment fallback refused: "
-                            f"{identifier_slot_detail.get('reason')}; refusing "
+                            "identifier/body propagation refused: "
+                            f"{identifier_model_detail.get('reason')}; refusing "
                             "to close"
                         )
                     identifier_sample = min(
@@ -13282,6 +16529,57 @@ def fixed_pick_and_place(object_name: str, *, dry: bool = False,
                 "stage=scene_collision_lifecycle phase=carry "
                 f"restored={scene_restored} detail={scene_restore_reason}"
             )
+            # Pick and carry have opposite payload requirements, and sharing one
+            # switch between them is why a held object sweeps into obstacles.
+            # During the grasp the payload box *must* be allowed to intersect
+            # the target — that intersection is the grasp. Once the object is
+            # held there is no such exemption: an unmodelled payload means the
+            # planner routes the empty gripper through free space while the
+            # object hanging beneath it clips whatever it passes over. Attach
+            # the measured (already conservative) box for the carry even when
+            # payload collision is disabled for the pick.
+            carry_payload_collision = os.getenv(
+                "REBOT_CARRY_PAYLOAD_COLLISION", "1"
+            ).strip().lower() not in {"0", "false", "no", "off"}
+            if scene_restored and carry_payload_collision \
+                    and not PAYLOAD_COLLISION_ENABLED \
+                    and isinstance(payload_box_context, dict):
+                try:
+                    carry_attach = A.update_collision_payload_box(
+                        np.asarray(
+                            payload_box_context["collision_size_m"], dtype=float
+                        ),
+                        np.asarray(
+                            payload_box_context["long_axis_ee"], dtype=float
+                        ),
+                        np.asarray(
+                            payload_box_context["center_offset_ee_m"],
+                            dtype=float,
+                        ),
+                        axes_ee=np.asarray(
+                            payload_box_context["full_axes_ee"], dtype=float
+                        ).T,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    carry_attach = A.MoveResult(
+                        False, f"carry payload attach error {exc}"
+                    )
+                steps.append((
+                    "attach_payload_collision_for_carry",
+                    bool(getattr(carry_attach, "ok", False)),
+                    str(getattr(carry_attach, "reason", "unavailable")),
+                ))
+                log(
+                    "stage=attach_payload_collision_for_carry "
+                    f"ok={getattr(carry_attach, 'ok', False)} "
+                    f"detail={getattr(carry_attach, 'reason', None)}"
+                )
+                if not bool(getattr(carry_attach, "ok", False)):
+                    A.clear_collision_scene()
+                    return recover(
+                        "measured carried-object collision envelope could not "
+                        "be attached; refusing an end-effector-only carry"
+                    )
             if not scene_restored:
                 # Do not attempt a blind carry. Clear the rejected map so the
                 # existing release/home recovery is not blocked by bad boxes.
@@ -13465,7 +16763,7 @@ def fixed_pick(object_name: str, *, dry: bool = False,
     )
 
 
-_SCENE_RELATIONS = {"left", "right", "front", "behind", "next_to"}
+_SCENE_RELATIONS = {"left", "right", "front", "behind", "next_to", "stack"}
 
 
 def _normalize_scene_relation(relation: str | None) -> str | None:
@@ -13475,6 +16773,8 @@ def _normalize_scene_relation(relation: str | None) -> str | None:
         "in_front_of": "front", "front_of": "front",
         "behind_of": "behind", "beside": "next_to", "near": "next_to",
         "next": "next_to", "somewhere": "free_space",
+        "on": "stack", "onto": "stack", "atop": "stack",
+        "on_top": "stack", "on_top_of": "stack", "stack_on": "stack",
         "somewhere_on_table": "free_space", "on_table": "free_space",
         "taught": "drop_zone", "bin": "drop_zone",
     }
@@ -13556,6 +16856,50 @@ def _voxel_payload_envelope(
     }
 
 
+def _payload_minimum_travel_height_m(
+    payload_envelope: dict[str, Any], start_z_m: float, release_z_m: float,
+) -> tuple[float | None, dict[str, Any]]:
+    """Require extra carry height from measured payload scale.
+
+    The OBB footprint handles observed XY collisions, but incomplete masks can
+    underestimate an overhanging end. Raising before XY by half the measured
+    longest extent gives a bounded, object-scaled reserve without altering the
+    pickup or release pose.
+    """
+    try:
+        size = np.asarray(payload_envelope["size_m"], dtype=float)
+        start_z = float(start_z_m)
+        release_z = float(release_z_m)
+        scale = float(os.getenv("REBOT_VOXEL_CARRY_EXTENT_LIFT_SCALE", "0.5"))
+        minimum_extra = float(os.getenv(
+            "REBOT_VOXEL_CARRY_MIN_EXTRA_LIFT_M", "0.025"
+        ))
+        maximum_extra = float(os.getenv(
+            "REBOT_VOXEL_CARRY_MAX_EXTRA_LIFT_M", "0.060"
+        ))
+    except (KeyError, TypeError, ValueError):
+        return None, {"reason": "payload carry-height inputs are invalid"}
+    if size.shape != (3,) or np.any(size <= 0.0) \
+            or not np.all(np.isfinite(size)):
+        return None, {"reason": "payload dimensions are invalid"}
+    scale = float(np.clip(scale, 0.25, 0.75))
+    minimum_extra = float(np.clip(minimum_extra, 0.015, 0.050))
+    maximum_extra = float(np.clip(maximum_extra, minimum_extra, 0.080))
+    longest = float(np.max(size))
+    extra = float(np.clip(scale * longest, minimum_extra, maximum_extra))
+    floor = max(start_z, release_z) + extra
+    return floor, {
+        "reason": (
+            f"payload-scaled carry floor adds {extra * 1000.0:.1f}mm above "
+            "the normal carry/release height before any XY motion"
+        ),
+        "longest_payload_extent_m": longest,
+        "extent_scale": scale,
+        "extra_lift_m": extra,
+        "minimum_travel_z_m": floor,
+    }
+
+
 def _scene_reference_point_consensus(
     points_camera_mm: list[np.ndarray], *, required: int,
     max_spread_mm: float,
@@ -13570,9 +16914,84 @@ def _scene_reference_point_consensus(
     )
 
 
+def _stack_reference_detection_quality(
+    detection: Any, frame: tuple[np.ndarray, np.ndarray, Any],
+) -> tuple[bool, str]:
+    """Reject broad/mixed semantic masks as exact stack destinations.
+
+    Side-relative placement can tolerate some reference-centroid error because
+    it deliberately adds lateral clearance.  ``stack`` cannot: its destination
+    is the reference centre itself.  A prompt mask spanning several nearby
+    objects would therefore turn a confident semantic label into a dangerous
+    exact XY target.  These bounds describe the observed mask and the robot's
+    small-tabletop-object operating envelope; they do not encode object names.
+    """
+    source = str(getattr(detection, "source", ""))
+    if source not in _SEMANTIC_IDENTITY_SOURCES:
+        return False, (
+            "exact stack reference requires a semantic instance mask; "
+            f"got {source or 'unknown'}"
+        )
+    try:
+        color = np.asarray(frame[0])
+        height, width = color.shape[:2]
+        x1, y1, x2, y2 = (
+            float(value) for value in detection.box
+        )
+        box_fraction = max(0.0, x2 - x1) * max(0.0, y2 - y1) / max(
+            1.0, float(width * height)
+        )
+        observed_extent_mm = max(
+            float(getattr(detection, "min_width_mm", 0.0) or 0.0),
+            float(getattr(detection, "max_width_mm", 0.0) or 0.0),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False, "exact stack reference geometry is malformed"
+    maximum_box_fraction = float(np.clip(float(os.getenv(
+        "REBOT_STACK_REFERENCE_MAX_IMAGE_FRACTION", "0.18"
+    )), 0.08, 0.30))
+    maximum_extent_mm = float(np.clip(float(os.getenv(
+        "REBOT_STACK_REFERENCE_MAX_EXTENT_MM", "180"
+    )), 100.0, 250.0))
+    if box_fraction > maximum_box_fraction:
+        return False, (
+            f"semantic reference box covers {100.0 * box_fraction:.1f}% of "
+            f"the image, beyond the {100.0 * maximum_box_fraction:.1f}% "
+            "single-object stack limit"
+        )
+    if not math.isfinite(observed_extent_mm) or observed_extent_mm <= 0.0:
+        return False, "exact stack reference has no metric mask extent"
+    if observed_extent_mm > maximum_extent_mm:
+        return False, (
+            f"semantic reference spans {observed_extent_mm:.1f}mm, beyond "
+            f"the {maximum_extent_mm:.1f}mm exact-stack instance limit"
+        )
+    info = getattr(detection, "info", {}) or {}
+    if info.get("depth_basis") == "semantic_seeded_rgbd_object":
+        area_ratio = float(info.get("completion_area_ratio", math.inf))
+        overlap = float(info.get("semantic_overlap_fraction", 0.0))
+        center_delta = float(info.get(
+            "semantic_to_object_center_delta_mm", math.inf
+        ))
+        maximum_ratio = float(np.clip(float(os.getenv(
+            "REBOT_STACK_REFERENCE_MAX_COMPLETION_RATIO", "3.0"
+        )), 1.5, 5.0))
+        if area_ratio > maximum_ratio or overlap < 0.50 \
+                or center_delta > 45.0:
+            return False, (
+                "semantic-to-RGBD reference completion is not compact enough "
+                f"for exact stacking (area_ratio={area_ratio:.2f}, "
+                f"overlap={overlap:.2f}, center_delta_mm={center_delta:.1f})"
+            )
+    return True, (
+        f"compact semantic stack reference: extent={observed_extent_mm:.1f}mm, "
+        f"image_fraction={100.0 * box_fraction:.1f}%"
+    )
+
+
 def _scene_reference_consensus(
     eye: WristEye, reference: str, log: Callable[[str], None], *,
-    force_look: bool = False,
+    force_look: bool = False, strict_stack: bool = False,
 ) -> tuple[Any | None, np.ndarray | None, dict[str, Any]]:
     samples: list[np.ndarray] = []
     sample_detections: list[Any] = []
@@ -13588,6 +17007,16 @@ def _scene_reference_consensus(
             reasons.append(why)
             continue
         partial = _detection_partial(det, frame)
+        if partial is None and strict_stack:
+            quality_ok, quality_reason = _stack_reference_detection_quality(
+                det, frame
+            )
+            if not quality_ok:
+                partial = quality_reason
+                log(
+                    "stage=stack_reference_quality accepted=false "
+                    f"frame={index + 1}/{count} detail={quality_reason}"
+                )
         if partial is not None:
             reasons.append(partial)
             continue
@@ -13618,6 +17047,11 @@ def _scene_reference_consensus(
                 reasons.append(why)
                 continue
             partial = _detection_partial(det, frame)
+            if partial is None and strict_stack:
+                quality_ok, quality_reason = \
+                    _stack_reference_detection_quality(det, frame)
+                if not quality_ok:
+                    partial = quality_reason
             if partial is not None:
                 reasons.append(partial)
                 continue
@@ -13648,6 +17082,9 @@ def _scene_reference_consensus(
             observation_consensus_frames=count,
             observation_consensus_max_spread_mm=SCENE_PLACE_MAX_SPREAD_MM,
             allow_edge_recenter=True,
+            detection_accept=(
+                _stack_reference_detection_quality if strict_stack else None
+            ),
         )
         if found is not None and found_frame is not None:
             latest, latest_frame = found, found_frame
@@ -13678,6 +17115,11 @@ def _scene_reference_consensus(
             # detector to rediscover the same view from scratch.
             if not look_consensus:
                 found_partial = _detection_partial(found, found_frame)
+                if found_partial is None and strict_stack:
+                    quality_ok, quality_reason = \
+                        _stack_reference_detection_quality(found, found_frame)
+                    if not quality_ok:
+                        found_partial = quality_reason
                 if found_partial is None:
                     samples.append(np.asarray(found.p_cam_mm, dtype=float))
                     sample_detections.append(found)
@@ -13705,6 +17147,11 @@ def _scene_reference_consensus(
                         f"detail={why}")
                     continue
                 partial = _detection_partial(det, frame)
+                if partial is None and strict_stack:
+                    quality_ok, quality_reason = \
+                        _stack_reference_detection_quality(det, frame)
+                    if not quality_ok:
+                        partial = quality_reason
                 if partial is not None:
                     reasons.append(partial)
                     log("stage=place_reference_sample_after_look "
@@ -13997,6 +17444,7 @@ def _log_voxel_route_view(
 def _voxel_release_waypoints(
     endpoint: np.ndarray, fixed_rpy: tuple[float, float, float],
     log: Callable[[str], None], context: dict[str, Any] | None = None,
+    *, destination_height_xy_m: Any | None = None,
 ) -> tuple[Any | None, np.ndarray, dict[str, Any], str]:
     """Propose a top-down free-cell carry route, then certify the full arm."""
     if _ACTIVE_SCENE_MAP is None:
@@ -14042,6 +17490,16 @@ def _voxel_release_waypoints(
         drop_clearance = max(
             base_drop_clearance, payload_down + drop_gap
         )
+        minimum_travel_z, carry_height_detail = \
+            _payload_minimum_travel_height_m(
+                payload_envelope, float(A.ee_pos()[2]), float(endpoint[2])
+            )
+        if minimum_travel_z is None:
+            detail = {
+                "reason": carry_height_detail.get("reason"),
+                "payload_envelope": payload_envelope,
+            }
+            return None, np.asarray(endpoint, dtype=float), detail, detail["reason"]
     else:
         # Scene-relative runs built by the current pick always have this box.
         # Refuse to silently regress to end-effector-only navigation.
@@ -14069,6 +17527,11 @@ def _voxel_release_waypoints(
             workspace_margin_m=APPROACH_WORKSPACE_MARGIN_M,
             ee_radius_m=route_radius,
             destination_radius_m=ee_radius,
+            minimum_travel_z_m=minimum_travel_z,
+            destination_height_xy_m=(
+                None if destination_height_xy_m is None
+                else np.asarray(destination_height_xy_m, dtype=float)
+            ),
             vertical_clearance_m=vertical_clearance,
             drop_clearance_m=drop_clearance,
             resolution_m=resolution,
@@ -14089,6 +17552,7 @@ def _voxel_release_waypoints(
             continue
         detail = dict(proposed.detail)
         detail["payload_envelope"] = payload_envelope
+        detail["payload_carry_height"] = carry_height_detail
         detail["payload_margin_m"] = round(payload_margin, 4)
         resolved_endpoint = np.asarray(
             proposed.release_endpoint_m, dtype=float
@@ -14104,6 +17568,8 @@ def _voxel_release_waypoints(
             f"start_z_m={detail['starting_carry_z_m']:.3f} "
             f"preferred_clear_z_m="
             f"{detail['preferred_payload_clear_z_m']:.3f} "
+            f"minimum_payload_travel_z_m="
+            f"{detail['minimum_payload_travel_z_m']:.3f} "
             f"rose_before_xy={str(detail['rose_before_xy']).lower()} "
             f"travel_z_m={detail['travel_z_m']:.3f} "
             f"destination_top_m={detail['destination_column_top_m']:.3f} "
@@ -14228,9 +17694,14 @@ def _plan_scene_relative_release(
     camera_mapping_override: np.ndarray | None = None,
     camera_mapping_detail: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray | None, list[tuple[float, float, float]] | None, dict[str, Any]]:
-    det, reference_cam, observation = _scene_reference_consensus(
-        eye, reference, log
-    )
+    if relation == "stack":
+        det, reference_cam, observation = _scene_reference_consensus(
+            eye, reference, log, strict_stack=True
+        )
+    else:
+        det, reference_cam, observation = _scene_reference_consensus(
+            eye, reference, log
+        )
     if det is None or reference_cam is None:
         return None, None, observation
     grasp_target = load_grasp_target()
@@ -14272,7 +17743,12 @@ def _plan_scene_relative_release(
     if reference_xy is None:
         return None, None, mapping_detail
 
-    if distance_m is None:
+    if relation == "stack":
+        offset = 0.0
+        distance_basis = (
+            "exact reference XY; lateral distance is ignored for stacking"
+        )
+    elif distance_m is None:
         ref_diameter_mm = max(
             float(det.min_width_mm or 0.0), float(det.max_width_mm or 0.0), 30.0
         )
@@ -14289,6 +17765,7 @@ def _plan_scene_relative_release(
         "right": np.array([0.0, -1.0]),
         "front": np.array([1.0, 0.0]),
         "behind": np.array([-1.0, 0.0]),
+        "stack": np.array([0.0, 0.0]),
     }
     names = [relation] if relation != "next_to" else [
         "left", "right", "front", "behind"
@@ -14302,11 +17779,12 @@ def _plan_scene_relative_release(
     # progressively farther placements on the same requested side; never cross
     # to another side and never exceed the existing 180 mm placement bound.
     clearance_offsets = [offset]
-    for extra in (0.020, 0.040, 0.060, 0.080):
-        candidate_offset = float(min(0.180, offset + extra))
-        if not any(abs(candidate_offset - value) < 1e-6
-                   for value in clearance_offsets):
-            clearance_offsets.append(candidate_offset)
+    if relation != "stack":
+        for extra in (0.020, 0.040, 0.060, 0.080):
+            candidate_offset = float(min(0.180, offset + extra))
+            if not any(abs(candidate_offset - value) < 1e-6
+                       for value in clearance_offsets):
+                clearance_offsets.append(candidate_offset)
 
     guarded_lo = np.array([
         A.X_MIN + APPROACH_WORKSPACE_MARGIN_M,
@@ -14333,9 +17811,16 @@ def _plan_scene_relative_release(
             f"mapped_xy={reference_xy.round(4).tolist()} "
             "action=safe_look_around_retry_before_pick"
         )
-        retry_det, retry_cam, retry_observation = _scene_reference_consensus(
-            eye, reference, log, force_look=True
-        )
+        if relation == "stack":
+            retry_det, retry_cam, retry_observation = \
+                _scene_reference_consensus(
+                    eye, reference, log, force_look=True, strict_stack=True
+                )
+        else:
+            retry_det, retry_cam, retry_observation = \
+                _scene_reference_consensus(
+                    eye, reference, log, force_look=True
+                )
         if retry_det is None or retry_cam is None:
             return None, None, {
                 **retry_observation,
@@ -14369,8 +17854,9 @@ def _plan_scene_relative_release(
 
     candidates: list[dict[str, Any]] = []
     valid: list[dict[str, Any]] = []
-    # Try the preferred distance first. Only expand when every requested side
-    # fails at that distance, and stop as soon as one complete route passes.
+    # Try the preferred distance first. Only side relations may expand when
+    # blocked. ``stack`` has exactly one zero-offset target and must fail closed
+    # rather than silently becoming a nearby placement.
     for clearance_offset in clearance_offsets:
         distance_candidates: list[dict[str, Any]] = []
         for name in names:
@@ -14500,6 +17986,39 @@ def _support_aware_release_pose(
         "desired_object_center_m": desired_center.round(5).tolist(),
         "payload_center_offset_base_m": center_offset_base.round(5).tolist(),
         "release_ee_m": endpoint.round(5).tolist(),
+    }
+
+
+def _payload_centered_release_xy(
+    desired_object_xy_m: Any,
+    context: dict[str, Any],
+    current_rpy: Any,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Return EE XY that puts the measured payload centre on desired XY."""
+    payload = context.get("payload_box")
+    if not isinstance(payload, dict):
+        return None, {"reason": "held-object payload geometry is unavailable"}
+    try:
+        desired = np.asarray(desired_object_xy_m, dtype=float)
+        center_offset_ee = np.asarray(
+            payload["center_offset_ee_m"], dtype=float
+        )
+        if desired.shape != (2,) or center_offset_ee.shape != (3,) \
+                or not np.all(np.isfinite(desired)) \
+                or not np.all(np.isfinite(center_offset_ee)):
+            raise ValueError("payload-centering arrays are invalid")
+        center_offset_base = (
+            _rpy_rotation_matrix(current_rpy) @ center_offset_ee
+        )
+        endpoint_xy = desired - center_offset_base[:2]
+    except (KeyError, TypeError, ValueError) as exc:
+        return None, {"reason": f"invalid payload centering geometry: {exc}"}
+    return endpoint_xy, {
+        "reason": "EE XY compensates the measured payload-centre offset",
+        "desired_object_center_xy_m": desired.round(5).tolist(),
+        "payload_center_offset_base_xy_m": \
+            center_offset_base[:2].round(5).tolist(),
+        "release_ee_xy_m": endpoint_xy.round(5).tolist(),
     }
 
 
@@ -14699,7 +18218,7 @@ def fixed_place(*, reference: str | None = None,
     if normalized_relation is None:
         return _result(False, f"unsupported placement relation: {relation!r}",
                        [("placement_description", False,
-                         "use left/right/front/behind/next_to/free_space/drop_zone")],
+                         "use left/right/front/behind/next_to/stack/free_space/drop_zone")],
                        object_held=_OBJECT_HELD, homed=False)
     if normalized_relation in _SCENE_RELATIONS and not reference:
         return _result(False, f"{normalized_relation} placement needs a reference object",
@@ -14865,6 +18384,43 @@ def fixed_place(*, reference: str | None = None,
         and _ACTIVE_SCENE_MAP is not None
         and os.getenv("REBOT_VOXEL_PLACE_NAV", "1") != "0"
     )
+    voxel_destination_height_xy: np.ndarray | None = None
+    if normalized_relation == "stack" and voxel_navigation:
+        # The semantic destination is the reference object's centre, while the
+        # route endpoint is the EE. Compensate the measured held-object offset
+        # so the payload—not merely the wrist—lands on the reference. Sample
+        # destination height at the reference itself so its occupied column
+        # determines the bounded drop height.
+        reference_xy_raw = placement_detail.get("reference_aligned_xy_m")
+        centered_xy, centering_detail = _payload_centered_release_xy(
+            reference_xy_raw, context, A.ee_rpy()
+        )
+        steps.append((
+            "stack_payload_centering", centered_xy is not None,
+            str(centering_detail.get("reason")),
+        ))
+        if centered_xy is None:
+            return recover(
+                "exact stack placement could not compensate the measured "
+                f"payload centre: {centering_detail.get('reason')}"
+            )
+        assert release_endpoint is not None
+        voxel_destination_height_xy = np.asarray(
+            reference_xy_raw, dtype=float
+        )
+        release_endpoint = np.asarray(release_endpoint, dtype=float).copy()
+        release_endpoint[:2] = centered_xy
+        placement_detail["stack_payload_centering"] = centering_detail
+        placement_detail["desired_object_center_xy_m"] = \
+            voxel_destination_height_xy.round(5).tolist()
+        placement_detail["release_endpoint_m"] = \
+            release_endpoint.round(4).tolist()
+        log(
+            "stage=stack_payload_centering ok=True "
+            f"object_xy={voxel_destination_height_xy.round(4).tolist()} "
+            f"ee_xy={centered_xy.round(4).tolist()} "
+            f"offset_xy={centering_detail.get('payload_center_offset_base_xy_m')}"
+        )
     if normalized_relation in _SCENE_RELATIONS and voxel_navigation:
         # The destination XY still comes from scene semantics. Its Z and the
         # entire carry path are derived from measured occupancy after pickup.
@@ -14948,7 +18504,8 @@ def fixed_place(*, reference: str | None = None,
         if voxel_navigation:
             drop_waypoints, release_endpoint, voxel_detail, drop_plan_reason = \
                 _voxel_release_waypoints(
-                    release_endpoint, drop_fixed_rpy, log, context
+                    release_endpoint, drop_fixed_rpy, log, context,
+                    destination_height_xy_m=voxel_destination_height_xy,
                 )
             placement_detail["voxel_navigation"] = voxel_detail
             placement_detail["release_endpoint_m"] = \
@@ -16336,7 +19893,7 @@ def main() -> None:
                    help="--fixed-pick-place: visible landmark for relative placing")
     p.add_argument("--place-relation", default="drop_zone",
                    choices=("drop_zone", "free_space", "left", "right",
-                            "front", "behind", "next_to"),
+                            "front", "behind", "next_to", "stack"),
                    help="--fixed-pick-place destination relation in robot/table frame")
     p.add_argument("--place-distance-m", type=float, default=None,
                    help="optional landmark separation, clamped to 0.06-0.18m")

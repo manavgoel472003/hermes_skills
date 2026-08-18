@@ -294,6 +294,10 @@ class GeometryGraspPlannerTest(TestCase):
         self.assertTrue(plan.ok, plan.reason)
         self.assertAlmostEqual(plan.yaw_correction_deg, -20.0)
         self.assertLess(plan.grasp_detection.min_width_mm, 50.0)
+        self.assertGreaterEqual(
+            plan.grasp_detection.max_width_mm,
+            plan.grasp_detection.min_width_mm,
+        )
         self.assertIn("aperture-derived residual", plan.reason)
 
     def test_aperture_derived_residual_still_refuses_projected_span(self):
@@ -337,6 +341,55 @@ class GeometryGraspPlannerTest(TestCase):
         self.assertEqual(
             plan.grasp_detection.info["jaw_sizing_basis"],
             "multiview metric 3D horizontal axes",
+        )
+
+    def test_metric_width_keeps_the_ranked_subsection_station(self):
+        """A metric OBB fixes the jaw width; it must not move the grasp station.
+
+        The metric box says how wide the object is, not where along it to grasp.
+        Discarding the ranked cross-section here left the grasp point on the
+        whole-mask centroid, which on a long object is a different place.
+        """
+        candidates = [
+            {"uv": [120.0, 150.0], "width_mm": 44.0, "axis_fraction": -0.32,
+             "end_clearance_fraction": 0.68, "score": 1.2},
+            {"uv": [150.0, 150.0], "width_mm": 41.0, "axis_fraction": 0.0,
+             "end_clearance_fraction": 1.0, "score": 2.0},
+        ]
+        obj = detection(source="sam3", width=43, length=90,
+                        area=4000, axis=62.0, uv=(178.0, 150.0))
+        envelope = detection(source="depth:object", width=43, length=90,
+                             area=7000, axis=62.0, uv=(178.0, 150.0))
+        envelope.info.update({
+            "cross_section_candidates": candidates,
+            "local_grasp_width_mm": 41.0,
+        })
+        plan = gg.plan_grasp_geometry(
+            self.color, self.depth, self.intr, obj,
+            current_rpy=(0.0, 0.0, 0.0), max_aperture_mm=50.0,
+            jaw_long_axis_camera_deg=-90.0,
+            max_yaw_delta_deg=20.0,
+            yaw_delta_bounds_deg=(-20.0, 20.0),
+            yaw_measurement_slop_deg=1.5,
+            max_residual_yaw_deg=6.0,
+            allow_aperture_derived_residual=True,
+            semantic_envelope=envelope,
+            metric_jaw_width_mm=22.0,
+            metric_major_mm=74.0,
+        )
+
+        self.assertTrue(plan.ok, plan.reason)
+        # Position comes from the highest-scoring station, not the centroid.
+        self.assertEqual(
+            plan.grasp_detection.info["selected_candidate"]["axis_fraction"],
+            0.0,
+        )
+        self.assertAlmostEqual(plan.grasp_detection.uv[0], 150.0, places=3)
+        # Width still derives from the 22mm metric box rather than the 41mm
+        # perspective-stretched 2D cross-section, after residual-yaw projection.
+        self.assertLess(float(plan.grasp_detection.min_width_mm), 41.0)
+        self.assertIn(
+            "metric", plan.grasp_detection.info["jaw_sizing_basis"]
         )
 
     def test_metric_axes_apply_before_oversized_feature_rejection(self):

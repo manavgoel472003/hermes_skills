@@ -591,6 +591,55 @@ class SceneCollisionMapTest(unittest.TestCase):
         self.assertFalse(reports[1]["accepted"], reports[1])
         self.assertTrue(reports[1]["valid_for_fusion"], reports[1])
 
+    def test_registration_adaptively_recovers_strong_boundary_match(self):
+        keys = np.array([
+            [x, y, z]
+            for x in range(50, 70)
+            for y in range(10)
+            for z in range(5, 10)
+        ], dtype=float)
+        anchor = keys * 0.004 + 0.0001
+        ghosted = anchor + np.array([0.016, 0.0, 0.0])
+        colors = np.zeros((len(anchor), 3), dtype=np.uint8)
+
+        registered, reports = register_dense_view_clouds(
+            [(anchor, colors), (ghosted, colors.copy())],
+            table_z_m=0.0, voxel_m=0.004, max_translation_m=0.012,
+            adaptive_max_translation_m=0.020,
+        )
+
+        self.assertTrue(reports[1]["adaptive_search"], reports[1])
+        self.assertTrue(reports[1]["accepted"], reports[1])
+        self.assertFalse(reports[1]["pinned_to_bound"], reports[1])
+        self.assertEqual(reports[1]["search_bound_mm"], 20.0)
+        self.assertTrue(np.allclose(
+            reports[1]["translation_mm"], [-16.0, 0.0, 0.0]
+        ))
+        self.assertTrue(np.allclose(registered[1][0], anchor, atol=1e-9))
+
+    def test_registration_rejects_match_still_pinned_at_adaptive_bound(self):
+        keys = np.array([
+            [x, y, z]
+            for x in range(50, 58)
+            for y in range(10)
+            for z in range(5, 10)
+        ], dtype=float)
+        anchor = keys * 0.004 + 0.0001
+        ghosted = anchor + np.array([0.028, 0.0, 0.0])
+        colors = np.zeros((len(anchor), 3), dtype=np.uint8)
+
+        registered, reports = register_dense_view_clouds(
+            [(anchor, colors), (ghosted, colors.copy())],
+            table_z_m=0.0, voxel_m=0.004, max_translation_m=0.012,
+            adaptive_max_translation_m=0.020,
+        )
+
+        self.assertTrue(reports[1]["adaptive_search"], reports[1])
+        self.assertFalse(reports[1]["accepted"], reports[1])
+        self.assertFalse(reports[1]["valid_for_fusion"], reports[1])
+        self.assertTrue(reports[1]["pinned_to_bound"], reports[1])
+        self.assertTrue(np.allclose(registered[1][0], ghosted))
+
     def test_registration_excludes_unrepairable_rotated_view_from_fusion(self):
         # A distinctive L-shaped scene has essentially no voxel agreement after
         # a wrist-angle error; bounded translation cannot repair that rotation.

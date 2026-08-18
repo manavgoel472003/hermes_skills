@@ -30,6 +30,14 @@ def _plan(scene: SceneMap, start=(0.25, 0.0, 0.15), goal=(0.45, 0.0)):
 
 
 class VoxelNavigationTest(TestCase):
+    def test_payload_scale_sets_bounded_minimum_carry_height(self):
+        floor, detail = ws._payload_minimum_travel_height_m(
+            {"size_m": [0.082, 0.045, 0.021]}, 0.20, 0.20,
+        )
+        self.assertIsNotNone(floor, detail)
+        self.assertAlmostEqual(floor, 0.241, places=4)
+        self.assertAlmostEqual(detail["extra_lift_m"], 0.041, places=4)
+
     def test_measured_payload_extends_required_clearance_below_tool(self):
         context = {
             "payload_box": {
@@ -75,6 +83,28 @@ class VoxelNavigationTest(TestCase):
             route.detail["destination_column_top_m"], 0.12, places=3
         )
 
+    def test_stack_samples_height_at_payload_center_not_ee_xy(self):
+        reference = ObstacleBox((0.45, 0.0, 0.07), (0.02, 0.02, 0.10))
+        route, detail = plan_topdown_route(
+            _scene(reference), np.asarray((0.25, 0.0, 0.20)),
+            np.asarray((0.40, 0.0)),
+            workspace_lo_m=(0.15, -0.20, 0.0),
+            workspace_hi_m=(0.50, 0.20, 0.30),
+            workspace_margin_m=0.01, ee_radius_m=0.005,
+            destination_radius_m=0.005,
+            destination_height_xy_m=np.asarray((0.45, 0.0)),
+            vertical_clearance_m=0.02, drop_clearance_m=0.03,
+            resolution_m=0.01,
+        )
+
+        self.assertIsNotNone(route, detail)
+        assert route is not None
+        self.assertAlmostEqual(route.release_endpoint_m[0], 0.40, places=3)
+        self.assertAlmostEqual(route.release_endpoint_m[2], 0.15, places=3)
+        self.assertEqual(
+            route.detail["destination_height_xy_m"], [0.45, 0.0]
+        )
+
     def test_long_payload_clearance_raises_release_above_destination(self):
         destination = ObstacleBox(
             (0.45, 0.0, 0.111), (0.04, 0.04, 0.100)
@@ -118,6 +148,41 @@ class VoxelNavigationTest(TestCase):
         self.assertEqual(route.anchors_m[0][:2], (0.25, 0.0))
         self.assertAlmostEqual(route.anchors_m[0][2], 0.23, places=3)
         self.assertGreater(route.release_endpoint_m[2], 0.20)
+
+    def test_payload_travel_floor_forces_lift_before_any_xy_motion(self):
+        route, detail = plan_topdown_route(
+            _scene(), np.asarray((0.25, 0.0, 0.15)),
+            np.asarray((0.45, 0.0)),
+            workspace_lo_m=(0.15, -0.20, 0.0),
+            workspace_hi_m=(0.50, 0.20, 0.30),
+            workspace_margin_m=0.01, ee_radius_m=0.02,
+            minimum_travel_z_m=0.23,
+            vertical_clearance_m=0.02, drop_clearance_m=0.03,
+            resolution_m=0.01,
+        )
+        self.assertIsNotNone(route, detail)
+        assert route is not None
+        self.assertEqual(route.anchors_m[0][:2], (0.25, 0.0))
+        self.assertAlmostEqual(route.anchors_m[0][2], 0.23, places=3)
+        self.assertTrue(route.detail["rose_before_xy"])
+        self.assertTrue(all(
+            attempt["travel_z_m"] >= 0.23
+            for attempt in route.detail["attempted_layers"]
+        ))
+
+    def test_payload_travel_floor_above_workspace_is_refused(self):
+        route, detail = plan_topdown_route(
+            _scene(), np.asarray((0.25, 0.0, 0.15)),
+            np.asarray((0.45, 0.0)),
+            workspace_lo_m=(0.15, -0.20, 0.0),
+            workspace_hi_m=(0.50, 0.20, 0.30),
+            workspace_margin_m=0.01, ee_radius_m=0.02,
+            minimum_travel_z_m=0.31,
+            vertical_clearance_m=0.02, drop_clearance_m=0.03,
+            resolution_m=0.01,
+        )
+        self.assertIsNone(route)
+        self.assertIn("exceeds", detail["reason"])
 
     def test_tall_column_still_causes_xy_detour_at_preferred_height(self):
         tall = ObstacleBox(

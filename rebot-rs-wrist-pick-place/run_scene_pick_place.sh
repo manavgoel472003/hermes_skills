@@ -8,7 +8,7 @@ if [[ "$mode" != "--dry" && "$mode" != "--run" ]]; then
 fi
 if [[ $# -lt 4 || $# -gt 5 ]]; then
   echo 'usage: ./run_scene_pick_place.sh [--dry|--run] "pick object" RELATION "reference object" [distance_m]' >&2
-  echo 'relations: left right front behind next_to' >&2
+  echo 'relations: left right front behind next_to stack' >&2
   exit 2
 fi
 
@@ -30,16 +30,24 @@ export REBOT_SCENE_COLLISION=1
 # multiple bounded wrist views. The two paths are deliberately explicit: a
 # hybrid reconstruction failure stops safely and never changes legacy behavior.
 export REBOT_OBJECT_GEOMETRY_MODE="${REBOT_OBJECT_GEOMETRY_MODE:-legacy}"
-# For now, route against the measured scene using the URDF arm and gripper only.
-# Alternative direct/RRT/Cartesian route search remains enabled.  The measured
-# object box is still retained for support-plane/release-height planning, but it
-# is not attached as a collision body until payload fusion is reliable enough.
+# Keep the grasp phase free of an attached collision body because the measured
+# payload necessarily overlaps the selected pick target while the jaws close.
+# The separately configured carry phase below attaches that same measured OBB
+# after the target-excluded scene map is restored.
 export REBOT_PAYLOAD_COLLISION="${REBOT_PAYLOAD_COLLISION:-0}"
+# Pick-target contact is exempted above, but once the object has been lifted its
+# measured OBB must participate in full-arm collision validation. A failed
+# attachment is now fatal rather than silently falling back to an empty gripper.
+export REBOT_CARRY_PAYLOAD_COLLISION="${REBOT_CARRY_PAYLOAD_COLLISION:-1}"
 export REBOT_SCENE_COLLISION_VOXEL_M="${REBOT_SCENE_COLLISION_VOXEL_M:-0.020}"
 # Preserve 3 mm of uncertainty around each occupied column. With the 20 mm
 # coarse voxel this yields a 26 mm protected footprint. Link geometry, the
 # measured table, and URDF self-collision checks remain unchanged.
 export REBOT_SCENE_COLLISION_INFLATION_M="${REBOT_SCENE_COLLISION_INFLATION_M:-0.003}"
+# Keep uncertainty local to the moving payload rather than making every scene
+# obstacle look larger. This protects against a few millimetres of RGB-D/FK
+# registration error when a carried object passes a mapped obstacle.
+export REBOT_VOXEL_PAYLOAD_MARGIN_M="${REBOT_VOXEL_PAYLOAD_MARGIN_M:-0.010}"
 export REBOT_SCENE_COLLISION_STRIDE_PX="${REBOT_SCENE_COLLISION_STRIDE_PX:-4}"
 # Fuse a short stationary RGB-D burst. A column must appear in a strict majority
 # of the frames, so one bad depth sample cannot become a permanent obstacle.

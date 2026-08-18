@@ -59,6 +59,41 @@ class WristWorkflowTest(TestCase):
             gate.anchor_base_m, [0.40, 0.10, 0.11]
         ))
 
+    def test_verified_metric_identity_anchor_cannot_drift_at_checkpoint(self):
+        messages = []
+        verified_center = np.array([0.4063, -0.0614, 0.0562])
+        gate = ws._HybridTargetIdentity(
+            description="red marker",
+            tool_camera_mm=np.zeros(3), log=messages.append,
+            anchor_base_m=verified_center.copy(),
+            semantic_points_base_m=[verified_center.copy()],
+            anchor_kind="verified_metric_obb_center",
+        )
+        frame = (np.zeros((100, 100, 3), dtype=np.uint8),
+                 np.ones((100, 100), dtype=np.float32),
+                 (100.0, 100.0, 50.0, 50.0))
+        # These represent accepted-but-contaminated close semantic centroids.
+        # They remain inside the 75 mm identity cluster but must not relocate
+        # the multi-view metric centre.
+        detections = [
+            SimpleNamespace(source="sam3", p_cam_mm=(0.0, 0.0, 100.0)),
+            SimpleNamespace(source="sam3", p_cam_mm=(0.0, 0.0, 100.0)),
+        ]
+        shifted = [
+            verified_center + np.array([0.060, 0.0, 0.0]),
+            verified_center + np.array([0.055, 0.005, 0.0]),
+        ]
+        with patch.object(gate, "_point_base", side_effect=[
+            (shifted[0], "mapped"), (shifted[1], "mapped")
+        ]):
+            first, _ = gate(detections[0], frame)
+            second, _ = gate(detections[1], frame)
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertTrue(np.allclose(gate.anchor_base_m, verified_center))
+        self.assertEqual(len(gate.semantic_points_base_m), 1)
+
     def test_environment_route_collision_signature_ignores_waypoint_density(self):
         first = (
             "Cartesian path collision at segment 19, sample 1/1: "
@@ -315,21 +350,22 @@ class WristWorkflowTest(TestCase):
         messages = []
         gate = ws._HybridTargetIdentity(
             description="red marker",
-            tool_camera_mm=np.zeros(3),
+            tool_camera_mm=np.array([0.0, 0.0, 300.0]),
             log=messages.append,
         )
         color_near = SimpleNamespace(
-            source="color:red", p_cam_mm=(10.0, 0.0, 205.0)
+            source="color:red", p_cam_mm=(-190.0, 0.0, 205.0)
         )
         semantic = SimpleNamespace(
-            source="sam3", p_cam_mm=(0.0, 0.0, 200.0)
+            source="sam3", p_cam_mm=(-200.0, 0.0, 200.0),
+            z_mm=200.0, box=(20, 20, 40, 40), info={}
         )
         color_far = SimpleNamespace(
-            source="color:red", p_cam_mm=(0.0, 0.0, 520.0)
+            source="color:red", p_cam_mm=(-200.0, 0.0, 520.0)
         )
-        frame = (np.zeros((2, 2, 3), dtype=np.uint8),
-                 np.ones((2, 2), dtype=np.float32),
-                 (100.0, 100.0, 1.0, 1.0))
+        frame = (np.zeros((100, 100, 3), dtype=np.uint8),
+                 np.ones((100, 100), dtype=np.float32),
+                 (100.0, 100.0, 50.0, 50.0))
         with (
             patch.dict(os.environ, {
                 "REBOT_HYBRID_TARGET_CLUSTER_RADIUS_M": "0.075"
@@ -359,6 +395,108 @@ class WristWorkflowTest(TestCase):
 
         self.assertEqual(gate.accepted, 2)
         self.assertEqual(gate.rejected, 2)
+
+    def test_hybrid_target_identity_defers_clipped_seed_then_anchors_valid_view(self):
+        gate = ws._HybridTargetIdentity(
+            description="purple marker",
+            tool_camera_mm=np.zeros(3),
+            log=lambda _message: None,
+        )
+        clipped = SimpleNamespace(
+            source="sam3", p_cam_mm=(0.0, 0.0, 240.0),
+            z_mm=240.0, box=(20, 20, 60, 99), info={},
+        )
+        complete = SimpleNamespace(
+            source="sam3", p_cam_mm=(0.0, 0.0, 240.0),
+            z_mm=240.0, box=(20, 20, 60, 70), info={},
+        )
+        frame = (np.zeros((100, 100, 3), dtype=np.uint8),
+                 np.ones((100, 100), dtype=np.float32),
+                 (100.0, 100.0, 50.0, 50.0))
+        with (
+            patch.object(
+                gate, "_point_base",
+                side_effect=[
+                    (np.array([0.53, 0.21, 0.03]), "mapped"),
+                    (np.array([0.44, 0.05, 0.03]), "mapped"),
+                ],
+            ),
+            patch.object(
+                ws, "load_safety_calibration",
+                return_value={"table_z_m": 0.012},
+            ),
+        ):
+            accepted, rejected_detail = gate(clipped, frame)
+            self.assertFalse(accepted)
+            self.assertTrue(rejected_detail["anchor_deferred"])
+            self.assertIn("clipped", rejected_detail["reason"])
+            self.assertIsNone(gate.anchor_base_m)
+
+            accepted, accepted_detail = gate(complete, frame)
+
+        self.assertTrue(accepted, accepted_detail)
+        self.assertEqual(gate.anchor_kind, "semantic")
+        self.assertTrue(np.allclose(gate.anchor_base_m, [0.44, 0.05, 0.03]))
+
+    def test_hybrid_target_identity_defers_seed_below_calibrated_table(self):
+        gate = ws._HybridTargetIdentity(
+            description="purple marker",
+            tool_camera_mm=np.zeros(3),
+            log=lambda _message: None,
+        )
+        detection = SimpleNamespace(
+            source="sam3", p_cam_mm=(0.0, 0.0, 240.0),
+            z_mm=240.0, box=(20, 20, 60, 70), info={},
+        )
+        frame = (np.zeros((100, 100, 3), dtype=np.uint8),
+                 np.ones((100, 100), dtype=np.float32),
+                 (100.0, 100.0, 50.0, 50.0))
+        with (
+            patch.object(
+                gate, "_point_base",
+                return_value=(np.array([0.33, 0.11, -0.001]), "mapped"),
+            ),
+            patch.object(
+                ws, "load_safety_calibration",
+                return_value={"table_z_m": 0.012},
+            ),
+        ):
+            accepted, detail = gate(detection, frame)
+
+        self.assertFalse(accepted)
+        self.assertTrue(detail["anchor_deferred"])
+        self.assertIn("below calibrated table", detail["reason"])
+        self.assertIsNone(gate.anchor_base_m)
+
+    def test_hybrid_target_identity_defers_seed_outside_arm_workspace(self):
+        gate = ws._HybridTargetIdentity(
+            description="red marker",
+            tool_camera_mm=np.zeros(3),
+            log=lambda _message: None,
+        )
+        detection = SimpleNamespace(
+            source="sam3", p_cam_mm=(0.0, 0.0, 568.0),
+            z_mm=568.0, box=(20, 20, 60, 70), info={},
+        )
+        frame = (np.zeros((100, 100, 3), dtype=np.uint8),
+                 np.ones((100, 100), dtype=np.float32),
+                 (100.0, 100.0, 50.0, 50.0))
+        with (
+            patch.object(
+                gate, "_point_base",
+                return_value=(np.array([0.752, -0.3872, 0.0204]), "mapped"),
+            ),
+            patch.object(
+                ws, "load_safety_calibration",
+                return_value={"table_z_m": 0.012},
+            ),
+        ):
+            accepted, detail = gate(detection, frame)
+
+        self.assertFalse(accepted)
+        self.assertTrue(detail["anchor_deferred"])
+        self.assertIn("outside the reachable workspace", detail["reason"])
+        self.assertIsNone(gate.anchor_base_m)
 
     def test_hybrid_target_identity_can_anchor_stable_rgbd_colored_object(self):
         gate = ws._HybridTargetIdentity(
@@ -523,6 +661,80 @@ class WristWorkflowTest(TestCase):
         self.assertAlmostEqual(detail["observed_width_mm"], 12.0)
         self.assertAlmostEqual(detail["conservative_width_mm"], 18.0)
 
+    def test_3d_axis_refinement_selects_bounded_aligned_yaw(self):
+        box = {
+            "axes_base": np.eye(3).tolist(),
+            "observed_size_m": [0.020, 0.090, 0.030],
+            "conservative_size_m": [0.026, 0.096, 0.036],
+        }
+
+        def mapping_for_rpy(rpy, **_kwargs):
+            marker = np.eye(3) * 1000.0
+            marker[0, 0] = np.degrees(rpy[2])
+            return marker, {"reason": "bounded rigid camera mapping"}
+
+        def alignment_at(mapping_box, mapping):
+            self.assertIs(mapping_box, box)
+            yaw_deg = float(mapping[0, 0])
+            if abs(yaw_deg - 6.0) > 0.1:
+                return {"ok": False, "reason": "axis remains oblique"}
+            return {
+                "ok": True,
+                "observed_width_mm": 20.0,
+                "conservative_width_mm": 26.0,
+                "image_alignment_error_deg": 0.2,
+                "reason": "measured narrow axis aligned",
+            }
+
+        with (
+            patch.dict(os.environ, {
+                "REBOT_3D_AXIS_REFINE_STEP_DEG": "1",
+                "REBOT_3D_AXIS_REFINE_MAX_YAW_DEG": "10",
+            }),
+            patch.object(ws, "load_saved_camera_jacobian",
+                         side_effect=mapping_for_rpy),
+            patch.object(ws, "_aligned_3d_jaw_width",
+                         side_effect=alignment_at),
+        ):
+            result = ws._find_3d_axis_yaw_refinement(
+                box, (0.0, 0.0, 0.0), 50.0
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertAlmostEqual(result["offset_deg"], 6.0)
+        self.assertAlmostEqual(np.degrees(result["target_rpy"][2]), 6.0)
+
+    def test_3d_axis_refinement_never_relaxes_jaw_aperture(self):
+        box = {
+            "axes_base": np.eye(3).tolist(),
+            "observed_size_m": [0.044, 0.090, 0.030],
+            "conservative_size_m": [0.052, 0.096, 0.036],
+        }
+        aligned_but_too_wide = {
+            "ok": True,
+            "observed_width_mm": 44.0,
+            "conservative_width_mm": 52.0,
+            "image_alignment_error_deg": 0.0,
+            "reason": "aligned but too wide",
+        }
+        with (
+            patch.dict(os.environ, {
+                "REBOT_3D_AXIS_REFINE_STEP_DEG": "2",
+                "REBOT_3D_AXIS_REFINE_MAX_YAW_DEG": "6",
+            }),
+            patch.object(ws, "load_saved_camera_jacobian", return_value=(
+                np.eye(3) * 1000.0, {"reason": "mapping"}
+            )),
+            patch.object(ws, "_aligned_3d_jaw_width",
+                         return_value=aligned_but_too_wide),
+        ):
+            result = ws._find_3d_axis_yaw_refinement(
+                box, (0.0, 0.0, 0.0), 50.0
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("50.0mm aperture", result["reason"])
+
     def test_locked_identifier_recovers_body_mask_jitter_without_relaxing_slot(self):
         geometry = SimpleNamespace(grasp_detection=SimpleNamespace(
             p_cam_mm=np.array([3.9, 31.7, 65.0]),
@@ -610,6 +822,84 @@ class WristWorkflowTest(TestCase):
         self.assertEqual(detail["axis_index"], 0)
         self.assertAlmostEqual(detail["optical_tilt_deg"], 16.5, places=1)
         self.assertGreater(detail["projected_resolved_mm"], 19.0)
+
+    def test_elongated_object_can_enter_by_stable_local_subsection(self):
+        geometry = SimpleNamespace(grasp_detection=object())
+        jaw_plan = {"ok": True, "preopen_mm": 50.0}
+        with patch.object(
+            ws, "_validate_object_gripper_fit",
+            return_value=(True, {"reason": "local section fits"}),
+        ):
+            safe, detail = ws._long_object_subsection_entry_safe(
+                geometry, jaw_plan,
+                metric_width_mm=25.9, metric_major_mm=42.4,
+            )
+
+        self.assertTrue(safe, detail)
+        self.assertGreater(detail["aspect_ratio"], 1.5)
+        self.assertIn("continue beyond the fingers", detail["reason"])
+
+    def test_broad_object_cannot_use_subsection_entry_exception(self):
+        geometry = SimpleNamespace(grasp_detection=object())
+        jaw_plan = {"ok": True, "preopen_mm": 50.0}
+        with patch.object(
+            ws, "_validate_object_gripper_fit",
+            return_value=(True, {"reason": "local section fits"}),
+        ) as fit:
+            safe, detail = ws._long_object_subsection_entry_safe(
+                geometry, jaw_plan,
+                metric_width_mm=35.0, metric_major_mm=42.0,
+            )
+
+        self.assertFalse(safe)
+        self.assertIn("aspect ratio", detail["reason"])
+        fit.assert_not_called()
+
+    def test_projected_span_accepts_submillimetre_uncertainty_boundary(self):
+        detail = {
+            "ok": True,
+            "observed_width_mm": 41.93,
+            "conservative_width_mm": 50.24,
+        }
+        with (
+            patch.object(ws, "GRASP_MIN_OPEN_CLEARANCE_MM", 8.0),
+            patch.object(ws, "GRASP_OPEN_CLEARANCE_BOUNDARY_SLOP_MM", 0.75),
+        ):
+            safe, gate = ws._projected_3d_span_fits_aperture(detail, 50.0)
+
+        self.assertTrue(safe, gate)
+        self.assertAlmostEqual(gate["measured_required_open_mm"], 49.18)
+        self.assertAlmostEqual(gate["conservative_excess_mm"], 0.24)
+
+    def test_projected_span_refuses_real_aperture_overrun(self):
+        detail = {
+            "ok": True,
+            "observed_width_mm": 42.8,
+            "conservative_width_mm": 51.0,
+        }
+        with (
+            patch.object(ws, "GRASP_MIN_OPEN_CLEARANCE_MM", 8.0),
+            patch.object(ws, "GRASP_OPEN_CLEARANCE_BOUNDARY_SLOP_MM", 0.75),
+        ):
+            safe, gate = ws._projected_3d_span_fits_aperture(detail, 50.0)
+
+        self.assertFalse(safe, gate)
+        self.assertGreater(gate["measured_required_open_mm"], 50.0)
+        self.assertGreater(gate["conservative_excess_mm"], 0.75)
+
+    def test_projected_span_never_expands_hard_aperture(self):
+        detail = {
+            "ok": True,
+            "observed_width_mm": 50.1,
+            "conservative_width_mm": 50.2,
+        }
+        with (
+            patch.object(ws, "GRASP_MIN_OPEN_CLEARANCE_MM", 0.0),
+            patch.object(ws, "GRASP_OPEN_CLEARANCE_BOUNDARY_SLOP_MM", 0.75),
+        ):
+            safe, gate = ws._projected_3d_span_fits_aperture(detail, 50.0)
+
+        self.assertFalse(safe, gate)
 
     def test_metric_object_box_projects_to_twelve_image_edges(self):
         box = {
@@ -1350,6 +1640,27 @@ class WristWorkflowTest(TestCase):
         self.assertFalse(ok)
         self.assertIn("including clearance", detail["reason"])
 
+    def test_object_fit_boundary_allows_logged_point_six_mm_only(self):
+        logged, logged_jaw = self._elongated_fit_fixture(width_mm=42.6)
+        real_miss, miss_jaw = self._elongated_fit_fixture(width_mm=43.0)
+        with (
+            patch.object(ws, "GRASP_MIN_OPEN_CLEARANCE_MM", 8.0),
+            patch.object(
+                ws, "GRASP_OPEN_CLEARANCE_BOUNDARY_SLOP_MM", 0.75
+            ),
+        ):
+            logged_ok, detail = ws._validate_object_gripper_fit(
+                logged, logged_jaw
+            )
+            miss_ok, miss_detail = ws._validate_object_gripper_fit(
+                real_miss, miss_jaw
+            )
+
+        self.assertTrue(logged_ok, detail)
+        self.assertFalse(miss_ok, miss_detail)
+        self.assertEqual(detail["effective_clearance_mm"], 7.25)
+        self.assertEqual(detail["clearance_boundary_slop_mm"], 0.75)
+
     def test_object_fit_rejects_grasp_too_near_long_object_end(self):
         geometry, jaw_plan = self._elongated_fit_fixture(end_fraction=0.20)
         with patch.object(ws, "GRASP_MIN_END_CLEARANCE_MM", 12.0):
@@ -1391,7 +1702,7 @@ class WristWorkflowTest(TestCase):
             detail["major_basis"], "registered_multiview_metric_box"
         )
 
-    def test_axis_aware_slot_accepts_longitudinal_protrusion_not_bad_width(self):
+    def test_axis_aware_slot_allows_object_overhang_but_centres_subsection(self):
         geometry, jaw_plan = self._elongated_fit_fixture()
         expected = np.array([0.0, 0.0, 0.0])
         with (
@@ -1401,18 +1712,88 @@ class WristWorkflowTest(TestCase):
             patch.object(ws, "DYNAMIC_SLOT_TOL_MM", 6.0),
         ):
             fits, detail = ws._jaw_slot_fit(
-                np.array([-5.66, 14.01, 4.7]), expected,
+                np.array([-5.66, 5.5, 4.7]), expected,
                 jaw_plan, geometry,
             )
             misses, miss_detail = ws._jaw_slot_fit(
-                np.array([-12.0, 14.01, 4.7]), expected,
+                np.array([-5.66, 10.5, 4.7]), expected,
                 jaw_plan, geometry,
             )
 
         self.assertTrue(fits, detail)
         self.assertFalse(misses, miss_detail)
-        self.assertGreater(detail["along_error_mm"], 8.0)
+        self.assertGreater(
+            detail["subsection_capture"]["major_mm"],
+            jaw_plan["max_aperture_mm"],
+        )
+        self.assertTrue(
+            detail["subsection_capture"]["whole_object_overhang_allowed"]
+        )
+        self.assertEqual(detail["along_limit_mm"], 6.0)
         self.assertLess(detail["across_error_mm"], detail["across_limit_mm"])
+
+    def test_local_subsection_profile_dynamically_tightens_near_object_end(self):
+        geometry, jaw_plan = self._elongated_fit_fixture(
+            width_mm=20.0, major_mm=100.0, end_fraction=0.68
+        )
+        selected = {
+            "uv": [10.0, 10.0], "width_mm": 20.0,
+            "axis_fraction": 0.32, "end_clearance_fraction": 0.68,
+        }
+        geometry.grasp_detection.info["selected_candidate"] = selected
+        geometry.candidates = [
+            {"uv": [8.0, 10.0], "width_mm": 20.4,
+             "axis_fraction": -0.16},
+            {"uv": [9.0, 10.0], "width_mm": 20.2,
+             "axis_fraction": 0.0},
+            {"uv": [10.0, 10.0], "width_mm": 20.0,
+             "axis_fraction": 0.16},
+            selected,
+        ]
+
+        with patch.dict(os.environ, {
+            "REBOT_GRASP_SUBSECTION_CENTER_RESERVE_MM": "2.0"
+        }):
+            limit, detail = ws._local_subsection_along_limit_mm(
+                geometry, jaw_plan,
+                {"major_mm": 100.0, "end_clearance_mm": 34.0},
+                6.0,
+            )
+
+        self.assertAlmostEqual(limit, 3.0)
+        self.assertEqual(
+            detail["source"], "measured_local_cross_section_profile"
+        )
+        self.assertTrue(detail["whole_object_overhang_allowed"])
+        self.assertLess(detail["right_support_mm"],
+                        detail["left_support_mm"])
+
+    def test_central_stable_subsection_uses_calibrated_six_mm_cap(self):
+        geometry, jaw_plan = self._elongated_fit_fixture(
+            width_mm=20.0, major_mm=100.0
+        )
+        selected = {
+            "uv": [10.0, 10.0], "width_mm": 20.0,
+            "axis_fraction": 0.0, "end_clearance_fraction": 1.0,
+        }
+        geometry.grasp_detection.info["selected_candidate"] = selected
+        geometry.candidates = [
+            {"uv": [8.0, 10.0], "width_mm": 20.4,
+             "axis_fraction": -0.16},
+            selected,
+            {"uv": [12.0, 10.0], "width_mm": 20.2,
+             "axis_fraction": 0.16},
+        ]
+
+        limit, detail = ws._local_subsection_along_limit_mm(
+            geometry, jaw_plan,
+            {"major_mm": 100.0, "end_clearance_mm": 50.0},
+            6.0,
+        )
+
+        self.assertAlmostEqual(limit, 6.0)
+        self.assertGreater(detail["local_half_support_mm"], 8.0)
+        self.assertTrue(detail["whole_object_overhang_allowed"])
 
     def test_slot_depth_limit_remains_strict_without_object_specific_slop(self):
         geometry, jaw_plan = self._elongated_fit_fixture(
@@ -1730,6 +2111,51 @@ class WristWorkflowTest(TestCase):
         self.assertTrue(detail["ok"], detail)
         self.assertTrue(np.array_equal(filtered, points))
 
+    def test_reference_shape_filter_allows_long_axis_completion(self):
+        reference = {
+            "center_m": [0.40, 0.02, 0.10],
+            "axes_base": np.eye(3).T.tolist(),
+            "observed_size_m": [0.020, 0.030, 0.070],
+        }
+        # Extending the measured 70 mm major axis is legitimate completion.
+        extension = np.array([
+            [0.40, 0.02, 0.16],
+            [0.401, 0.021, 0.17],
+        ] * 15)
+
+        filtered, detail = ws._filter_target_points_to_reference_shape(
+            extension, reference
+        )
+
+        self.assertTrue(detail["ok"], detail)
+        self.assertEqual(len(filtered), len(extension))
+        self.assertEqual(detail["unbounded_axis"], 2)
+
+    def test_reference_shape_filter_removes_nearby_transverse_spill(self):
+        reference = {
+            "center_m": [0.40, 0.02, 0.10],
+            "axes_base": np.eye(3).T.tolist(),
+            "observed_size_m": [0.020, 0.030, 0.070],
+        }
+        target = np.array([
+            [0.40 + offset, 0.02, 0.10]
+            for offset in np.linspace(-0.009, 0.009, 30)
+        ])
+        # Still inside a 75 mm centroid sphere, but outside the measured
+        # object's transverse cross-section.
+        spill = np.array([
+            [0.445, 0.02, 0.10 + offset]
+            for offset in np.linspace(-0.02, 0.02, 25)
+        ])
+
+        filtered, detail = ws._filter_target_points_to_reference_shape(
+            np.vstack((target, spill)), reference
+        )
+
+        self.assertTrue(detail["ok"], detail)
+        self.assertEqual(len(filtered), len(target))
+        self.assertEqual(detail["removed"], len(spill))
+
     def test_locked_body_is_recovered_from_stable_semantic_feature(self):
         body, detail = ws._locked_body_from_feature(
             [4.0, 18.9, 68.3], [-2.7, 1.1, 11.2]
@@ -1777,6 +2203,179 @@ class WristWorkflowTest(TestCase):
         self.assertEqual(detail["width_axis_index"], 2)
         self.assertEqual(detail["major_axis_index"], 0)
         self.assertIn("measured 3D principal extents", detail["reason"])
+
+    def test_metric_box_must_stop_growing_before_hybrid_acceptance(self):
+        first = {
+            "observed_size_m": [0.0155, 0.0235, 0.0300], "views": 1,
+        }
+        growing = {
+            "observed_size_m": [0.0154, 0.0259, 0.0424], "views": 2,
+        }
+        stable = {
+            "observed_size_m": [0.0156, 0.0262, 0.0430], "views": 3,
+        }
+
+        converged, detail = ws._metric_box_extent_convergence(first, growing)
+        self.assertFalse(converged)
+        self.assertIn("still changing", detail["reason"])
+        converged, detail = ws._metric_box_extent_convergence(growing, stable)
+        self.assertTrue(converged, detail)
+
+    def test_metric_box_accepts_stable_repeat_after_bounded_discovery(self):
+        previous = {
+            "observed_size_m": [0.0083, 0.0158, 0.0852], "views": 2,
+        }
+        current = {
+            "observed_size_m": [0.0083, 0.0160, 0.0908], "views": 2,
+        }
+
+        converged, detail = ws._metric_box_extent_convergence(
+            previous, current
+        )
+
+        self.assertTrue(converged, detail)
+        self.assertTrue(detail["repeated_view_set"])
+        self.assertIn("added no new target mask", detail["reason"])
+
+    def test_metric_box_does_not_accept_single_view_repeat(self):
+        previous = {
+            "observed_size_m": [0.0083, 0.0158, 0.0852], "views": 1,
+        }
+        current = {
+            "observed_size_m": [0.0083, 0.0158, 0.0852], "views": 1,
+        }
+
+        converged, detail = ws._metric_box_extent_convergence(
+            previous, current
+        )
+
+        self.assertFalse(converged, detail)
+        self.assertIn("no newly registered target mask", detail["reason"])
+
+    def test_gravity_locked_sponge_converges_by_tabletop_axes(self):
+        previous = {
+            "observed_size_m": [0.0810, 0.0221, 0.0169],
+            "axes_base": [
+                [-0.995, -0.099, 0.0],
+                [0.099, -0.995, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            "orientation_mode": "three_view_gravity_locked_obb",
+            "views": 4,
+        }
+        current = {
+            "observed_size_m": [0.0870, 0.0231, 0.0231],
+            "axes_base": [
+                [-0.995, -0.099, 0.0],
+                [0.099, -0.995, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            "orientation_mode": "three_view_gravity_locked_obb",
+            "views": 5,
+        }
+
+        converged, detail = ws._metric_box_extent_convergence(
+            previous, current
+        )
+
+        self.assertTrue(converged, detail)
+        self.assertEqual(
+            detail["comparison_mode"], "gravity_locked_tabletop_axes"
+        )
+        self.assertIn("tabletop axes stable", detail["reason"])
+
+    def test_gravity_snapped_upright_marker_keeps_generic_extent_convergence(self):
+        previous = {
+            "observed_size_m": [0.0308, 0.0212, 0.0828],
+            "axes_base": [
+                [0.30, -0.954, 0.0],
+                [0.954, 0.30, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            "orientation_mode": "gravity_snapped_measured_obb(1.6deg)",
+            "views": 4,
+        }
+        current = {
+            "observed_size_m": [0.0314, 0.0223, 0.0862],
+            "axes_base": [
+                [0.307, -0.952, 0.0],
+                [0.952, 0.307, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            "orientation_mode": "gravity_snapped_measured_obb(1.4deg)",
+            "views": 5,
+        }
+
+        converged, detail = ws._metric_box_extent_convergence(
+            previous, current
+        )
+
+        self.assertTrue(converged, detail)
+        self.assertEqual(detail["comparison_mode"], "sorted_3d_extents")
+        self.assertIn("all measured box extents stable", detail["reason"])
+
+    def test_gravity_locked_sponge_still_rejects_growing_footprint(self):
+        previous = {
+            "observed_size_m": [0.040, 0.020, 0.016],
+            "axes_base": np.eye(3).tolist(),
+            "orientation_mode": "three_view_gravity_locked_obb",
+            "views": 3,
+        }
+        current = {
+            "observed_size_m": [0.080, 0.030, 0.022],
+            "axes_base": np.eye(3).tolist(),
+            "orientation_mode": "three_view_gravity_locked_obb",
+            "views": 4,
+        }
+
+        converged, detail = ws._metric_box_extent_convergence(
+            previous, current
+        )
+
+        self.assertFalse(converged, detail)
+        self.assertEqual(
+            detail["comparison_mode"], "gravity_locked_tabletop_axes"
+        )
+
+    def test_hybrid_discovery_can_require_translated_camera_baseline(self):
+        detection = SimpleNamespace(
+            box=(100, 100, 200, 200), z_mm=240.0, source="sam3",
+        )
+        frame = (np.zeros((480, 640, 3), dtype=np.uint8), None, None)
+        current = np.array([0.301, 0.0, 0.249], dtype=float)
+
+        def execute_translation(path, _log, fixed_rpy=None):
+            current[:] = np.asarray(path[-1], dtype=float)
+            return True, "ok"
+
+        with (
+            patch.object(ws.A, "ee_pos", side_effect=lambda: current.tolist()),
+            patch.object(ws.A, "ee_rpy", return_value=[0.0, 0.0, 0.0]),
+            patch.object(ws, "_plan_rpy_trajectory",
+                         return_value=([(0.0, 0.0, 0.0)], "ok")),
+            patch.object(ws, "_execute_rpy_trajectory",
+                         return_value=(True, "ok")),
+            patch.object(ws, "_plan_fixed_approach_trajectory",
+                         side_effect=lambda endpoint, **_kwargs:
+                         ([tuple(endpoint)], "ok")),
+            patch.object(ws, "_execute_fixed_approach_trajectory",
+                         side_effect=execute_translation),
+            patch.object(ws, "_settle"),
+            patch.object(ws, "_observe",
+                         return_value=(detection, frame, "found")),
+        ):
+            found, _frame, _geometry, detail = ws._look_around_object(
+                SimpleNamespace(), "yellow sponge", lambda _line: None,
+                require_grasp=False,
+                minimum_translation_from_m=[0.301, 0.0, 0.249],
+                minimum_translation_m=0.025,
+            )
+
+        self.assertIs(found, detection)
+        self.assertEqual(detail["pose"], "pitched_retreat")
+        self.assertGreaterEqual(
+            np.linalg.norm(current - np.array([0.301, 0.0, 0.249])), 0.025
+        )
 
     def test_visible_checkpoint_stops_before_occluding_final_approach(self):
         endpoint = np.array([0.40, 0.0, 0.20])
@@ -1921,6 +2520,37 @@ class WristWorkflowTest(TestCase):
         self.assertIsNone(body)
         self.assertIn("no 2-frame", detail["reason"])
 
+    def test_registered_identifier_body_can_seed_bounded_alignment(self):
+        body, detail = ws._registered_identifier_body_for_alignment(
+            [2.8, 34.7, 64.8],
+            {"stable_frames": 5, "spread_mm": 0.9},
+            [-2.8, 8.0, -9.7],
+        )
+
+        self.assertIsNotNone(body, detail)
+        np.testing.assert_allclose(body, [5.6, 26.7, 74.5])
+        self.assertIn("closure still requires", detail["reason"])
+
+    def test_registered_identifier_body_requires_multiframe_identity(self):
+        body, detail = ws._registered_identifier_body_for_alignment(
+            [2.8, 34.7, 64.8],
+            {"stable_frames": 1},
+            [-2.8, 8.0, -9.7],
+        )
+
+        self.assertIsNone(body)
+        self.assertIn("1/2 stable", detail["reason"])
+
+    def test_registered_identifier_body_rejects_unbounded_offset(self):
+        body, detail = ws._registered_identifier_body_for_alignment(
+            [2.8, 34.7, 64.8],
+            {"stable_frames": 5},
+            [0.0, 0.0, 80.0],
+        )
+
+        self.assertIsNone(body)
+        self.assertIn("75mm", detail["reason"])
+
     def test_endpoint_width_consensus_uses_ready_cross_section_range(self):
         samples = [
             {"width_mm": width, "token": index}
@@ -2003,6 +2633,63 @@ class WristWorkflowTest(TestCase):
         self.assertIsNotNone(selected, detail)
         self.assertTrue(detail["stable_body_endpoint_override"])
         self.assertAlmostEqual(detail["median_mm"], 14.0)
+
+    def test_two_endpoint_batches_must_still_form_three_frame_consensus(self):
+        def sample(width, x):
+            return {
+                "width_mm": width,
+                "body_cam_mm": [x, 31.7, 65.0],
+                "token": width,
+            }
+
+        first = {
+            "locked_samples": [
+                sample(15.47, 3.60), sample(15.49, 3.62)
+            ],
+            "fresh_samples": [],
+            "identifier_samples": [],
+        }
+        second = {
+            "locked_samples": [sample(15.48, 3.61)],
+            "fresh_samples": [],
+            "identifier_samples": [],
+        }
+
+        merged = ws._merge_endpoint_measurement_batches(
+            first, second, 25.19, 28.19,
+            section_locked=True, allow_reselection=False,
+        )
+
+        self.assertIsNotNone(merged["selected"], merged["width_detail"])
+        self.assertIsNotNone(merged["body_cam"], merged["body_detail"])
+        self.assertEqual(len(merged["locked_samples"]), 3)
+        self.assertEqual(merged["merged_stationary_batches"], 2)
+        self.assertTrue(
+            merged["width_detail"]["stable_body_endpoint_override"]
+        )
+
+    def test_two_endpoint_batches_do_not_accept_only_two_total_frames(self):
+        sample = {
+            "width_mm": 15.48,
+            "body_cam_mm": [3.6, 31.7, 65.0],
+        }
+        first = {
+            "locked_samples": [sample], "fresh_samples": [],
+            "identifier_samples": [],
+        }
+        second = {
+            "locked_samples": [dict(sample)], "fresh_samples": [],
+            "identifier_samples": [],
+        }
+
+        merged = ws._merge_endpoint_measurement_batches(
+            first, second, 25.19, 28.19,
+            section_locked=True, allow_reselection=False,
+        )
+
+        self.assertIsNone(merged["selected"])
+        self.assertIsNone(merged["body_cam"])
+        self.assertIn("only 2/3", merged["width_detail"]["reason"])
 
     def test_narrow_section_without_stable_body_authority_still_fails(self):
         samples = [
@@ -2251,6 +2938,59 @@ class WristWorkflowTest(TestCase):
         self.assertEqual(detail["selected_relation"], "left")
         self.assertFalse(detail["collision_model"])
 
+    def test_scene_relative_stack_uses_exact_reference_xy(self):
+        det = SimpleNamespace(
+            min_width_mm=20.0, max_width_mm=40.0, source="sam3"
+        )
+        attempted = []
+
+        def route(endpoint, _rpy, log=None):
+            attempted.append(np.asarray(endpoint, dtype=float))
+            return [tuple(float(value) for value in endpoint)], "ik ok"
+
+        with (
+            patch.object(ws, "_scene_reference_consensus", return_value=(
+                det, np.array([3.0, 32.0, 70.0]), {"reason": "stable"}
+            )),
+            patch.object(ws, "load_grasp_target",
+                         return_value=(3.0, 32.0, 70.0)),
+            patch.object(ws, "load_saved_camera_jacobian", return_value=(
+                np.eye(3) * 1000.0, {"reason": "rigid"}
+            )),
+            patch.object(ws.A, "ee_pos", return_value=(0.30, 0.0, 0.22)),
+            patch.object(ws.A, "ee_rpy", return_value=(0.0, 0.0, 0.0)),
+            patch.object(ws, "_high_release_waypoints", side_effect=route),
+        ):
+            endpoint, waypoints, detail = ws._plan_scene_relative_release(
+                "green marker", "stack", 0.10, {}, SimpleNamespace(),
+                lambda _msg: None,
+            )
+
+        self.assertIsNotNone(endpoint, detail)
+        self.assertIsNotNone(waypoints)
+        self.assertEqual(len(attempted), 1)
+        self.assertTrue(np.allclose(endpoint, [0.30, 0.0, 0.20]))
+        self.assertEqual(detail["selected_relation"], "stack")
+        self.assertEqual(detail["offset_m"], 0.0)
+        self.assertIn("exact reference XY", detail["distance_basis"])
+
+    def test_stack_payload_centering_compensates_held_object_offset(self):
+        context = {
+            "payload_box": {
+                "center_offset_ee_m": [0.012, -0.008, -0.030],
+            }
+        }
+
+        endpoint_xy, detail = ws._payload_centered_release_xy(
+            [0.45, 0.05], context, (0.0, 0.0, 0.0)
+        )
+
+        self.assertIsNotNone(endpoint_xy, detail)
+        np.testing.assert_allclose(endpoint_xy, [0.438, 0.058])
+        self.assertEqual(
+            detail["desired_object_center_xy_m"], [0.45, 0.05]
+        )
+
     def test_place_reference_keeps_accepted_look_frame_and_resamples(self):
         frame = (
             np.zeros((10, 10, 3), dtype=np.uint8),
@@ -2345,6 +3085,55 @@ class WristWorkflowTest(TestCase):
         self.assertIsNone(det)
         self.assertIsNone(reference_cam)
         self.assertIn("only 1/3 frames", detail["reason"])
+
+    def test_stack_reference_rejects_broad_multi_object_semantic_mask(self):
+        frame = (
+            np.zeros((480, 640, 3), dtype=np.uint8),
+            np.full((480, 640), 334.0, dtype=np.float32),
+            (430.0, 430.0, 320.0, 240.0),
+        )
+        detection = SimpleNamespace(
+            source="sam3", box=(185, 210, 608, 385),
+            min_width_mm=136.0, max_width_mm=329.0,
+            info={
+                "depth_basis": "semantic_seeded_rgbd_object",
+                "completion_area_ratio": 4.4,
+                "semantic_overlap_fraction": 0.80,
+                "semantic_to_object_center_delta_mm": 13.0,
+            },
+        )
+
+        accepted, reason = ws._stack_reference_detection_quality(
+            detection, frame
+        )
+
+        self.assertFalse(accepted)
+        self.assertTrue(
+            "image" in reason or "spans" in reason,
+            reason,
+        )
+
+    def test_stack_reference_accepts_compact_semantic_instance(self):
+        frame = (
+            np.zeros((480, 640, 3), dtype=np.uint8),
+            np.full((480, 640), 300.0, dtype=np.float32),
+            (430.0, 430.0, 320.0, 240.0),
+        )
+        detection = SimpleNamespace(
+            source="sam3", box=(450, 275, 555, 410),
+            min_width_mm=72.0, max_width_mm=96.0,
+            info={
+                "depth_basis": "native_semantic_mask",
+                "mask_u8": np.ones((480, 640), dtype=np.uint8),
+            },
+        )
+
+        accepted, reason = ws._stack_reference_detection_quality(
+            detection, frame
+        )
+
+        self.assertTrue(accepted, reason)
+        self.assertIn("compact semantic stack reference", reason)
 
     def test_scene_relative_retries_farther_on_same_side(self):
         det = SimpleNamespace(
@@ -2718,7 +3507,8 @@ class WristWorkflowTest(TestCase):
         self.assertEqual(ws._normalize_scene_relation("next to"), "next_to")
         self.assertEqual(ws._normalize_scene_relation("somewhere on table"),
                          "free_space")
-        self.assertIsNone(ws._normalize_scene_relation("on top of"))
+        self.assertEqual(ws._normalize_scene_relation("on top of"), "stack")
+        self.assertEqual(ws._normalize_scene_relation("stack on"), "stack")
 
     def test_fixed_pick_hold_q_runs_controlled_recovery(self):
         fake_stdin = SimpleNamespace(
@@ -3214,6 +4004,48 @@ class WristWorkflowTest(TestCase):
         self.assertEqual(detail["pose"], "yaw_left")
         self.assertTrue(any("status=observing" in line for line in logs))
 
+    def test_hybrid_grasp_look_around_scopes_wider_camera_envelope(self):
+        detection = SimpleNamespace(
+            box=(100, 100, 200, 200), z_mm=200.0, source="sam3",
+            p_cam_mm=(0.0, 0.0, 200.0), info={},
+        )
+        frame = (np.zeros((480, 640, 3), dtype=np.uint8), None, None)
+        geometry = SimpleNamespace(ok=True, reason="fits")
+        envelope_calls = []
+        logs = []
+
+        with (
+            patch.object(ws.A, "ee_pos", return_value=[0.301, 0.0, 0.249]),
+            patch.object(ws.A, "ee_rpy", return_value=[0.0, 0.0, 0.0]),
+            patch.object(ws, "_plan_rpy_trajectory",
+                         return_value=([(0.0, 0.0, np.deg2rad(12.0))], "ok")),
+            patch.object(ws, "_execute_rpy_trajectory",
+                         return_value=(True, "ok")),
+            patch.object(ws, "_settle"),
+            patch.object(ws, "_observe",
+                         return_value=(detection, frame, "found")),
+            patch.object(ws, "_plan_scene_grasp_geometry",
+                         return_value=geometry),
+            patch.object(ws, "_append_pose_aware_discovery_view",
+                         return_value=True),
+            patch.object(ws, "_set_active_camera_envelope",
+                         side_effect=envelope_calls.append),
+        ):
+            found, _frame, _geometry, detail = ws._look_around_object(
+                SimpleNamespace(), "blue marker", logs.append,
+                require_grasp=True,
+                geometry_accept=lambda _geometry: (True, "fits"),
+                captured_views=[],
+            )
+
+        self.assertIs(found, detection)
+        self.assertTrue(detail["ok"])
+        self.assertEqual(envelope_calls, [30.0, None])
+        self.assertTrue(any(
+            "look_around_camera_envelope status=raised" in line
+            for line in logs
+        ))
+
     def test_look_around_retreats_only_after_pitched_views(self):
         partial = SimpleNamespace(
             box=(0, 100, 200, 200), z_mm=200.0, source="sam3"
@@ -3259,6 +4091,166 @@ class WristWorkflowTest(TestCase):
         self.assertAlmostEqual(
             np.rad2deg(translations[0][1][1]), 8.0, places=3
         )
+
+    def test_look_around_adds_farther_retreat_after_original_sweep(self):
+        """A target clipped in all original views gets a second camera origin."""
+        partial = SimpleNamespace(
+            box=(0, 100, 200, 200), z_mm=200.0, source="sam3"
+        )
+        complete = SimpleNamespace(
+            box=(100, 100, 200, 200), z_mm=240.0, source="sam3"
+        )
+        frame = (np.zeros((480, 640, 3), dtype=np.uint8), None, None)
+        observations = [
+            *((partial, frame, "found") for _ in range(6)),
+            (complete, frame, "found"),
+        ]
+        planned_endpoints = []
+
+        def plan_translation(endpoint, **_kwargs):
+            planned_endpoints.append(np.asarray(endpoint, dtype=float))
+            return [tuple(endpoint)], "ok"
+
+        with (
+            patch.object(ws.A, "ee_pos", return_value=[0.301, 0.0, 0.249]),
+            patch.object(ws.A, "ee_rpy", return_value=[0.0, 0.0, 0.0]),
+            patch.object(ws, "_plan_rpy_trajectory",
+                         return_value=([(0.0, 0.0, 0.0)], "ok")),
+            patch.object(ws, "_execute_rpy_trajectory",
+                         return_value=(True, "ok")),
+            patch.object(ws, "_plan_fixed_approach_trajectory",
+                         side_effect=plan_translation),
+            patch.object(ws, "_execute_fixed_approach_trajectory",
+                         return_value=(True, "ok")),
+            patch.object(ws, "_settle"),
+            patch.object(ws, "_observe", side_effect=observations),
+        ):
+            found, _frame, _geometry, detail = ws._look_around_object(
+                SimpleNamespace(), "yellow sponge", lambda _line: None,
+                require_grasp=False,
+            )
+
+        self.assertIs(found, complete)
+        self.assertEqual(detail["pose"], "extended_pitched_retreat")
+        self.assertTrue(any(
+            np.isclose(endpoint[0], 0.301 - 0.075)
+            for endpoint in planned_endpoints
+        ))
+
+    def test_grasp_discovery_can_use_calibrated_edge_recenter(self):
+        """The translated recenter path is available to grasp targets too."""
+        partial = SimpleNamespace(
+            box=(0, 100, 200, 200), z_mm=200.0, source="sam3",
+            p_cam_mm=(100.0, 0.0, 200.0),
+        )
+        complete = SimpleNamespace(
+            box=(100, 100, 200, 200), z_mm=240.0, source="sam3",
+            p_cam_mm=(0.0, 0.0, 240.0),
+        )
+        frame = (np.zeros((480, 640, 3), dtype=np.uint8), None, None)
+        geometry = SimpleNamespace(ok=True, reason="fits")
+        captured = []
+
+        with (
+            patch.object(ws.A, "ee_pos", return_value=[0.301, 0.0, 0.249]),
+            patch.object(ws.A, "ee_rpy", return_value=[0.0, 0.0, 0.0]),
+            patch.object(ws, "_plan_rpy_trajectory",
+                         return_value=([(0.0, 0.0, 0.0)], "ok")),
+            patch.object(ws, "_execute_rpy_trajectory",
+                         return_value=(True, "ok")),
+            patch.object(ws, "_plan_fixed_approach_trajectory",
+                         return_value=([(0.25, 0.0, 0.249)], "ok")),
+            patch.object(ws, "_execute_fixed_approach_trajectory",
+                         return_value=(True, "ok")),
+            patch.object(ws, "_settle"),
+            patch.object(ws, "_observe", return_value=(partial, frame, "found")),
+            patch.object(ws, "load_saved_camera_jacobian",
+                         return_value=(np.eye(3) * 1000.0, {"reason": "ok"})),
+            patch.object(ws, "_recenter_clipped_placement_reference",
+                         return_value=(complete, frame, {"ok": True})),
+            patch.object(ws, "_plan_scene_grasp_geometry",
+                         return_value=geometry),
+            patch.object(ws, "_append_pose_aware_discovery_view",
+                         return_value=True) as append_view,
+        ):
+            found, found_frame, found_geometry, detail = \
+                ws._look_around_object(
+                    SimpleNamespace(), "yellow sponge", lambda _line: None,
+                    require_grasp=True,
+                    geometry_accept=lambda _geometry: (True, "fits"),
+                    captured_views=captured,
+                    allow_edge_recenter=True,
+                )
+
+        self.assertIs(found, complete)
+        self.assertIs(found_frame, frame)
+        self.assertIs(found_geometry, geometry)
+        self.assertEqual(detail["pose"], "edge_recenter")
+        self.assertEqual(
+            append_view.call_args_list[-1].kwargs["name"], "edge_recenter"
+        )
+
+    def test_grasp_discovery_can_recenter_deferred_identity_hint(self):
+        """A clipped unanchored mask is camera-motion input, not a target."""
+        partial = SimpleNamespace(
+            box=(100, 300, 200, 479), z_mm=240.0, source="sam3",
+            p_cam_mm=(0.0, 80.0, 240.0),
+        )
+        complete = SimpleNamespace(
+            box=(100, 100, 200, 300), z_mm=240.0, source="sam3",
+            p_cam_mm=(0.0, 0.0, 240.0),
+        )
+        frame = (np.zeros((480, 640, 3), dtype=np.uint8), None, None)
+        geometry = SimpleNamespace(ok=True, reason="fits")
+
+        class DeferredEye:
+            def take_deferred_identity_candidate(self, _description):
+                return partial, frame, {
+                    "anchor_deferred": True,
+                    "reason": (
+                        "semantic candidate cannot establish identity because "
+                        "semantic/depth envelope is clipped at the image "
+                        "bottom edge"
+                    ),
+                }
+
+        messages = []
+        with (
+            patch.object(ws.A, "ee_pos", return_value=[0.301, 0.0, 0.249]),
+            patch.object(ws.A, "ee_rpy", return_value=[0.0, 0.0, 0.0]),
+            patch.object(ws, "_plan_rpy_trajectory",
+                         return_value=([(0.0, 0.0, 0.0)], "ok")),
+            patch.object(ws, "_execute_rpy_trajectory",
+                         return_value=(True, "ok")),
+            patch.object(ws, "_plan_fixed_approach_trajectory",
+                         return_value=([(0.25, 0.0, 0.249)], "ok")),
+            patch.object(ws, "_execute_fixed_approach_trajectory",
+                         return_value=(True, "ok")),
+            patch.object(ws, "_settle"),
+            patch.object(ws, "_observe", return_value=(
+                None, None, {"identity_gate": {"anchor_deferred": True}}
+            )),
+            patch.object(ws, "load_saved_camera_jacobian",
+                         return_value=(np.eye(3) * 1000.0, {"reason": "ok"})),
+            patch.object(ws, "_recenter_clipped_placement_reference",
+                         return_value=(complete, frame, {"ok": True})),
+            patch.object(ws, "_plan_scene_grasp_geometry",
+                         return_value=geometry),
+        ):
+            found, _found_frame, found_geometry, detail = \
+                ws._look_around_object(
+                    DeferredEye(), "red marker", messages.append,
+                    require_grasp=True,
+                    geometry_accept=lambda _geometry: (True, "fits"),
+                    allow_edge_recenter=True,
+                )
+
+        self.assertIs(found, complete)
+        self.assertIs(found_geometry, geometry)
+        self.assertEqual(detail["pose"], "edge_recenter")
+        self.assertTrue(any(
+            "authority=recenter_only" in message for message in messages
+        ))
 
     def test_look_around_rejects_one_lucky_reference_frame(self):
         """A boundary flicker must not prevent trying the next safe view."""
@@ -3676,6 +4668,61 @@ class WristWorkflowTest(TestCase):
         self.assertEqual(save.call_args.kwargs["named_view_clouds"], {})
         self.assertFalse(result["per_view_clouds_exported"])
 
+    @staticmethod
+    def _shape_vote(view, sizes_m, major_axis_rows=None):
+        return {
+            "view": view,
+            "box": {
+                "center_m": [0.45, 0.0, 0.05],
+                "axes_base": (
+                    np.eye(3) if major_axis_rows is None
+                    else np.asarray(major_axis_rows, dtype=float)
+                ).tolist(),
+                "observed_size_m": list(sizes_m),
+            },
+            "points": np.ones((30, 3), dtype=float),
+        }
+
+    def test_shape_axis_consensus_ignores_partial_view_axis_swap(self):
+        # The clipped first view mistakes the real 45 mm width (base X) for
+        # the object's major axis. Three later complete views agree that the
+        # true ~81 mm length is base Y.
+        candidates = [
+            self._shape_vote("partial", [0.045, 0.019, 0.016]),
+            self._shape_vote("wide", [0.044, 0.081, 0.020]),
+            self._shape_vote("retreat", [0.043, 0.080, 0.021]),
+            self._shape_vote("yaw", [0.045, 0.082, 0.020]),
+        ]
+
+        selected, detail = ws._target_shape_axis_consensus(candidates)
+
+        self.assertEqual(
+            [item["view"] for item in selected],
+            ["wide", "retreat", "yaw"],
+        )
+        self.assertNotIn("partial", detail["views"])
+        self.assertLessEqual(detail["maximum_axis_delta_deg"], 0.1)
+
+    def test_shape_axis_consensus_does_not_lock_from_two_views(self):
+        candidates = [
+            self._shape_vote("partial_a", [0.045, 0.019, 0.016]),
+            self._shape_vote("partial_b", [0.046, 0.020, 0.017]),
+        ]
+
+        selected, detail = ws._target_shape_axis_consensus(candidates)
+
+        self.assertEqual(selected, [])
+        self.assertIn("transverse filtering remains disabled", detail["reason"])
+
+    def test_shape_axis_signature_rejects_nearly_square_view(self):
+        axis, detail = ws._target_shape_major_axis_signature({
+            "axes_base": np.eye(3).tolist(),
+            "observed_size_m": [0.044, 0.048, 0.020],
+        })
+
+        self.assertIsNone(axis)
+        self.assertIn("ambiguous", detail["reason"])
+
     def test_discovery_target_box_ignores_rejected_geometry_view(self):
         frame = (
             np.zeros((8, 8, 3), dtype=np.uint8),
@@ -3991,6 +5038,56 @@ class WristWorkflowTest(TestCase):
         self.assertIs(selected, fresh)
         self.assertTrue(np.allclose(body, [10.2, 20.05, 100.1]))
 
+    def test_strict_checkpoint_lock_never_reselects_spilled_fresh_body(self):
+        fresh = [
+            {"body_cam_mm": [10.0, 20.0, 100.0]},
+            {"body_cam_mm": [10.2, 20.1, 100.1]},
+        ]
+
+        body, detail, selected = ws._checkpoint_section_consensus(
+            [], fresh, section_locked=True, allow_reselection=False,
+            min_frames=2, max_spread_mm=4.0,
+        )
+
+        self.assertIsNone(body)
+        self.assertIn("only 0/2", detail["reason"])
+        self.assertEqual(selected, [])
+
+    def test_registered_central_section_can_recover_fresh_centre_position(self):
+        allowed, detail = ws._registered_section_can_use_fresh_centre(0.0)
+
+        self.assertTrue(allowed, detail)
+        self.assertIn("inside", detail["reason"])
+
+    def test_registered_noncentral_section_cannot_jump_to_fresh_centre(self):
+        allowed, detail = ws._registered_section_can_use_fresh_centre(0.16)
+
+        self.assertFalse(allowed, detail)
+        self.assertIn("outside", detail["reason"])
+
+    def test_horizontal_major_consensus_builds_gravity_locked_axes(self):
+        votes = [
+            {"major_axis": np.array([1.0, 0.02, 0.05])},
+            {"major_axis": np.array([-0.99, -0.04, -0.08])},
+            {"major_axis": np.array([0.98, -0.03, 0.10])},
+        ]
+
+        axes, detail = ws._horizontal_major_consensus_axes(votes)
+
+        self.assertIsNotNone(axes, detail)
+        np.testing.assert_allclose(axes[:, 2], [0.0, 0.0, 1.0])
+        np.testing.assert_allclose(axes.T @ axes, np.eye(3), atol=1e-6)
+
+    def test_tilted_major_consensus_does_not_force_tabletop_frame(self):
+        angle = np.radians(38.0)
+        axis = np.array([np.cos(angle), 0.0, np.sin(angle)])
+        votes = [{"major_axis": axis.copy()} for _ in range(3)]
+
+        axes, detail = ws._horizontal_major_consensus_axes(votes)
+
+        self.assertIsNone(axes)
+        self.assertIn("exceeds", detail["reason"])
+
     def test_checkpoint_does_not_reselect_without_explicit_section_lock(self):
         fresh = [
             {"body_cam_mm": [10.0, 20.0, 100.0]},
@@ -4005,6 +5102,44 @@ class WristWorkflowTest(TestCase):
         self.assertIsNone(body)
         self.assertIn("only 0/2", detail["reason"])
         self.assertEqual(selected, [])
+
+    def test_strict_checkpoint_presence_ignores_shifting_mask_centroids(self):
+        def sample(point):
+            return {
+                "point_base_m": point,
+                "feature": SimpleNamespace(
+                    source="sam3", info={"mask_u8": np.ones((2, 2), np.uint8)}
+                ),
+            }
+
+        accepted, detail = ws._strict_checkpoint_identity_presence([
+            sample([0.45, 0.06, 0.11]),
+            sample([0.48, 0.09, 0.12]),
+            sample([0.44, 0.04, 0.10]),
+        ])
+
+        self.assertIsNotNone(accepted, detail)
+        self.assertFalse(detail["centroid_steering"])
+        self.assertIn("were not used to steer", detail["reason"])
+
+    def test_strict_checkpoint_presence_rejects_nonsemantic_fallbacks(self):
+        samples = [
+            {
+                "point_base_m": [0.45, 0.06, 0.11],
+                "feature": SimpleNamespace(
+                    source="color:yellow", info={"mask_u8": np.ones((2, 2))}
+                ),
+            },
+            {
+                "point_base_m": [0.46, 0.06, 0.11],
+                "feature": SimpleNamespace(source="sam3", info={}),
+            },
+        ]
+
+        accepted, detail = ws._strict_checkpoint_identity_presence(samples)
+
+        self.assertIsNone(accepted)
+        self.assertIn("0/2", detail["reason"])
 
     def test_endpoint_measurement_reselects_stable_fresh_close_geometry(self):
         def samples(widths, offset=0.0):
@@ -4026,6 +5161,23 @@ class WristWorkflowTest(TestCase):
         self.assertIsNotNone(result["body_cam"], result)
         self.assertTrue(result["section_reselected"])
         self.assertIn("stable fresh close-range", result["width_detail"]["reason"])
+
+    def test_strict_endpoint_lock_never_reselects_spilled_fresh_width(self):
+        fresh = [
+            {
+                "width_mm": width,
+                "body_cam_mm": [10.0, 20.0, 100.0 + 0.1 * index],
+            }
+            for index, width in enumerate((114.8, 115.0, 115.1, 114.9, 115.0))
+        ]
+
+        result = ws._endpoint_measurement_consensus(
+            [], fresh, 20.0, 45.0,
+            section_locked=True, allow_reselection=False,
+        )
+
+        self.assertIsNone(result["selected"])
+        self.assertFalse(result["section_reselected"])
 
     def test_endpoint_measurement_will_not_reselect_unstable_fresh_width(self):
         fresh = [
@@ -4317,6 +5469,32 @@ class WristWorkflowTest(TestCase):
         self.assertEqual(checked_pitches, [5.0, -5.0, 10.0])
         route.assert_called_once()
 
+    def test_projected_metric_width_cannot_exceed_stale_cropped_major(self):
+        body = ws.WD.Detection(
+            box=(2, 2, 18, 18), uv=(10.0, 10.0), z_mm=200.0,
+            p_cam_mm=(0.0, 0.0, 200.0), source="sam3",
+            min_width_mm=18.0, max_width_mm=29.4,
+        )
+        geometry = ws.GG.GraspGeometry(
+            True, "cropped restored view", body, body,
+            (0.0, 0.0, 0.0), candidates=[],
+        )
+
+        updated = ws._geometry_with_projected_3d_width(geometry, {
+            "ok": True,
+            "observed_width_mm": 35.2,
+            "conservative_width_mm": 42.0,
+            "object_major_mm": 81.6,
+            "reason": "measured OBB projection",
+        })
+
+        self.assertEqual(updated.grasp_detection.min_width_mm, 35.2)
+        self.assertEqual(updated.grasp_detection.max_width_mm, 81.6)
+        self.assertGreaterEqual(
+            updated.grasp_detection.max_width_mm,
+            updated.grasp_detection.min_width_mm,
+        )
+
     def test_multiview_restore_accepts_fresh_edge_clip_after_safe_obb_projection(self):
         frame = (
             np.zeros((20, 20, 3), dtype=np.uint8),
@@ -4380,6 +5558,7 @@ class WristWorkflowTest(TestCase):
                 "ok": True, "observed_width_mm": 24.0,
                 "conservative_width_mm": 32.0, "reason": "safe projection",
             }),
+            patch.object(ws, "_ACTIVE_CAMERA_ENVELOPE_DEG", 30.0),
             patch("arm_agent.gripper_model.max_aperture_mm",
                   return_value=50.0),
         ):
@@ -4396,6 +5575,12 @@ class WristWorkflowTest(TestCase):
         self.assertTrue(result.grasp_detection.info[
             "metric_recovery_pose_validated"
         ])
+        self.assertEqual(
+            result.grasp_detection.info[
+                "metric_recovery_camera_envelope_deg"
+            ],
+            30.0,
+        )
 
     def test_multiview_restore_uses_bounded_yaw_for_near_boundary_projection(self):
         frame = (
@@ -4988,7 +6173,8 @@ class WristWorkflowTest(TestCase):
         self.assertTrue(result["gripper_opened"])
         self.assertTrue(result["homed"])
 
-    def test_interrupt_recovery_opens_before_homing(self):
+    def test_interrupt_recovery_opens_before_homing_when_object_is_held(self):
+        ws._OBJECT_HELD = True
         events = []
         with (
             patch.object(ws, "_gripper", lambda action: events.append(action) or {"ok": True}),
@@ -4997,6 +6183,19 @@ class WristWorkflowTest(TestCase):
             result = ws._home_after_interrupt()
 
         self.assertEqual(events, ["open", "home"])
+        self.assertTrue(result["gripper_opened"])
+        self.assertTrue(result["homed"])
+
+    def test_interrupt_recovery_homes_before_opening_when_nothing_is_held(self):
+        ws._OBJECT_HELD = False
+        events = []
+        with (
+            patch.object(ws, "_gripper", lambda action: events.append(action) or {"ok": True}),
+            patch.object(ws, "_home", lambda: events.append("home") or {"ok": True}),
+        ):
+            result = ws._home_after_interrupt()
+
+        self.assertEqual(events, ["home", "open"])
         self.assertTrue(result["gripper_opened"])
         self.assertTrue(result["homed"])
 

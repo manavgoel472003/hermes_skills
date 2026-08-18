@@ -780,6 +780,7 @@ def register_dense_view_clouds(
     table_z_m: float,
     voxel_m: float = 0.004,
     max_translation_m: float = 0.012,
+    adaptive_max_translation_m: float | None = None,
     minimum_overlap: float = 0.15,
     minimum_improvement: float = 0.015,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[dict[str, Any]]]:
@@ -813,6 +814,12 @@ def register_dense_view_clouds(
     voxel = float(np.clip(voxel_m, 0.003, 0.008))
     maximum = float(np.clip(max_translation_m, 0.0, 0.015))
     max_step = int(np.floor(maximum / voxel + 1e-9))
+    adaptive_maximum = maximum
+    if adaptive_max_translation_m is not None:
+        adaptive_maximum = float(np.clip(
+            adaptive_max_translation_m, maximum, 0.024
+        ))
+    adaptive_max_step = int(np.floor(adaptive_maximum / voxel + 1e-9))
     table_clearance = float(table_z_m) + max(0.010, 2.5 * voxel)
 
     def occupied(points: np.ndarray) -> np.ndarray:
@@ -879,8 +886,58 @@ def register_dense_view_clouds(
         denominator = float(max(1, min(len(reference_set), len(moving_keys))))
         zero_ratio = zero_count / denominator
         best_ratio = best_count / denominator
+        initial_best_ratio = best_ratio
+        initial_pinned = bool(
+            max_step and int(np.max(np.abs(best_shift))) >= max_step
+        )
+        adaptive_search = False
+        # A boundary optimum can be a real hand-eye/FK translation just beyond
+        # the normal diagnostic window. Expand the search only when the first
+        # pass has strong occupancy evidence, and only for callers that opted
+        # into the larger bound. This keeps the common path fast and prevents a
+        # weakly related scene cluster from being dragged across the workspace.
+        strong_overlap = max(float(minimum_overlap) + 0.10, 0.25)
+        strong_improvement = max(4.0 * float(minimum_improvement), 0.08)
+        if (
+            initial_pinned
+            and adaptive_max_step > max_step
+            and best_ratio >= strong_overlap
+            and best_ratio - zero_ratio >= strong_improvement
+        ):
+            adaptive_search = True
+            extended_shifts = [
+                np.array([dx, dy, dz], dtype=np.int64)
+                for dx in range(-adaptive_max_step, adaptive_max_step + 1)
+                for dy in range(-adaptive_max_step, adaptive_max_step + 1)
+                for dz in range(-adaptive_max_step, adaptive_max_step + 1)
+                if max(abs(dx), abs(dy), abs(dz)) > max_step
+            ]
+            extended_shifts.sort(key=lambda shift: (
+                int(np.dot(shift, shift)), int(abs(shift[2])),
+                tuple(int(v) for v in shift)
+            ))
+            for shift in extended_shifts:
+                count = overlap(shift)
+                if count > best_count:
+                    best_count = count
+                    best_shift = shift
+            best_ratio = best_count / denominator
+        # A translation sitting on the edge of the search grid is a clamp, not a
+        # fit: the best alignment found is the furthest one allowed, so the real
+        # optimum lies outside the bounded search and this view is simply not
+        # registered. Accepting it drags the view to the bound in every pinned
+        # axis, and the object box fitted to the union then inflates by the
+        # spread between views. One such view took a measured 87x35x25mm object
+        # to 97x105x91mm and put every axis beyond the jaw aperture.
+        effective_max_step = adaptive_max_step if adaptive_search else max_step
+        effective_maximum = effective_max_step * voxel
+        pinned_to_bound = bool(
+            effective_max_step
+            and int(np.max(np.abs(best_shift))) >= effective_max_step
+        )
         accepted = bool(
             np.any(best_shift)
+            and not pinned_to_bound
             and best_ratio >= float(minimum_overlap)
             and best_ratio - zero_ratio >= float(minimum_improvement)
         )
@@ -901,11 +958,22 @@ def register_dense_view_clouds(
             "zero_overlap": round(zero_ratio, 4),
             "best_overlap": round(best_ratio, 4),
             "above_table_voxels": int(len(moving_keys)),
+            "pinned_to_bound": pinned_to_bound,
+            "initial_pinned_to_bound": initial_pinned,
+            "adaptive_search": adaptive_search,
+            "initial_best_overlap": round(initial_best_ratio, 4),
+            "search_bound_mm": round(effective_maximum * 1000.0, 1),
             "reason": (
+                "adaptive bounded above-table occupancy registration accepted"
+                if accepted and adaptive_search else
                 "bounded above-table occupancy registration accepted"
                 if accepted else
                 "raw FK/hand-eye transform already has sufficient overlap"
                 if valid_for_fusion else
+                "view excluded from fusion; best translation sat on the "
+                f"{effective_maximum * 1000.0:.0f}mm search bound, so the alignment did "
+                "not converge"
+                if pinned_to_bound else
                 "view excluded from fusion; FK/hand-eye transform and bounded "
                 "translation lacked registration consensus"
             ),

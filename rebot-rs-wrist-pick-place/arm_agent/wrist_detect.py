@@ -1543,6 +1543,7 @@ def detect_vlm(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics,
                      min_width_mm=min_mm, max_width_mm=max_mm,
                      info={"confidence": result.get("confidence"),
                            "detector_backend": backend,
+                           "model_version": result.get("model_version"),
                            "box_axis_aligned": True,
                            "depth_basis": depth_basis,
                            **({"mask_u8": mask_u8}
@@ -1587,6 +1588,18 @@ def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, descri
             near_mm=near_mm, far_mm=far_mm,
         )
         why["semantic_result"] = found.source if found else "not found"
+        if found is None:
+            from .local_vision import tracking_lost as semantic_tracking_lost
+            if semantic_tracking_lost(description):
+                why.update(
+                    semantic_tracking_lost=True,
+                    used=None,
+                    reason=(
+                        "SAM3 video lost the locked target instance; "
+                        "colour/depth reassociation was intentionally blocked"
+                    ),
+                )
+                return None, why
         if found is not None:
             if hybrid_identity:
                 complete_query = detect_vlm(

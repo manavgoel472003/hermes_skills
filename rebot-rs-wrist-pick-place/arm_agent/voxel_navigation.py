@@ -40,15 +40,23 @@ def plan_topdown_route(
     drop_clearance_m: float,
     resolution_m: float,
     destination_radius_m: float | None = None,
+    minimum_travel_z_m: float | None = None,
+    destination_height_xy_m: np.ndarray | None = None,
 ) -> tuple[VoxelRoute | None, dict[str, Any]]:
     """Plan XY motion through free cells, trying higher Z layers as needed."""
     start = np.asarray(start_m, dtype=float)
     goal_xy = np.asarray(destination_xy_m, dtype=float)
+    height_xy = (
+        goal_xy.copy() if destination_height_xy_m is None
+        else np.asarray(destination_height_xy_m, dtype=float)
+    )
     lo = np.asarray(workspace_lo_m, dtype=float) + workspace_margin_m
     hi = np.asarray(workspace_hi_m, dtype=float) - workspace_margin_m
     resolution = float(np.clip(resolution_m, 0.008, 0.030))
     if np.any(goal_xy < lo[:2]) or np.any(goal_xy > hi[:2]):
         return None, {"reason": "destination XY is outside the guarded workspace"}
+    if height_xy.shape != (2,) or not np.all(np.isfinite(height_xy)):
+        return None, {"reason": "destination height-sampling XY is invalid"}
 
     nx = max(2, int(math.floor((hi[0] - lo[0]) / resolution)) + 1)
     ny = max(2, int(math.floor((hi[1] - lo[1]) / resolution)) + 1)
@@ -89,8 +97,8 @@ def plan_topdown_route(
     goal_top = float(scene.table_z_m)
     for box in scene.boxes:
         box_lo, box_hi = _box_bounds(box)
-        closest_xy = np.clip(goal_xy, box_lo[:2], box_hi[:2])
-        if float(np.linalg.norm(goal_xy - closest_xy)) \
+        closest_xy = np.clip(height_xy, box_lo[:2], box_hi[:2])
+        if float(np.linalg.norm(height_xy - closest_xy)) \
                 <= destination_radius + 1e-9:
             goal_top = max(goal_top, float(box_hi[2]))
     required_release_z = float(max(lo[2], goal_top + drop_clearance_m))
@@ -99,6 +107,7 @@ def plan_topdown_route(
             "reason": "destination column plus carried-object drop clearance "
                       "exceeds the guarded Z workspace",
             "destination_column_top_m": round(goal_top, 4),
+            "destination_height_xy_m": height_xy.round(4).tolist(),
             "required_release_z_m": round(required_release_z, 4),
             "maximum_release_z_m": round(float(hi[2]), 4),
         }
@@ -121,7 +130,18 @@ def plan_topdown_route(
     # have no grid route; complete-arm IK/collision validation remains the
     # controller's responsibility.
     base_z = max(float(start[2]), float(lo[2]))
-    preferred_z = min(float(hi[2]), max(base_z, release_z))
+    requested_floor = (
+        base_z if minimum_travel_z_m is None
+        else max(base_z, float(minimum_travel_z_m))
+    )
+    if not math.isfinite(requested_floor) or requested_floor > hi[2] + 1e-9:
+        return None, {
+            "reason": "payload-derived minimum travel height exceeds the guarded Z workspace",
+            "minimum_travel_z_m": round(float(requested_floor), 4),
+            "maximum_travel_z_m": round(float(hi[2]), 4),
+        }
+    travel_floor = min(float(hi[2]), requested_floor)
+    preferred_z = min(float(hi[2]), max(base_z, release_z, travel_floor))
     layer_epsilon = max(0.003, 0.25 * resolution)
     higher_layers = [
         min(float(hi[2]), z + layer_epsilon)
@@ -132,11 +152,13 @@ def plan_topdown_route(
         higher_layers.append(
             min(float(hi[2]), max(higher_layers) + 0.020)
         )
-    lower_fallbacks = [base_z]
+    # A payload-derived floor is a physical clearance requirement, not a route
+    # preference. Never reintroduce the old low carry layer as a fallback.
+    lower_fallbacks = [base_z] if base_z >= travel_floor - 1e-6 else []
     lower_fallbacks.extend(
         min(float(hi[2]), z + layer_epsilon)
         for z in obstacle_tops
-        if base_z + 0.002 < z < preferred_z - 0.002
+        if max(base_z, travel_floor) + 0.002 < z < preferred_z - 0.002
     )
 
     # De-duplicate without sorting: route priority is safety policy, not Z
@@ -307,8 +329,10 @@ def plan_topdown_route(
             "travel_z_m": round(float(layer_z), 4),
             "starting_carry_z_m": round(base_z, 4),
             "preferred_payload_clear_z_m": round(preferred_z, 4),
+            "minimum_payload_travel_z_m": round(travel_floor, 4),
             "rose_before_xy": rose_before_xy,
             "destination_column_top_m": round(goal_top, 4),
+            "destination_height_xy_m": height_xy.round(4).tolist(),
             "release_z_m": round(release_z, 4),
             "path_cells": len(path) + (1 if rise_before_goal else 0),
             "path_turns": max(0, len(sparse) - 2),

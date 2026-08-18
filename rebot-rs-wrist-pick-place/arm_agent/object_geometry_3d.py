@@ -315,6 +315,58 @@ def fit_tabletop_box(
     )
 
 
+def fit_tabletop_box_with_axes(
+    point_sets_m: Iterable[np.ndarray], *, table_z_m: float,
+    axes_base: np.ndarray, orientation_mode: str,
+) -> ObjectBox3D:
+    """Refit measured extents while preserving a trusted orthonormal frame.
+
+    Multi-view translation registration can shear a small object enough for a
+    fresh PCA to rotate its axes even though independent views already agreed
+    on their physical direction.  This helper does not invent dimensions: it
+    projects the same robustly trimmed measured points onto the supplied frame
+    and recomputes every extent and the centre from those measurements.
+    """
+    views = [np.asarray(points, dtype=float).reshape(-1, 3)
+             for points in point_sets_m if np.asarray(points).size]
+    if not views:
+        raise ValueError("no metric object observations")
+    points = np.vstack(views)
+    points = points[np.all(np.isfinite(points), axis=1)]
+    points = points[points[:, 2] >= float(table_z_m) - 0.004]
+    if len(points) < 50:
+        raise ValueError("fewer than 50 above-support object points")
+    axes = np.asarray(axes_base, dtype=float)
+    if axes.shape != (3, 3) or not np.all(np.isfinite(axes)):
+        raise ValueError("trusted object axes are invalid")
+    gram = axes.T @ axes
+    if not np.allclose(gram, np.eye(3), atol=1e-3) \
+            or abs(float(np.linalg.det(axes))) < 0.99:
+        raise ValueError("trusted object axes are not orthonormal")
+    median = np.median(points, axis=0)
+    radial = np.linalg.norm(points - median, axis=1)
+    points = points[radial <= np.percentile(radial, 99.0)]
+    projections = points @ axes
+    lo = np.percentile(projections, 1.0, axis=0)
+    hi = np.percentile(projections, 99.0, axis=0)
+    observed = np.maximum(hi - lo, 0.003)
+    center = axes @ ((lo + hi) / 2.0)
+    uncertainty = np.full(3, 0.005 if len(views) == 1 else 0.003, dtype=float)
+    conservative = observed + 2.0 * uncertainty
+    return ObjectBox3D(
+        center_m=tuple(float(value) for value in center),
+        axes_base=tuple(tuple(float(v) for v in axes[:, index])
+                        for index in range(3)),
+        observed_size_m=tuple(float(v) for v in observed),
+        conservative_size_m=tuple(float(v) for v in conservative),
+        uncertainty_m=tuple(float(v) for v in uncertainty),
+        support_z_m=float(table_z_m), point_count=int(len(points)),
+        views=len(views), prior=None,
+        source="multiframe_rgbd_measured_obb", support_completed=False,
+        orientation_mode=str(orientation_mode),
+    )
+
+
 def expand_with_shape_prior(
     observed_size_m: np.ndarray, conservative_size_m: np.ndarray,
     vertices: np.ndarray,
