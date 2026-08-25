@@ -1,15 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep exactly one complete console log for the most recent wrist run.  This
+# wrapper is the common execution path for scene pick/place, pick-only, dry,
+# and watch commands, so failures from the detector, planner, arm, and recovery
+# all land in one predictable file while remaining visible in the terminal.
+latest_log="${REBOT_LATEST_RUN_LOG:-/home/manav/rebot_lerobot/logs/latest_wrist_run.log}"
+mkdir -p "$(dirname "$latest_log")"
+exec > >(tee "$latest_log") 2>&1
+export PYTHONUNBUFFERED=1
+printf '[launcher] latest run log -> %s\n' "$latest_log"
+printf '[launcher] command:'
+printf ' %q' "$0" "$@"
+printf '\n'
+
 cd /home/manav/rebot_lerobot
 
 export PYTHONPATH="/home/manav/rebot_lerobot/.vendor/sam3_transformers${PYTHONPATH:+:$PYTHONPATH}"
 export REBOT_DYNAMIC_GRASP=1
+# The viewer/export flag does not enable collision checking. Protect the
+# arm/gripper route by default; set this explicitly to 0 only for diagnostics.
+export REBOT_SCENE_COLLISION="${REBOT_SCENE_COLLISION:-1}"
+# Use one geometry authority per grasp attempt.  The visible checkpoint fixes
+# subsection, orientation and width; after the jaws open, RGB-D is presence-only
+# and cannot steer or resize the grasp.  One failed, fully recovered attempt may
+# retry a different measured subsection, then the workflow terminates.
+export REBOT_SIMPLE_GRASP_FLOW="${REBOT_SIMPLE_GRASP_FLOW:-1}"
+export REBOT_SIMPLE_GRASP_MAX_ATTEMPTS="${REBOT_SIMPLE_GRASP_MAX_ATTEMPTS:-2}"
+# Do not spend eight identical frames proving that a clipped ready view is still
+# clipped.  After three misses the existing bounded look-around takes over. One
+# additional translated discovery sweep is enough to establish/converge the
+# hybrid metric box; a second whole sweep only repeated the same evidence.
+export REBOT_HYBRID_SEMANTIC_ANCHOR_ATTEMPTS="${REBOT_HYBRID_SEMANTIC_ANCHOR_ATTEMPTS:-3}"
+export REBOT_HYBRID_EXTRA_VIEW_SWEEPS="${REBOT_HYBRID_EXTRA_VIEW_SWEEPS:-1}"
 # Plan the macro pick route once from the complete initial scene, execute only
 # its collision-checked prefix to a dynamically selected visible checkpoint,
 # then require fresh stationary RGB-D body consensus before replacing the short
-# final leg.  The replacement is fully IK/collision validated before motion;
-# endpoint vision still performs bounded jaw-slot centering and closure.
+# final leg. The replacement is fully IK/collision validated before motion;
+# endpoint vision confirms presence but cannot perform another alignment.
 export REBOT_FIXED_SCENE_TRAJECTORY="${REBOT_FIXED_SCENE_TRAJECTORY:-1}"
 export REBOT_WRIST_CLOSE_GRIPPER_AT_START=1
 export REBOT_CAN_BITRATE=1000000
@@ -22,11 +50,11 @@ export REBOT_VISION_TRACKER="${REBOT_VISION_TRACKER:-none}"
 export REBOT_VISION_PRIMARY=1
 export REBOT_SAM3_MODEL=facebook/sam3
 export REBOT_SAM31_SCORE_THRESHOLD="${REBOT_SAM31_SCORE_THRESHOLD:-0.30}"
-# SAM 3.1 establishes the named target once. Its independent per-frame masks
-# were empirically unstable under the large viewpoint sweep, so the proven
-# SAM3 image backend takes over metric multi-view geometry after that anchor.
-# The base-frame hybrid identity gate remains authoritative across the switch.
-export REBOT_SAM31_BOOTSTRAP_ONLY="${REBOT_SAM31_BOOTSTRAP_ONLY:-1}"
+# Keep SAM 3.1 authoritative for every discovery view. Switching to the older
+# SAM3 backend after the first proposal allowed broad masks from later views to
+# absorb neighbouring objects and inflate the discovery target. Single-frame
+# inference remains bounded; full video propagation is still disabled.
+export REBOT_SAM31_BOOTSTRAP_ONLY="${REBOT_SAM31_BOOTSTRAP_ONLY:-0}"
 export REBOT_VISION_DEVICE=cuda
 export REBOT_VISION_DTYPE=bfloat16
 export REBOT_SAM3_SCORE_THRESHOLD=0.30
@@ -88,9 +116,10 @@ export REBOT_DYNAMIC_GRIPPER_SLOT_MARGIN_MM=8
 export REBOT_DYNAMIC_GRIPPER_REMEASURE_RADIUS_MM=6
 export REBOT_DYNAMIC_GRIPPER_CLOSE_STEP_DEG=18
 export REBOT_GRIPPER_SIZE_MARGIN_MM=0
-# Position-close 4 mm below the stable image/depth width. This is 1 mm tighter
-# than the previous general profile; calibrated jaw limits, slow closure, and
-# visual lift verification remain mandatory. Keep it externally overridable.
+# Position-close 4 mm below the stable image/depth width. Calibrated jaw limits,
+# bounded position ramps, and visual lift verification remain mandatory. The
+# endpoint camera gate separately requires enough centring for both fingers to
+# overlap the measured body before this close begins.
 export REBOT_GRIPPER_SIZE_COMPRESSION_MM="${REBOT_GRIPPER_SIZE_COMPRESSION_MM:-4}"
 export REBOT_DYNAMIC_MICRO_LIFT_M="${REBOT_DYNAMIC_MICRO_LIFT_M:-0.015}"
 export REBOT_GRASP_HOLD_FRAMES=6

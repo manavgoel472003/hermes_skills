@@ -582,7 +582,7 @@ class Sam31TextSegmenter:
         self._last_mask: np.ndarray | None = None
         self._last_box: tuple[int, int, int, int] | None = None
         self.bootstrap_only = os.getenv(
-            "REBOT_SAM31_BOOTSTRAP_ONLY", "1"
+            "REBOT_SAM31_BOOTSTRAP_ONLY", "0"
         ).strip().lower() in {"1", "true", "yes", "on"}
         self._bootstrap_complete = False
         self._geometry_backend: Sam3TextSegmenter | None = None

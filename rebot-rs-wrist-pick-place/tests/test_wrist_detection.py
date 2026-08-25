@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from arm_agent.wrist_detect import (
     complete_semantic_with_rgbd_object,
     detect,
     detect_color,
+    detect_color_seeded_instance,
     detect_color_conjunction,
     detect_colored_tabletop_object,
     detect_color_union,
@@ -24,6 +26,116 @@ from arm_agent.wrist_detect import (
 
 
 class BlueDetectionTest(TestCase):
+    def test_color_seeded_instance_expands_cap_without_selecting_green_object(self):
+        color = np.full((100, 160, 3), 100, dtype=np.uint8)
+        depth = np.full((100, 160), 500.0, dtype=np.float32)
+        blue_mask = np.zeros((100, 160), dtype=np.uint8)
+        green_mask = np.zeros_like(blue_mask)
+        blue_mask[15:85, 20:44] = 255
+        green_mask[15:85, 95:119] = 255
+        depth[blue_mask > 0] = 220.0
+        depth[green_mask > 0] = 225.0
+        # Only the cap is blue; the rest of this physical marker is white.
+        color[15:32, 20:44] = (220, 50, 20)
+        color[32:85, 20:44] = (220, 220, 220)
+        color[15:32, 95:119] = (40, 210, 40)
+        color[32:85, 95:119] = (220, 220, 220)
+        blue = Detection(
+            box=(20, 15, 44, 85), uv=(32.0, 50.0), z_mm=220.0,
+            p_cam_mm=(-30.0, 0.0, 220.0), source="depth:object",
+            area_px=1680.0, min_width_mm=18.0, max_width_mm=55.0,
+            info={"mask_u8": blue_mask},
+        )
+        green = Detection(
+            box=(95, 15, 119, 85), uv=(107.0, 50.0), z_mm=225.0,
+            p_cam_mm=(30.0, 0.0, 225.0), source="depth:object",
+            area_px=1680.0, min_width_mm=18.0, max_width_mm=55.0,
+            info={"mask_u8": green_mask},
+        )
+
+        with patch(
+            "arm_agent.wrist_detect.segment_objects",
+            return_value=[green, blue],
+        ):
+            found = detect_color_seeded_instance(
+                color, depth, (300.0, 300.0, 80.0, 50.0), "blue",
+                near_mm=60.0, far_mm=600.0,
+            )
+
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.source, "rgbd:color_seeded_instance")
+        mask = found.info["mask_u8"] > 0
+        self.assertGreater(np.count_nonzero(mask[:, 20:44]), 1500)
+        self.assertEqual(np.count_nonzero(mask[:, 95:119]), 0)
+        self.assertEqual(found.info["identity_seed_kind"], "direct_color_mask")
+        self.assertEqual(found.info["depth_basis"], "color_seeded_rgbd_object")
+
+    def test_hybrid_pick_target_uses_color_seed_before_text_model(self):
+        color = np.zeros((40, 60, 3), dtype=np.uint8)
+        depth = np.full((40, 60), 220.0, dtype=np.float32)
+        seeded = Detection(
+            box=(10, 10, 20, 30), uv=(15.0, 20.0), z_mm=220.0,
+            p_cam_mm=(0.0, 0.0, 220.0),
+            source="rgbd:color_seeded_instance",
+            info={"mask_u8": np.ones((40, 60), dtype=np.uint8)},
+        )
+        with (
+            patch.dict(os.environ, {
+                "REBOT_OBJECT_GEOMETRY_MODE": "hybrid",
+                "REBOT_ENABLE_LOCATE_ANYTHING": "1",
+                "REBOT_VISION_PRIMARY": "1",
+            }),
+            patch(
+                "arm_agent.wrist_detect.detect_color_seeded_instance",
+                return_value=seeded,
+            ),
+            patch("arm_agent.wrist_detect.detect_vlm") as text_detector,
+        ):
+            found, why = detect(
+                color, depth, (100.0, 100.0, 30.0, 20.0), "blue marker",
+                near_mm=60.0, far_mm=600.0,
+            )
+
+        self.assertIs(found, seeded)
+        self.assertEqual(why["used"], "rgbd:color_seeded_instance")
+        text_detector.assert_not_called()
+
+    def test_hybrid_white_cup_keeps_semantic_noun_identity(self):
+        color = np.full((50, 80, 3), 200, dtype=np.uint8)
+        depth = np.full((50, 80), 230.0, dtype=np.float32)
+        cup_mask = np.zeros((50, 80), dtype=np.uint8)
+        cup_mask[10:45, 40:70] = 255
+        cup = Detection(
+            box=(40, 10, 70, 45), uv=(55.0, 27.5), z_mm=230.0,
+            p_cam_mm=(20.0, 0.0, 230.0), source="sam3",
+            info={"mask_u8": cup_mask, "depth_basis": "native_semantic_mask"},
+        )
+        with (
+            patch.dict(os.environ, {
+                "REBOT_OBJECT_GEOMETRY_MODE": "hybrid",
+                "REBOT_ENABLE_LOCATE_ANYTHING": "1",
+                "REBOT_VISION_PRIMARY": "1",
+            }),
+            patch("arm_agent.wrist_detect.detect_vlm", return_value=cup),
+            patch(
+                "arm_agent.wrist_detect.validate_full_object_semantic_query",
+                return_value=(cup, {"reason": "semantic cup retained"}),
+            ),
+            patch(
+                "arm_agent.wrist_detect.detect_color_seeded_instance"
+            ) as color_seed,
+        ):
+            found, why = detect(
+                color, depth, (120.0, 120.0, 40.0, 25.0), "white cup",
+                near_mm=60.0, far_mm=600.0,
+                semantic_noun_first=True,
+            )
+
+        self.assertIs(found, cup)
+        self.assertEqual(why["used"], "sam3")
+        color_seed.assert_not_called()
+
     def test_semantic_seed_separates_thin_bridge_to_neighbor(self):
         physical = np.zeros((80, 120), dtype=np.uint8)
         physical[15:65, 15:40] = 255
@@ -82,6 +194,9 @@ class BlueDetectionTest(TestCase):
             np.count_nonzero(physical_mask),
         )
         self.assertTrue(completed.info["object_completion_validated"])
+        np.testing.assert_array_equal(
+            completed.info["semantic_seed_mask_u8"], semantic_mask
+        )
         self.assertIn("expanded", detail["reason"])
 
     def test_semantic_part_does_not_attach_to_nonoverlapping_object(self):
@@ -372,8 +487,12 @@ class BlueDetectionTest(TestCase):
 
         self.assertIsNotNone(found)
         assert found is not None
-        self.assertEqual(found.source, "color:red+pink")
-        self.assertEqual(why["color_words"], ["red", "pink"])
+        # "white body" now contributes a colour word of its own: white became
+        # nameable when the achromatic bands were added. The point of this test
+        # is that the slash alternatives red/pink stay unioned behind one stable
+        # tracker, which they do.
+        self.assertEqual(found.source, "color:red+pink+white")
+        self.assertEqual(why["color_words"], ["red", "pink", "white"])
 
     def test_multicolour_sponge_is_one_union_detection(self):
         color = np.zeros((200, 300, 3), dtype=np.uint8)

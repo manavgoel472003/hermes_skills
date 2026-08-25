@@ -148,6 +148,110 @@ def masked_points_base(
     return ee + np.linalg.solve(mapping, (tool - points_cam).T).T
 
 
+def constrain_completion_to_semantic_seed(
+    completed_points_m: np.ndarray,
+    semantic_seed_points_m: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Remove transverse RGB-D completion spill around a semantic identity.
+
+    A named part may legitimately expand into a longer differently-coloured
+    body, so completion length remains unbounded.  It may not, however, expand
+    arbitrarily in *two* transverse directions merely because table-plane
+    segmentation joined a nearby object.  The native semantic pixels define a
+    dynamic cross-section and the measured point cloud supplies the extension
+    axis.  No class name or expected object dimension is used.
+
+    If the semantic seed is itself clearly elongated, its major axis is the
+    stronger direction measurement.  Otherwise (for example a circular marker
+    cap), use the completed component's measured major axis.  The filter fails
+    open diagnostically when either cloud is too weak; later aperture and
+    multi-view gates still fail closed before robot motion.
+    """
+    completed = np.asarray(completed_points_m, dtype=float)
+    seed = np.asarray(semantic_seed_points_m, dtype=float)
+    if completed.ndim != 2 or completed.shape[1:] != (3,) \
+            or seed.ndim != 2 or seed.shape[1:] != (3,):
+        return completed, {
+            "ok": False, "applied": False,
+            "reason": "completed or semantic-seed points have invalid dimensions",
+        }
+    completed = completed[np.all(np.isfinite(completed), axis=1)]
+    seed = seed[np.all(np.isfinite(seed), axis=1)]
+    if len(completed) < 50 or len(seed) < 20:
+        return completed, {
+            "ok": False, "applied": False,
+            "reason": "too few completed or semantic-seed points",
+        }
+    # When completion barely changed the native mask there is no spill to
+    # correct, and avoiding an unnecessary PCA makes full-object masks stable.
+    expansion_ratio = float(len(completed)) / max(1.0, float(len(seed)))
+    if expansion_ratio <= 1.20:
+        return completed, {
+            "ok": True, "applied": False,
+            "reason": "RGB-D completion is already close to the semantic mask",
+            "completion_to_seed_ratio": round(expansion_ratio, 3),
+        }
+
+    def principal_axis(points: np.ndarray) -> tuple[np.ndarray, float]:
+        centered = points - np.median(points, axis=0)
+        covariance = centered.T @ centered / max(1, len(centered) - 1)
+        values, vectors = np.linalg.eigh(covariance)
+        order = np.argsort(values)[::-1]
+        major = vectors[:, int(order[0])]
+        ratio = float(values[order[0]] / max(values[order[1]], 1e-12))
+        return major / max(float(np.linalg.norm(major)), 1e-12), ratio
+
+    seed_axis, seed_axis_ratio = principal_axis(seed)
+    completed_axis, _completed_axis_ratio = principal_axis(completed)
+    axis = seed_axis if seed_axis_ratio >= 1.35 else completed_axis
+    axis_source = (
+        "semantic_seed_major_axis"
+        if seed_axis_ratio >= 1.35 else "completed_component_major_axis"
+    )
+    center = np.median(seed, axis=0)
+
+    def radial_distance(points: np.ndarray) -> np.ndarray:
+        offsets = points - center
+        axial = offsets @ axis
+        transverse = offsets - np.outer(axial, axis)
+        return np.linalg.norm(transverse, axis=1)
+
+    seed_radial = radial_distance(seed)
+    # Registration/depth noise deserves a metric floor, while the proportional
+    # term scales naturally from a thin marker to a broad sponge.
+    seed_radius = float(np.percentile(seed_radial, 99.0))
+    padding = max(0.004, 0.20 * seed_radius)
+    radius_limit = seed_radius + padding
+    keep = radial_distance(completed) <= radius_limit
+    constrained = completed[keep]
+    minimum = max(50, int(round(0.70 * len(seed))))
+    if len(constrained) < minimum:
+        return completed, {
+            "ok": False, "applied": False,
+            "reason": (
+                "semantic-seeded cross-section retained too few points; "
+                "original completion kept for downstream fail-closed gates"
+            ),
+            "kept": int(len(constrained)), "minimum": int(minimum),
+        }
+    return constrained, {
+        "ok": True,
+        "applied": len(constrained) < len(completed),
+        "reason": (
+            f"retained {len(constrained)}/{len(completed)} completion points "
+            "inside the semantic-seeded cross-section; long-axis completion "
+            "remains unbounded"
+        ),
+        "kept": int(len(constrained)),
+        "removed": int(len(completed) - len(constrained)),
+        "axis_source": axis_source,
+        "seed_axis_ratio": round(seed_axis_ratio, 3),
+        "seed_radius_mm": round(seed_radius * 1000.0, 2),
+        "padding_mm": round(padding * 1000.0, 2),
+        "completion_to_seed_ratio": round(expansion_ratio, 3),
+    }
+
+
 def consistent_view_extent_indices(
     point_sets_m: Iterable[np.ndarray], *, table_z_m: float,
     absolute_tolerance_m: float = 0.008,

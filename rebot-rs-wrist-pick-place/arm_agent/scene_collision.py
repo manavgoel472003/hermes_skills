@@ -18,6 +18,7 @@ inflating every obstacle column before collision checking.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -775,6 +776,145 @@ def fuse_dense_view_clouds(
     )
 
 
+def _rotation_angle_deg(rotation: np.ndarray) -> float:
+    cosine = float(np.clip((np.trace(rotation) - 1.0) / 2.0, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def _bounded_rigid_voxel_refinement(
+    reference_keys: np.ndarray,
+    moving_keys: np.ndarray,
+    *, voxel_m: float, initial_translation_m: np.ndarray,
+    maximum_rotation_deg: float,
+) -> dict[str, Any]:
+    """Refine a translated diagnostic view with a small rigid ICP step.
+
+    This intentionally has no scipy/Open3D dependency. Correspondences are
+    nearest occupied voxel centres inside a bounded neighbourhood, followed by
+    a Kabsch rigid fit. The fit rotates around the moving cloud centroid so its
+    reported translation remains a physical local correction rather than a
+    large origin-dependent number.
+    """
+    reference = np.asarray(reference_keys, dtype=float) * float(voxel_m)
+    moving = np.asarray(moving_keys, dtype=float) * float(voxel_m)
+    if len(reference) < 80 or len(moving) < 80:
+        return {"ok": False, "reason": "insufficient rigid correspondences"}
+    maximum_samples = 3500
+    if len(moving) > maximum_samples:
+        moving = moving[np.linspace(
+            0, len(moving) - 1, maximum_samples
+        ).astype(int)]
+    reference_lookup = {
+        tuple(int(value) for value in key): key.astype(float) * float(voxel_m)
+        for key in np.asarray(reference_keys, dtype=np.int64)
+    }
+    neighbour_steps = 3
+    offsets = sorted((
+        (dx, dy, dz)
+        for dx in range(-neighbour_steps, neighbour_steps + 1)
+        for dy in range(-neighbour_steps, neighbour_steps + 1)
+        for dz in range(-neighbour_steps, neighbour_steps + 1)
+    ), key=lambda item: item[0] ** 2 + item[1] ** 2 + item[2] ** 2)
+    pivot = np.mean(moving, axis=0)
+    rotation = np.eye(3)
+    shift = np.asarray(initial_translation_m, dtype=float).copy()
+    maximum_rotation = float(np.clip(maximum_rotation_deg, 0.25, 5.0))
+    for _iteration in range(4):
+        transformed = (moving - pivot) @ rotation.T + pivot + shift
+        source = []
+        destination = []
+        for point in transformed:
+            key = np.floor(point / float(voxel_m)).astype(np.int64)
+            best = None
+            best_distance = math.inf
+            for dx, dy, dz in offsets:
+                candidate = reference_lookup.get((
+                    int(key[0] + dx), int(key[1] + dy), int(key[2] + dz)
+                ))
+                if candidate is None:
+                    continue
+                distance = float(np.dot(candidate - point, candidate - point))
+                if distance < best_distance:
+                    best = candidate
+                    best_distance = distance
+            if best is not None:
+                source.append(point)
+                destination.append(best)
+        if len(source) < 80:
+            return {
+                "ok": False,
+                "reason": f"only {len(source)} bounded rigid correspondences",
+            }
+        source_array = np.asarray(source, dtype=float)
+        destination_array = np.asarray(destination, dtype=float)
+        source_center = np.mean(source_array, axis=0)
+        destination_center = np.mean(destination_array, axis=0)
+        covariance = (source_array - source_center).T @ (
+            destination_array - destination_center
+        )
+        try:
+            left, _singular, right_t = np.linalg.svd(covariance)
+        except np.linalg.LinAlgError:
+            return {"ok": False, "reason": "rigid SVD did not converge"}
+        delta_rotation = right_t.T @ left.T
+        if float(np.linalg.det(delta_rotation)) < 0.0:
+            right_t[-1, :] *= -1.0
+            delta_rotation = right_t.T @ left.T
+        delta_translation = destination_center \
+            - source_center @ delta_rotation.T
+        # Compose row-vector transforms, then convert back to the fixed-pivot
+        # representation used for applying the correction to dense points.
+        global_translation = pivot - pivot @ rotation.T + shift
+        rotation = delta_rotation @ rotation
+        global_translation = global_translation @ delta_rotation.T \
+            + delta_translation
+        shift = global_translation - pivot + pivot @ rotation.T
+        angle = _rotation_angle_deg(rotation)
+        if angle > maximum_rotation:
+            return {
+                "ok": False,
+                "reason": (
+                    f"rigid correction requested {angle:.2f}deg, beyond the "
+                    f"{maximum_rotation:.2f}deg diagnostic bound"
+                ),
+            }
+    transformed = (moving - pivot) @ rotation.T + pivot + shift
+    transformed_keys = np.floor(
+        transformed / float(voxel_m)
+    ).astype(np.int64)
+    reference_set = set(reference_lookup)
+    support_offsets = [
+        (dx, dy, dz)
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        for dz in (-1, 0, 1)
+    ]
+    overlap = sum(
+        any((int(key[0] + dx), int(key[1] + dy), int(key[2] + dz))
+            in reference_set for dx, dy, dz in support_offsets)
+        for key in transformed_keys
+    ) / float(max(1, min(len(reference_set), len(transformed_keys))))
+    translated = moving + np.asarray(initial_translation_m, dtype=float)
+    translated_keys = np.floor(
+        translated / float(voxel_m)
+    ).astype(np.int64)
+    translated_overlap = sum(
+        any((int(key[0] + dx), int(key[1] + dy), int(key[2] + dz))
+            in reference_set for dx, dy, dz in support_offsets)
+        for key in translated_keys
+    ) / float(max(1, min(len(reference_set), len(translated_keys))))
+    return {
+        "ok": True,
+        "rotation": rotation,
+        "rotation_deg": _rotation_angle_deg(rotation),
+        "pivot_m": pivot,
+        "translation_m": shift,
+        "overlap": float(overlap),
+        "translated_overlap": float(translated_overlap),
+        "correspondences": len(source),
+    }
+
+
 def register_dense_view_clouds(
     clouds: Iterable[tuple[np.ndarray, np.ndarray]], *,
     table_z_m: float,
@@ -783,16 +923,18 @@ def register_dense_view_clouds(
     adaptive_max_translation_m: float | None = None,
     minimum_overlap: float = 0.15,
     minimum_improvement: float = 0.015,
+    maximum_rotation_deg: float = 3.0,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[dict[str, Any]]]:
-    """Remove small base-frame translation ghosts before diagnostic fusion.
+    """Remove small base-frame rigid ghosts before diagnostic fusion.
 
     Wrist FK plus the saved rigid camera rotation provides the authoritative
     first transform.  Different wrist angles can nevertheless disagree by a
     few millimetres because of joint tracking and hand-eye calibration error.
-    Search only a tightly bounded translation against *above-table* geometry;
-    never deform an individual view and never align using the featureless table
-    plane.  Consequently two objects stacked in one RGB-D frame retain their
-    physical separation, while duplicate copies of the complete scene align.
+    First search a tightly bounded translation against *above-table* geometry,
+    then permit a small rigid rotation only when nearest-voxel ICP materially
+    improves that overlap. Never align using the featureless table plane.
+    Consequently two objects stacked in one RGB-D frame retain their physical
+    separation, while orientation-dependent copies of the complete scene align.
 
     This is intentionally diagnostic registration.  The fail-closed collision
     map uses stationary frames and does not consume these corrected clouds.
@@ -935,26 +1077,95 @@ def register_dense_view_clouds(
             effective_max_step
             and int(np.max(np.abs(best_shift))) >= effective_max_step
         )
-        accepted = bool(
+        translation_accepted = bool(
             np.any(best_shift)
             and not pinned_to_bound
             and best_ratio >= float(minimum_overlap)
             and best_ratio - zero_ratio >= float(minimum_improvement)
         )
+        translation = (
+            best_shift.astype(float) * voxel
+            if translation_accepted else np.zeros(3)
+        )
+        rotation = np.eye(3)
+        rotation_pivot = np.zeros(3)
+        rigid_accepted = False
+        rigid_detail = _bounded_rigid_voxel_refinement(
+            reference_keys, moving_keys,
+            voxel_m=voxel,
+            initial_translation_m=translation,
+            maximum_rotation_deg=maximum_rotation_deg,
+        )
+        if rigid_detail.get("ok"):
+            candidate_rotation = np.asarray(
+                rigid_detail["rotation"], dtype=float
+            )
+            candidate_translation = np.asarray(
+                rigid_detail["translation_m"], dtype=float
+            )
+            candidate_angle = float(rigid_detail["rotation_deg"])
+            candidate_overlap = float(rigid_detail["overlap"])
+            translated_overlap = float(
+                rigid_detail.get("translated_overlap", best_ratio)
+            )
+            bounded_translation = bool(
+                np.max(np.abs(candidate_translation))
+                <= adaptive_maximum + 1e-9
+            )
+            # Do not introduce tiny numerical rotations into a view that the
+            # translation-only registration already explains. A rotational
+            # correction must be measurable and improve occupied-scene
+            # agreement by a full registration margin.
+            rigid_accepted = bool(
+                0.15 <= candidate_angle <= float(maximum_rotation_deg)
+                and bounded_translation
+                and candidate_overlap >= float(minimum_overlap)
+                and candidate_overlap - translated_overlap
+                >= max(0.01, float(minimum_improvement))
+            )
+            if rigid_accepted:
+                rotation = candidate_rotation
+                rotation_pivot = np.asarray(
+                    rigid_detail["pivot_m"], dtype=float
+                )
+                translation = candidate_translation
+                best_ratio = candidate_overlap
+                pinned_to_bound = False
+        accepted = bool(translation_accepted or rigid_accepted)
         # A zero correction is not a failed registration when the views already
         # share enough occupied geometry. Keep that case distinct from a view
         # whose FK/hand-eye transform has no registration consensus at all.
         valid_for_fusion = bool(
             accepted or zero_ratio >= float(minimum_overlap)
         )
-        translation = best_shift.astype(float) * voxel if accepted else np.zeros(3)
-        corrected = points + translation
+        corrected = (
+            (points - rotation_pivot) @ rotation.T
+            + rotation_pivot + translation
+        )
         registered.append((corrected, colors))
         reports.append({
             "view": view_index,
             "accepted": accepted,
             "valid_for_fusion": valid_for_fusion,
             "translation_mm": (translation * 1000.0).round(1).tolist(),
+            "rotation_deg": round(_rotation_angle_deg(rotation), 3),
+            "rotation_matrix": rotation.round(9).tolist(),
+            "rotation_pivot_m": rotation_pivot.round(6).tolist(),
+            "registration_mode": (
+                "bounded_rigid" if rigid_accepted else
+                "bounded_translation" if translation_accepted else
+                "raw"
+            ),
+            "rigid_refinement": {
+                "accepted": rigid_accepted,
+                "reason": rigid_detail.get("reason"),
+                "candidate_rotation_deg": rigid_detail.get("rotation_deg"),
+                "candidate_overlap": rigid_detail.get("overlap"),
+                "translated_overlap": rigid_detail.get(
+                    "translated_overlap"
+                ),
+                "correspondences": rigid_detail.get("correspondences"),
+            },
             "zero_overlap": round(zero_ratio, 4),
             "best_overlap": round(best_ratio, 4),
             "above_table_voxels": int(len(moving_keys)),
@@ -964,10 +1175,12 @@ def register_dense_view_clouds(
             "initial_best_overlap": round(initial_best_ratio, 4),
             "search_bound_mm": round(effective_maximum * 1000.0, 1),
             "reason": (
+                "bounded rigid above-table occupancy registration accepted"
+                if rigid_accepted else
                 "adaptive bounded above-table occupancy registration accepted"
-                if accepted and adaptive_search else
+                if translation_accepted and adaptive_search else
                 "bounded above-table occupancy registration accepted"
-                if accepted else
+                if translation_accepted else
                 "raw FK/hand-eye transform already has sufficient overlap"
                 if valid_for_fusion else
                 "view excluded from fusion; best translation sat on the "

@@ -1,5 +1,7 @@
+import os
 import unittest
 from unittest.mock import Mock
+from unittest.mock import patch
 
 import torch
 
@@ -45,6 +47,11 @@ class Sam3VideoIdentityTests(unittest.TestCase):
 
 
 class Sam31MaskTests(unittest.TestCase):
+    def test_full_sam31_discovery_is_the_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            segmenter = Sam31TextSegmenter()
+        self.assertFalse(segmenter.bootstrap_only)
+
     def test_box_matching_retains_native_mask(self):
         segmenter = Sam31TextSegmenter()
         segmenter._last_box = (10, 20, 40, 60)
@@ -57,7 +64,8 @@ class Sam31MaskTests(unittest.TestCase):
         ))
 
     def test_completed_bootstrap_delegates_later_geometry_queries(self):
-        segmenter = Sam31TextSegmenter()
+        with patch.dict(os.environ, {"REBOT_SAM31_BOOTSTRAP_ONLY": "1"}):
+            segmenter = Sam31TextSegmenter()
         fallback = Mock()
         fallback.locate.return_value = {
             "ok": True, "found": True, "backend": "sam3"

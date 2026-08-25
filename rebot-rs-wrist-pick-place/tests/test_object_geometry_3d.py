@@ -9,6 +9,46 @@ from arm_agent import wrist_servo as ws
 
 
 class ObjectGeometry3DTest(unittest.TestCase):
+    def test_semantic_seed_constrains_transverse_completion_spill(self):
+        rng = np.random.default_rng(91)
+        # A 100 x 12 x 10 mm marker body along X. Its native semantic mask
+        # covers a short but clearly elongated section of the same body.
+        body = rng.uniform(
+            [0.30, -0.006, 0.020], [0.40, 0.006, 0.030], size=(1800, 3)
+        )
+        seed = rng.uniform(
+            [0.315, -0.005, 0.021], [0.345, 0.005, 0.029], size=(500, 3)
+        )
+        # Repeated neighbouring geometry is close enough to survive the old
+        # 75 mm identity sphere and multi-view support filter.
+        neighbour = rng.uniform(
+            [0.32, 0.025, 0.015], [0.39, 0.075, 0.090], size=(1600, 3)
+        )
+
+        filtered, detail = og.constrain_completion_to_semantic_seed(
+            np.vstack((body, neighbour)), seed
+        )
+
+        self.assertTrue(detail["ok"], detail)
+        self.assertTrue(detail["applied"], detail)
+        self.assertEqual(detail["axis_source"], "semantic_seed_major_axis")
+        self.assertGreater(len(filtered), 1200)
+        self.assertLess(np.percentile(np.abs(filtered[:, 1]), 99), 0.015)
+        self.assertGreater(np.ptp(filtered[:, 0]), 0.085)
+
+    def test_full_semantic_mask_does_not_get_needlessly_refiltered(self):
+        rng = np.random.default_rng(92)
+        target = rng.uniform(
+            [0.30, -0.02, 0.02], [0.38, 0.02, 0.05], size=(1000, 3)
+        )
+        filtered, detail = og.constrain_completion_to_semantic_seed(
+            target, target[:900]
+        )
+
+        self.assertTrue(detail["ok"], detail)
+        self.assertFalse(detail["applied"], detail)
+        self.assertEqual(len(filtered), len(target))
+
     def test_masked_points_cannot_escape_cleaned_detection_box(self):
         depth = np.full((30, 40), 200.0, dtype=np.float32)
         mask = np.full((30, 40), 255, dtype=np.uint8)

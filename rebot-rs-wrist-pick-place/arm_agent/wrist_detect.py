@@ -35,6 +35,22 @@ COLORS: dict[str, list[tuple[tuple[int, int, int], tuple[int, int, int]]]] = {
     "blue":   [((98, 150, 50), (130, 255, 255))],
     "purple": [((130, 60, 50), (160, 255, 255))],
     "pink":   [((160, 80, 120), (172, 255, 255))],
+    # Achromatic. White and black have no hue, so they span every H and are
+    # separated on saturation and value instead. Without these, "white cup" and
+    # "black mug" yield no colour word at all and the RGB-D colour path is
+    # skipped entirely, leaving them wholly dependent on a semantic hit -- which
+    # is how a plainly visible white cup went undetected 0/3 frames.
+    # Bounds measured on this rig: white cup S=24/V=189, pale table S=29/V=204,
+    # dark mat S=152/V=76, black object S=67/V=39, dark green mug S=81/V=55.
+    # Black stays under V=45/S=70: at V=50/S=80 the dark green mug read 15%
+    # black, above the 12% veto threshold, and tightening drops it to 9% while
+    # the genuinely black object still reads 46%. A shadowed coloured object is
+    # the real hazard here, not the table.
+    # the pale table matches "white" but cannot be selected, because the
+    # detector resolves a depth-connected object above the table plane first
+    # and only then reads colour inside it.
+    "white":  [((0, 0, 150), (180, 60, 255))],
+    "black":  [((0, 0, 0), (180, 70, 45))],
 }
 # Words that name a colour without being one.
 _ALIASES = {"magenta": "purple", "violet": "purple", "cyan": "blue",
@@ -396,6 +412,93 @@ def _box_has_all_colors(
         >= min_pixels
         for name in names
     )
+
+
+#: Fraction of a detection's own surface that must show the single colour the
+#: prompt names.  Measured on this rig: a correct marker reads 30-32% (the
+#: barrel is white, only the cap and label carry the colour) while a
+#: wrong-coloured one reads 0-3%.  12% sits well clear of both, leaving room
+#: for a shaded or edge-on face without admitting an outright wrong colour.
+COLOR_VETO_FRACTION = float(
+    os.getenv("REBOT_COLOR_VETO_FRACTION", "0.12")
+)
+
+
+def color_veto_enabled() -> bool:
+    """Whether a single-colour prompt may veto a semantic detection."""
+    return os.getenv("REBOT_COLOR_VETO", "1").strip().lower() not in {
+        "0", "false", "no", "off"
+    }
+
+
+def _globally_distinctive_color(name: str) -> bool:
+    """Whether colour alone can safely identify an object in the full frame.
+
+    Chromatic HSV bands constrain both hue and saturation, so they are useful
+    deterministic fallbacks after a semantic noun miss. Achromatic bands span
+    essentially every hue (white/black); using those globally discards the noun
+    and can turn ``white cup`` into any white marker, paper, or table patch.
+    """
+    bands = COLORS.get(name, [])
+    if not bands:
+        return False
+    return all(
+        (int(hi[0]) - int(lo[0])) < 170 and int(lo[1]) >= 50
+        for lo, hi in bands
+    )
+
+
+def semantic_color_fraction(
+    color_bgr: np.ndarray,
+    depth_mm: np.ndarray,
+    detection: "Detection",
+    name: str,
+) -> float | None:
+    """How much of ``detection``'s own surface actually shows ``name``.
+
+    Returns ``None`` when there is too little surface to judge, which callers
+    must treat as "no opinion" rather than as a refusal.
+
+    The measurement is confined to the object's depth shell.  A box alone would
+    include the table behind the object, which both dilutes the colour of a
+    correct object and can lend a wrong one the colour of whatever it sits on.
+    """
+    if not isinstance(depth_mm, np.ndarray) or depth_mm.ndim != 2:
+        return None
+    height, width = color_bgr.shape[:2]
+    x1, y1, x2, y2 = detection.box
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(width, int(x2)), min(height, int(y2))
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return None
+    pixels = np.zeros((height, width), dtype=bool)
+    pixels[y1:y2, x1:x2] = True
+    native_mask_value = (getattr(detection, "info", {}) or {}).get(
+        "mask_u8"
+    )
+    native_mask = (
+        np.asarray(native_mask_value, dtype=np.uint8)
+        if native_mask_value is not None else np.empty((0, 0), np.uint8)
+    )
+    # A semantic box can include a neighbouring marker, cup, or background at
+    # nearly the same depth.  Those pixels previously lent the wrong instance
+    # enough requested colour to pass the veto.  When the detector supplies a
+    # native mask, measure only that exact object surface; retain the bounded
+    # box behavior solely for older detectors without masks.
+    if native_mask.shape == pixels.shape and np.any(native_mask > 0):
+        pixels &= native_mask > 0
+    if depth_mm.shape == pixels.shape:
+        shell = pixels & (
+            (depth_mm > detection.z_mm - 45.0)
+            & (depth_mm < detection.z_mm + 45.0)
+        )
+        if int(np.count_nonzero(shell)) >= 40:
+            pixels = shell
+    total = int(np.count_nonzero(pixels))
+    if total < 40:
+        return None
+    hits = int(np.count_nonzero((color_mask(color_bgr, name) > 0) & pixels))
+    return hits / float(total)
 
 
 def detect_color_conjunction(
@@ -813,6 +916,108 @@ def detect_colored_tabletop_object(
     )
 
 
+def detect_color_seeded_instance(
+    color_bgr: np.ndarray,
+    depth_mm: np.ndarray,
+    intr: Intrinsics,
+    name: str,
+    *,
+    near_mm: float = NEAR_MM,
+    far_mm: float = FAR_MM,
+) -> Detection | None:
+    """Build one physical object mask from an exact requested-colour seed.
+
+    Text grounding can choose the wrong same-class object while ignoring its
+    colour adjective.  Conversely, a raw HSV mask often covers only a marker
+    cap or label.  This path uses the deterministic colour pixels to select an
+    independently segmented tabletop object, then retains only the connected
+    physical component containing those pixels.  The resulting mask—not its
+    rectangle—is authoritative for identity and metric geometry.
+    """
+    if name not in COLORS:
+        return None
+    physical = detect_colored_tabletop_object(
+        color_bgr, depth_mm, intr, [name],
+        near_mm=near_mm, far_mm=far_mm,
+    )
+    if physical is None:
+        return None
+    raw_mask = np.asarray(
+        (getattr(physical, "info", {}) or {}).get("mask_u8"),
+        dtype=np.uint8,
+    )
+    if raw_mask.shape != depth_mm.shape or not np.any(raw_mask > 0):
+        return None
+    requested = color_mask(color_bgr, name)
+    requested = cv2.morphologyEx(
+        requested, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)
+    )
+    seed = np.where(
+        (raw_mask > 0) & (requested > 0), 255, 0
+    ).astype(np.uint8)
+    minimum_pixels = int(np.clip(_env_float(
+        "REBOT_COLOR_SEED_MIN_PIXELS", 25.0
+    ), 12.0, 200.0))
+    if int(np.count_nonzero(seed)) < minimum_pixels:
+        return None
+    instance_mask, separation = _separate_semantic_seeded_component(
+        raw_mask, seed
+    )
+    valid = (instance_mask > 0) & depth_gate(
+        depth_mm, near_mm, far_mm
+    )
+    values = np.asarray(depth_mm[valid], dtype=float)
+    if values.size < max(40, minimum_pixels):
+        return None
+    contours, _ = cv2.findContours(
+        instance_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    moments = cv2.moments(contour)
+    if moments["m00"] <= 0:
+        return None
+    u = float(moments["m10"] / moments["m00"])
+    v = float(moments["m01"] / moments["m00"])
+    z_mm = float(np.median(values))
+    x, y, width, height = cv2.boundingRect(contour)
+    (_, _), (rect_width, rect_height), _ = cv2.minAreaRect(contour)
+    min_width_mm, max_width_mm = _metric_size(
+        rect_width, rect_height, z_mm, intr
+    )
+    seed_pixels = int(np.count_nonzero(seed))
+    return Detection(
+        box=(x, y, x + width, y + height),
+        uv=(u, v), z_mm=z_mm,
+        p_cam_mm=deproject(u, v, z_mm, intr),
+        source="rgbd:color_seeded_instance",
+        area_px=float(np.count_nonzero(instance_mask)),
+        min_width_mm=min_width_mm,
+        max_width_mm=max_width_mm,
+        info={
+            **(getattr(physical, "info", {}) or {}),
+            "mask_u8": instance_mask,
+            # Reuse the established seed-mask field consumed by registered
+            # multi-view fusion.  Its kind is explicit so diagnostics do not
+            # misrepresent this deterministic mask as a semantic-model mask.
+            "semantic_seed_mask_u8": seed,
+            "identity_seed_kind": "direct_color_mask",
+            "identifier_colors": [name],
+            "identifier_color_pixels": {name: seed_pixels},
+            "semantic_seeded_instance_separation": separation,
+            "segmentation_source":
+                "color_seeded_rgbd_object_completion:native_mask",
+            "depth_basis": "color_seeded_rgbd_object",
+            "object_completion_validated": True,
+            "semantic_identity_source": "rgbd:color_seeded_instance",
+            "identity_basis":
+                "exact_color_seed_inside_table_plane_depth_component",
+            **rect_geometry(contour),
+        },
+    )
+
+
 def complete_semantic_with_rgbd_object(
     color_bgr: np.ndarray,
     depth_mm: np.ndarray,
@@ -938,6 +1143,14 @@ def complete_semantic_with_rgbd_object(
             **(getattr(semantic, "info", {}) or {}),
             **physical_info,
             "mask_u8": np.asarray(physical_info["mask_u8"], dtype=np.uint8),
+            # Preserve the model-authoritative identity pixels separately from
+            # the larger RGB-D completion.  Multi-view metric fusion uses this
+            # seed to stop a depth component shared with a neighbour from
+            # becoming part of the requested object's 3-D box.  The completed
+            # mask remains the ordinary detection/grasp envelope.
+            "semantic_seed_mask_u8": np.asarray(
+                semantic_mask, dtype=np.uint8
+            ).copy(),
             "segmentation_source": "semantic_seeded_rgbd_object_completion",
             "depth_basis": "semantic_seeded_rgbd_object",
             "object_completion_validated": True,
@@ -1438,6 +1651,16 @@ def segment_semantic_envelope(
             # The metric 3D box fitter needs the exact semantic pixels rather
             # than the axis-aligned detector box.
             "mask_u8": component,
+            **({
+                "semantic_seed_mask_u8": np.asarray(
+                    (getattr(semantic_box, "info", {}) or {}).get(
+                        "semantic_seed_mask_u8"
+                    ),
+                    dtype=np.uint8,
+                ).copy(),
+            } if (getattr(semantic_box, "info", {}) or {}).get(
+                "semantic_seed_mask_u8"
+            ) is not None else {}),
             "local_grasp_width_mm": local_width,
             "cross_section_candidates": profile,
             **geometry,
@@ -1552,12 +1775,14 @@ def detect_vlm(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics,
 
 def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, description: str,
            *, near_mm: float = NEAR_MM, far_mm: float = FAR_MM,
-           allow_vlm: bool = True) -> tuple[Detection | None, dict[str, Any]]:
+           allow_vlm: bool = True,
+           semantic_noun_first: bool = False) -> tuple[Detection | None, dict[str, Any]]:
     """Locate ``description`` in a wrist RGB-D frame.
 
-    With GPU vision enabled, Grounding DINO is primary for named objects so a
-    colored cap cannot silently stand in for the whole requested object.  The
-    inexpensive color/depth detector remains the deterministic fallback.
+    Hybrid mode resolves the semantic noun first and verifies its exact mask
+    against any requested colour. If that semantic result fails, a distinctive
+    chromatic colour may seed one physical RGB-D component as a fallback;
+    achromatic colour alone is never allowed to discard the noun identity.
 
     Returns ``(detection | None, why)`` where ``why`` records what each detector
     did, so a failure is explainable to the planner instead of just empty.
@@ -1582,6 +1807,43 @@ def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, descri
     ).strip().lower() == "hybrid"
     names = colors_of(description)
     require_all_colors = _requires_all_colors(description)
+    color_seeded_fallback_enabled = os.getenv(
+        "REBOT_COLOR_SEEDED_PRIMARY", "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    distinctive_names = [
+        name for name in names if _globally_distinctive_color(name)
+    ]
+    color_seeded_fallback_allowed = bool(
+        hybrid_identity
+        and color_seeded_fallback_enabled
+        and len(names) == 1
+        and not require_all_colors
+        and distinctive_names
+    )
+    # Pick targets retain the proven deterministic single-colour path. Exact
+    # placement references opt into noun-first mode because their semantic
+    # class (for example cup versus marker) defines the destination itself.
+    if color_seeded_fallback_allowed and not semantic_noun_first:
+        found = detect_color_seeded_instance(
+            color_bgr, depth_mm, intr, names[0],
+            near_mm=near_mm, far_mm=far_mm,
+        )
+        why["color_seeded_primary_result"] = (
+            "found" if found is not None else "not found"
+        )
+        if found is not None:
+            why["used"] = found.source
+            why["color_seeded_primary"] = {
+                "color": names[0],
+                "reason": (
+                    "pick-target policy: exact requested-colour pixels "
+                    "selected one physical RGB-D object before semantics"
+                ),
+            }
+            return found, why
+    # Noun-first references resolve the semantic object and verify its exact
+    # mask against the requested colour. Only a distinctive chromatic colour
+    # may recover a semantic miss; achromatic colour never replaces the noun.
     if allow_vlm and vision_enabled and vision_primary:
         found = detect_vlm(
             color_bgr, depth_mm, intr, description,
@@ -1593,13 +1855,14 @@ def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, descri
             if semantic_tracking_lost(description):
                 why.update(
                     semantic_tracking_lost=True,
-                    used=None,
                     reason=(
                         "SAM3 video lost the locked target instance; "
-                        "colour/depth reassociation was intentionally blocked"
+                        "only a distinctive exact-colour seed may recover it"
                     ),
                 )
-                return None, why
+                if not color_seeded_fallback_allowed:
+                    why["used"] = None
+                    return None, why
         if found is not None:
             if hybrid_identity:
                 complete_query = detect_vlm(
@@ -1632,12 +1895,66 @@ def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, descri
                     if _box_has_all_colors(color_bgr, found.box, names)
                     else "incomplete under HSV; accepted semantic noun match"
                 )
+            elif len(names) == 1 and color_veto_enabled():
+                # A single named colour is the one case where HSV is stronger
+                # evidence than the noun match. SAM 3 has been observed to
+                # return whichever object is most salient and ignore the colour
+                # word entirely -- offering a green marker for "red marker",
+                # "blue marker" and back. A near-total absence of the named
+                # colour on the object's own surface is positive evidence of
+                # the wrong instance, so refuse it and let the colour-primary
+                # RGB-D path below answer instead. Deliberately not applied to
+                # multi-colour prompts, where a shaded face routinely hides one
+                # of the named colours.
+                fraction = semantic_color_fraction(
+                    color_bgr, depth_mm, found, names[0]
+                )
+                if fraction is None:
+                    why["semantic_color_check"] = (
+                        "too little measurable surface; accepted noun match"
+                    )
+                elif fraction < COLOR_VETO_FRACTION:
+                    why["semantic_color_veto"] = {
+                        "color": names[0],
+                        "fraction": round(fraction, 4),
+                        "required": COLOR_VETO_FRACTION,
+                        "reason": (
+                            f"semantic match shows {fraction:.1%} "
+                            f"{names[0]}; below the "
+                            f"{COLOR_VETO_FRACTION:.0%} required"
+                        ),
+                    }
+                    found = None
+                else:
+                    why["semantic_color_check"] = (
+                        f"{fraction:.1%} {names[0]} on the object"
+                    )
+            if found is not None:
+                why["used"] = found.source
+                return found, why
+    if color_seeded_fallback_allowed:
+        found = detect_color_seeded_instance(
+            color_bgr, depth_mm, intr, names[0],
+            near_mm=near_mm, far_mm=far_mm,
+        )
+        why["color_seeded_fallback_result"] = (
+            "found" if found is not None else "not found"
+        )
+        if found is not None:
             why["used"] = found.source
+            why["color_seeded_fallback"] = {
+                "color": names[0],
+                "reason": (
+                    "semantic noun was unavailable or failed exact-mask "
+                    "colour verification; distinctive requested-colour "
+                    "pixels selected one physical RGB-D object"
+                ),
+            }
             return found, why
     # Hybrid identity needs a physical object candidate even when open-vocabulary
     # grounding misses. The depth/table component is authoritative here; HSV is
     # only evidence inside that component. Legacy detection order is untouched.
-    if hybrid_identity and names:
+    if hybrid_identity and names and distinctive_names:
         found = detect_colored_tabletop_object(
             color_bgr, depth_mm, intr, names,
             require_all=require_all_colors,
@@ -1649,6 +1966,12 @@ def detect(color_bgr: np.ndarray, depth_mm: np.ndarray, intr: Intrinsics, descri
         if found is not None:
             why["used"] = found.source
             return found, why
+    elif hybrid_identity and names:
+        why["rgbd_colored_object_result"] = (
+            "skipped: achromatic colour cannot replace semantic noun identity"
+        )
+        why["used"] = None
+        return None, why
     why["color_word"] = names[0] if len(names) == 1 else None
     why["color_words"] = names
     if names:

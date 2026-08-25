@@ -573,6 +573,38 @@ class SceneCollisionMapTest(unittest.TestCase):
         corrected_z = np.unique(np.round(registered[1][0][:, 2], 3))
         self.assertEqual(corrected_z.tolist(), [0.025, 0.045])
 
+    def test_registration_refines_small_orientation_dependent_ghost(self):
+        rng = np.random.default_rng(21)
+        keys = np.unique(np.column_stack((
+            rng.integers(50, 100, 5000),
+            rng.integers(-30, 35, 5000),
+            rng.integers(5, 35, 5000),
+        )), axis=0)[:2500]
+        anchor = keys.astype(float) * 0.004 + 0.0001
+        angle = np.deg2rad(2.0)
+        rotation = np.array([
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        centre = np.mean(anchor, axis=0)
+        ghosted = (anchor - centre) @ rotation.T + centre \
+            + np.array([0.004, -0.004, 0.0])
+        colors = np.zeros((len(anchor), 3), dtype=np.uint8)
+
+        registered, reports = register_dense_view_clouds(
+            [(anchor, colors), (ghosted, colors.copy())],
+            table_z_m=0.0, voxel_m=0.004, max_translation_m=0.012,
+            minimum_overlap=0.15,
+        )
+
+        self.assertTrue(reports[1]["accepted"], reports[1])
+        self.assertEqual(reports[1]["registration_mode"], "bounded_rigid")
+        self.assertLessEqual(reports[1]["rotation_deg"], 3.0)
+        before = np.mean(np.linalg.norm(ghosted - anchor, axis=1))
+        after = np.mean(np.linalg.norm(registered[1][0] - anchor, axis=1))
+        self.assertLess(after, before * 0.6)
+
     def test_registration_keeps_already_aligned_view_for_fusion(self):
         rng = np.random.default_rng(11)
         keys = np.unique(np.column_stack((

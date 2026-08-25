@@ -42,6 +42,7 @@ def plan_topdown_route(
     destination_radius_m: float | None = None,
     minimum_travel_z_m: float | None = None,
     destination_height_xy_m: np.ndarray | None = None,
+    minimum_destination_top_m: float | None = None,
 ) -> tuple[VoxelRoute | None, dict[str, Any]]:
     """Plan XY motion through free cells, trying higher Z layers as needed."""
     start = np.asarray(start_m, dtype=float)
@@ -101,12 +102,30 @@ def plan_topdown_route(
         if float(np.linalg.norm(height_xy - closest_xy)) \
                 <= destination_radius + 1e-9:
             goal_top = max(goal_top, float(box_hi[2]))
+    # A compact semantic reference mask can measure a stack target's upper
+    # surface more precisely than the deliberately coarse collision boxes.
+    # Never let voxel coarsening lower that measured top: the release must
+    # clear the taller of the two estimates.  This is an elevation floor, not
+    # a bypass of scene collision or workspace checks.
+    measured_goal_top = None
+    if minimum_destination_top_m is not None:
+        try:
+            candidate = float(minimum_destination_top_m)
+        except (TypeError, ValueError):
+            candidate = float("nan")
+        if math.isfinite(candidate):
+            measured_goal_top = candidate
+            goal_top = max(goal_top, candidate)
     required_release_z = float(max(lo[2], goal_top + drop_clearance_m))
     if required_release_z > hi[2] + 1e-9:
         return None, {
             "reason": "destination column plus carried-object drop clearance "
                       "exceeds the guarded Z workspace",
             "destination_column_top_m": round(goal_top, 4),
+            "measured_destination_top_floor_m": (
+                None if measured_goal_top is None
+                else round(measured_goal_top, 4)
+            ),
             "destination_height_xy_m": height_xy.round(4).tolist(),
             "required_release_z_m": round(required_release_z, 4),
             "maximum_release_z_m": round(float(hi[2]), 4),

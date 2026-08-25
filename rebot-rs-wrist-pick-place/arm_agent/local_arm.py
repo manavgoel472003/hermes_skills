@@ -718,6 +718,8 @@ class LocalArm:
         obstacle_names: set[str],
         payload_center_m: Any,
         payload_aabb_size_m: Any,
+        measured_payload_aabb_size_m: Any = None,
+        strict_obstacle_names: set[str] | None = None,
     ) -> dict[str, Any]:
         """Validate exact initial contacts for a scoped vertical extraction.
 
@@ -795,8 +797,25 @@ class LocalArm:
                 "discovered_boxes": [],
             }
 
-        payload_lower = payload_center - payload_size / 2.0
-        payload_upper = payload_center + payload_size / 2.0
+        # The reservation tube widens this envelope so nearby names can be
+        # discovered and guarded. That widened box is a *containment* test only.
+        # It must not become the reported payload: the caller derives lift
+        # distance from the payload bottom, so an inflated bottom silently turns
+        # an uncertainty allowance into extra commanded travel. Keep the guarded
+        # box for the separation checks and report the measured one.
+        guard_lower = payload_center - payload_size / 2.0
+        guard_upper = payload_center + payload_size / 2.0
+        measured_size = payload_size
+        if measured_payload_aabb_size_m is not None:
+            candidate_size = np.asarray(
+                measured_payload_aabb_size_m, dtype=float
+            )
+            if candidate_size.shape == (3,) \
+                    and np.all(np.isfinite(candidate_size)) \
+                    and np.all(candidate_size > 0.0):
+                measured_size = candidate_size
+        payload_lower = payload_center - measured_size / 2.0
+        payload_upper = payload_center + measured_size / 2.0
         scale = max(
             1.0,
             float(np.max(np.abs(payload_center))),
@@ -810,27 +829,53 @@ class LocalArm:
             "center_m": record["center_m"].round(4).tolist(),
             "size_m": record["size_m"].round(4).tolist(),
         } for record in records]
+        # An *exact* reported contact that lies outside the payload geometry is
+        # a contradiction and still fails closed. A name discovered only by the
+        # reservation tube is different: that tube is deliberately generous, so
+        # it can surface boxes the payload does not actually touch. Those are
+        # reserved-near, not initial contacts, and must simply be dropped rather
+        # than abort the extraction — otherwise a distant box anywhere in the
+        # scene can veto every escape.
+        strict_names = set(strict_obstacle_names or obstacle_names)
+        contained: list[dict[str, Any]] = []
+        dropped_far_names: list[str] = []
         for record in records:
             separation = np.maximum(
-                payload_lower - record["upper_m"],
-                record["lower_m"] - payload_upper,
+                guard_lower - record["upper_m"],
+                record["lower_m"] - guard_upper,
             )
             if np.any(separation > epsilon):
-                return {
-                    "ok": False,
-                    "reason": (
-                        "reported payload overlap lies outside the attached "
-                        "payload geometry"
-                    ),
-                    "allowed_initial_obstacles": sorted(obstacle_names),
-                    "rejected_obstacle": record["name"],
-                    "separation_m": separation.round(6).tolist(),
-                    "payload_bounds_m": [
-                        payload_lower.round(4).tolist(),
-                        payload_upper.round(4).tolist(),
-                    ],
-                    "discovered_boxes": diagnostic_boxes,
-                }
+                if record["name"] in strict_names:
+                    return {
+                        "ok": False,
+                        "reason": (
+                            "reported payload overlap lies outside the attached "
+                            "payload geometry"
+                        ),
+                        "allowed_initial_obstacles": sorted(obstacle_names),
+                        "rejected_obstacle": record["name"],
+                        "separation_m": separation.round(6).tolist(),
+                        "payload_bounds_m": [
+                            payload_lower.round(4).tolist(),
+                            payload_upper.round(4).tolist(),
+                        ],
+                        "discovered_boxes": diagnostic_boxes,
+                    }
+                dropped_far_names.append(record["name"])
+                continue
+            contained.append(record)
+        if not contained:
+            return {
+                "ok": True,
+                "reason": (
+                    "no reserved scene box actually intersects the payload"
+                ),
+                "allowed_initial_obstacles": [],
+                "discovered_boxes": diagnostic_boxes,
+                "dropped_far_obstacles": sorted(dropped_far_names),
+            }
+        records = contained
+        obstacle_names = {record["name"] for record in records}
 
         cluster_lower = np.min(np.stack([
             record["lower_m"] for record in records
@@ -1167,11 +1212,34 @@ class LocalArm:
                 discovered,
                 payload_center_m if payload_center_m is not None else [0.0] * 3,
                 guarded_payload_size,
+                measured_payload_aabb_size_m=payload_aabb_size_m,
+                strict_obstacle_names=exact_initial_obstacles,
             )
             if not cluster.get("ok"):
                 self._payload_escape_obstacles = set()
                 self._payload_escape_reference = None
                 return cluster
+            # The reservation tube may have surfaced boxes the payload does not
+            # touch. Only the names the cluster actually retained may have their
+            # collisions excepted; guarding a distant box would disable a real
+            # obstacle for the whole extraction.
+            retained_names = set(cluster.get("allowed_initial_obstacles") or [])
+            if retained_names:
+                dropped = discovered - retained_names
+                discovered = discovered & retained_names
+                reserved_near_obstacles = (
+                    reserved_near_obstacles & retained_names
+                )
+                reserved_near_distances = {
+                    name: distance
+                    for name, distance in reserved_near_distances.items()
+                    if name in retained_names
+                }
+                if dropped:
+                    cluster = {
+                        **cluster,
+                        "dropped_far_obstacles": sorted(dropped),
+                    }
             self._payload_escape_obstacles = set(discovered)
             self._payload_escape_reference = (
                 {

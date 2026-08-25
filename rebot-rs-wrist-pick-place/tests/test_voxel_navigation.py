@@ -83,6 +83,31 @@ class VoxelNavigationTest(TestCase):
             route.detail["destination_column_top_m"], 0.12, places=3
         )
 
+    def test_measured_stack_top_floor_beats_a_coarse_lower_collision_box(self):
+        # Collision geometry is intentionally coarse.  A compact RGB-D mask
+        # can see a stack reference's top 10 mm higher, and the payload must
+        # not graze that surface merely because the collision box is shorter.
+        coarse_reference = ObstacleBox(
+            (0.45, 0.0, 0.075), (0.04, 0.04, 0.10)
+        )
+        route, detail = plan_topdown_route(
+            _scene(coarse_reference), np.asarray((0.25, 0.0, 0.20)),
+            np.asarray((0.45, 0.0)),
+            workspace_lo_m=(0.15, -0.20, 0.0),
+            workspace_hi_m=(0.50, 0.20, 0.30),
+            workspace_margin_m=0.01, ee_radius_m=0.02,
+            vertical_clearance_m=0.02, drop_clearance_m=0.03,
+            minimum_destination_top_m=0.135,
+            resolution_m=0.01,
+        )
+        self.assertIsNotNone(route, detail)
+        assert route is not None
+        self.assertAlmostEqual(route.detail["destination_column_top_m"], 0.135)
+        self.assertAlmostEqual(
+            route.detail["measured_destination_top_floor_m"], 0.135
+        )
+        self.assertAlmostEqual(route.release_endpoint_m[2], 0.165)
+
     def test_stack_samples_height_at_payload_center_not_ee_xy(self):
         reference = ObstacleBox((0.45, 0.0, 0.07), (0.02, 0.02, 0.10))
         route, detail = plan_topdown_route(
