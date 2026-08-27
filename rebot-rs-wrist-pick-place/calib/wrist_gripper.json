@@ -1,0 +1,16 @@
+{
+  "mm_per_rad": 19.09859317102744,
+  "close_rad": 0.0,
+  "close_deg": 0.0,
+  "open_rad": 5.910208446028398,
+  "open_deg": 338.63,
+  "max_aperture_mm": 112.88,
+  "saved_at": "2026-07-29T12:37:09",
+  "detail": {
+    "method": "measured_span",
+    "aperture_mm": 50.0,
+    "measured_rad": 2.6179938779914944,
+    "measured_deg": 150.0,
+    "at_fraction": 0.442961344240026
+  }
+}

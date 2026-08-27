@@ -2637,8 +2637,36 @@ def _validate_object_gripper_fit(
         width_mm, major_mm, aperture_mm, preopen_mm
     )):
         return False, {"reason": "object or jaw dimensions are invalid"}
-    effective_clearance_mm, clearance_boundary_slop_mm = \
-        _effective_open_clearance_mm()
+    registered_subsection_entry = (getattr(grasp, "info", {}) or {}).get(
+        "registered_subsection_entry"
+    )
+    if isinstance(registered_subsection_entry, dict):
+        # This flag is installed only by ``_registered_subsection_fits_aperture``
+        # after registered and stationary RGB-D boxes agree.  It replaces the
+        # generic whole-mask entry margin with their measured disagreement; the
+        # physical jaw opening remains hard-clamped at ``aperture_mm``.
+        try:
+            effective_clearance_mm = float(
+                registered_subsection_entry["measured_uncertainty_mm"]
+            )
+            approved_width_mm = float(
+                registered_subsection_entry["observed_width_mm"]
+            )
+        except (KeyError, TypeError, ValueError):
+            return False, {"reason": "registered subsection entry evidence is invalid"}
+        if not (math.isfinite(effective_clearance_mm)
+                and effective_clearance_mm >= 0.0
+                and math.isfinite(approved_width_mm)
+                and abs(approved_width_mm - width_mm) <= 1.0):
+            return False, {
+                "reason": "registered subsection width no longer matches the jaw plan"
+            }
+        clearance_boundary_slop_mm = effective_clearance_mm
+        clearance_basis = "registered/stationary projected-width disagreement"
+    else:
+        effective_clearance_mm, clearance_boundary_slop_mm = \
+            _effective_open_clearance_mm()
+        clearance_basis = "configured generic entry clearance"
     required_open_mm = width_mm + effective_clearance_mm
     if required_open_mm > aperture_mm + 1e-6:
         return False, {
@@ -2657,6 +2685,7 @@ def _validate_object_gripper_fit(
             ),
             "effective_clearance_mm": effective_clearance_mm,
             "clearance_boundary_slop_mm": clearance_boundary_slop_mm,
+            "clearance_basis": clearance_basis,
         }
     if major_mm > max(1.0, GRASP_MAX_MAJOR_MM):
         return False, {
@@ -2706,6 +2735,7 @@ def _validate_object_gripper_fit(
         "configured_clearance_mm": max(0.0, GRASP_MIN_OPEN_CLEARANCE_MM),
         "effective_clearance_mm": effective_clearance_mm,
         "clearance_boundary_slop_mm": clearance_boundary_slop_mm,
+        "clearance_basis": clearance_basis,
         "end_clearance_mm": end_clearance_mm,
         "preopen_mm": preopen_mm,
     }
@@ -3388,6 +3418,219 @@ def _stable_visual_subsection_fallback(
         "max_aperture_mm": aperture_mm,
         "metric_projection_mm": projected_mm,
         "orientation_mode": orientation_mode,
+    }
+
+
+def _measure_locked_visual_slice(
+    frame: tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]],
+    feature: WD.Detection, expected_body: WD.Detection,
+) -> tuple[WD.Detection | None, dict[str, Any]]:
+    """Measure one fixed mask slice at a locked jaw-section image location.
+
+    Unlike ``_plan_scene_grasp_geometry``, this never asks the geometry planner
+    to pick a new best section.  That planner is correct for primary grasps but
+    is exactly what made successive sponge fallback frames select different
+    shoulders/edges.  We retain the locked section's image position and measure
+    only the mask width perpendicular to the current mask's long axis.
+    """
+    color, depth, intr = frame
+    diagnostics: dict[str, Any] = {"attempt": "locked_visual_slice"}
+    envelope = WD.segment_semantic_envelope(
+        color, depth, intr, feature, feature,
+        near_mm=WD.NEAR_MM, far_mm=WD.FAR_MM, diagnostics=diagnostics,
+    )
+    if envelope is None:
+        return None, {"reason": diagnostics.get(
+            "reason", "semantic RGB-D mask unavailable for locked slice"
+        )}
+    info = getattr(envelope, "info", {}) or {}
+    mask = np.asarray(info.get("mask_u8"), dtype=np.uint8)
+    if mask.shape != np.asarray(depth).shape or not np.any(mask > 0):
+        return None, {"reason": "locked slice semantic mask is invalid"}
+    try:
+        anchor_uv = np.asarray(expected_body.uv, dtype=float)
+        long_axis_deg = float(info["long_axis_deg"])
+    except (KeyError, TypeError, ValueError):
+        return None, {"reason": "locked slice anchor or mask axis is invalid"}
+    if anchor_uv.shape != (2,) or not np.all(np.isfinite(anchor_uv)):
+        return None, {"reason": "locked slice anchor is invalid"}
+    ys, xs = np.nonzero(mask > 0)
+    if xs.size < 20:
+        return None, {"reason": "locked slice has too few mask pixels"}
+    nearest = int(np.argmin((xs.astype(float) - anchor_uv[0]) ** 2 +
+                             (ys.astype(float) - anchor_uv[1]) ** 2))
+    centre_uv = (float(xs[nearest]), float(ys[nearest]))
+    valid_depth = (mask > 0) & np.isfinite(depth) & (depth > 0)
+    local_radius_px = 8.0
+    local = valid_depth & (
+        (np.indices(depth.shape)[1] - centre_uv[0]) ** 2 +
+        (np.indices(depth.shape)[0] - centre_uv[1]) ** 2 <= local_radius_px ** 2
+    )
+    values = np.asarray(depth[local], dtype=float)
+    if values.size < 8:
+        values = np.asarray(depth[valid_depth], dtype=float)
+    if values.size < 8:
+        return None, {"reason": "locked slice has insufficient valid depth"}
+    z_mm = float(np.median(values))
+    width_mm = WD.local_cross_section_width_mm(
+        mask, centre_uv, long_axis_deg, z_mm, intr,
+    )
+    if width_mm is None:
+        return None, {"reason": "locked slice width could not be measured"}
+    measured = replace(
+        expected_body,
+        uv=centre_uv,
+        z_mm=z_mm,
+        p_cam_mm=WD.deproject(centre_uv[0], centre_uv[1], z_mm, intr),
+        min_width_mm=float(width_mm),
+        info={
+            **(getattr(expected_body, "info", {}) or {}),
+            "position_basis": "locked_depth_gated_visual_slice",
+            "locked_slice_long_axis_deg": long_axis_deg,
+            "locked_slice_mask_pixels": int(np.count_nonzero(mask)),
+        },
+    )
+    return measured, {
+        "reason": "fixed depth-gated local mask slice measured",
+        "mask_pixels": int(np.count_nonzero(mask)),
+        "long_axis_deg": long_axis_deg,
+    }
+
+
+def _capture_stable_visual_subsection(
+    eye: "WristEye", description: str, current_rpy: tuple[float, float, float],
+    expected_geometry: GG.GraspGeometry, log: Callable[[str], None], *,
+    min_frames: int = 2, max_frames: int = 4,
+) -> tuple[GG.GraspGeometry | None, dict[str, Any]]:
+    """Re-observe one local grasp section without replacing locked 3D shape.
+
+    This is deliberately a late, narrow fallback for an elongated object whose
+    complete OBB projects too widely through the jaws.  The normal grasp path
+    (including marker grasps) never calls it.  It obtains repeated stationary
+    RGB-D measurements at the already verified metric grasp point, so a noisy
+    PCA attitude cannot turn a safely measured local section into a rejection.
+    The full registered box is *not* changed: it remains collision/payload
+    authority.  A fresh observation that wanders away from the locked body is
+    rejected rather than allowed to select a neighbouring object.
+    """
+    body = expected_geometry.grasp_detection
+    if body is None:
+        return None, {"reason": "locked grasp section is missing"}
+    try:
+        expected = np.asarray(body.p_cam_mm, dtype=float)
+    except (TypeError, ValueError):
+        return None, {"reason": "locked grasp section has invalid position"}
+    if expected.shape != (3,) or not np.all(np.isfinite(expected)):
+        return None, {"reason": "locked grasp section has invalid position"}
+    try:
+        max_offset_mm = float(os.getenv(
+            "REBOT_VISUAL_SUBSECTION_MAX_OFFSET_MM", "30"
+        ))
+    except (TypeError, ValueError):
+        max_offset_mm = 30.0
+    max_offset_mm = float(np.clip(max_offset_mm, 10.0, 60.0))
+    required = int(np.clip(min_frames, 2, 3))
+    total = int(np.clip(max_frames, required, 6))
+    samples: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for index in range(1, total + 1):
+        feature, frame, why = _observe(eye, description)
+        if feature is None or frame is None:
+            failures.append(str(why))
+            log(
+                "stage=visual_subsection_sample "
+                f"frame={index}/{total} ok=False detail={why}"
+            )
+            continue
+        candidate_body, slice_detail = _measure_locked_visual_slice(
+            frame, feature, body,
+        )
+        if candidate_body is None:
+            failures.append(str(slice_detail.get("reason")))
+            log(
+                "stage=visual_subsection_sample "
+                f"frame={index}/{total} ok=False detail={slice_detail.get('reason')}"
+            )
+            continue
+        position = np.asarray(candidate_body.p_cam_mm, dtype=float)
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            failures.append("local section position is invalid")
+            continue
+        offset_mm = float(np.linalg.norm(position - expected))
+        if offset_mm > max_offset_mm:
+            failures.append(
+                f"local section is {offset_mm:.1f}mm from the locked body"
+            )
+            log(
+                "stage=visual_subsection_sample "
+                f"frame={index}/{total} ok=False offset_mm={offset_mm:.1f} "
+                "detail=outside locked-body identity radius"
+            )
+            continue
+        width_mm = float(candidate_body.min_width_mm or 0.0)
+        if not math.isfinite(width_mm) or width_mm <= 0.0:
+            failures.append("local section width is invalid")
+            continue
+        samples.append({
+            "body_cam_mm": position.tolist(), "width_mm": width_mm,
+            "body": candidate_body,
+        })
+        log(
+            "stage=visual_subsection_sample "
+            f"frame={index}/{total} ok=True offset_mm={offset_mm:.1f} "
+            f"width_mm={width_mm:.1f}"
+        )
+        median, position_detail = _endpoint_body_pose_consensus(
+            samples, min_frames=required, max_spread_mm=5.0
+        )
+        if median is None:
+            continue
+        rejected = set(position_detail.get("rejected_frame_indices", []))
+        stable = [sample for sample_index, sample in enumerate(samples)
+                  if sample_index not in rejected]
+        widths = np.asarray([sample["width_mm"] for sample in stable], dtype=float)
+        median_width_mm = float(np.median(widths))
+        width_spread_mm = float(np.max(np.abs(widths - median_width_mm)))
+        width_limit_mm = max(3.0, 0.20 * max(1.0, median_width_mm))
+        if width_spread_mm > width_limit_mm:
+            failures.append(
+                f"local-section width spread {width_spread_mm:.1f}mm exceeds "
+                f"{width_limit_mm:.1f}mm"
+            )
+            continue
+        representative = min(stable, key=lambda sample: float(np.linalg.norm(
+            np.asarray(sample["body_cam_mm"], dtype=float) - median
+        )))
+        representative_body = representative["body"]
+        # Use the largest stable width for entry clearance.  The median body
+        # position avoids one noisy RGB-D frame moving the final target.
+        measured_body = replace(
+            representative_body,
+            p_cam_mm=tuple(float(value) for value in median),
+            min_width_mm=float(np.max(widths)),
+            info={
+                **(getattr(representative_body, "info", {}) or {}),
+                "position_basis": "stable_local_visual_subsection",
+                "stable_width_median_mm": median_width_mm,
+                "stable_width_max_mm": float(np.max(widths)),
+            },
+        )
+        return replace(expected_geometry, grasp_detection=measured_body), {
+            **position_detail,
+            "reason": (
+                f"{len(stable)} stable local RGB-D sections; width median "
+                f"{median_width_mm:.1f}mm, spread {width_spread_mm:.1f}mm"
+            ),
+            "valid_full_geometry_frames": len(stable),
+            "width_median_mm": median_width_mm,
+            "width_max_mm": float(np.max(widths)),
+            "width_spread_mm": width_spread_mm,
+            "failures": failures,
+        }
+    return None, {
+        "reason": f"no {required}-frame stable local RGB-D subsection",
+        "valid_full_geometry_frames": len(samples),
+        "failures": failures,
     }
 
 
@@ -4780,6 +5023,72 @@ def _projected_3d_span_fits_aperture(
         "boundary_slop_mm": boundary_slop,
         "max_aperture_mm": aperture,
     }
+
+
+def _registered_subsection_fits_aperture(
+    registered_box: dict[str, Any] | None,
+    stationary_box: dict[str, Any] | None,
+    camera_mapping: np.ndarray,
+    max_aperture_mm: float,
+) -> tuple[bool, dict[str, Any]]:
+    """Authorize an elongated local section from repeatable metric evidence.
+
+    This is not a general reduction of the entry margin.  It is available only
+    when two independently acquired metric boxes agree on the *same* projected
+    local cross-section.  In that case their disagreement is the relevant
+    uncertainty; applying the unrelated whole-mask 7.25 mm entry allowance a
+    second time is what falsely vetoes a sponge that already has physical room
+    inside a 50 mm opening.  The hard opening command remains 50 mm.
+    """
+    primary = _projected_3d_cross_section_span(registered_box, camera_mapping)
+    secondary = _projected_3d_cross_section_span(stationary_box, camera_mapping)
+    if not primary.get("ok") or not secondary.get("ok"):
+        return False, {
+            "reason": "registered and stationary local cross-sections are unavailable",
+            "registered": primary, "stationary": secondary,
+        }
+    try:
+        observed = float(primary["observed_width_mm"])
+        other_observed = float(secondary["observed_width_mm"])
+        aspect = float(primary["elongation_ratio"])
+        aperture = float(max_aperture_mm)
+    except (KeyError, TypeError, ValueError):
+        return False, {"reason": "local cross-section evidence is malformed"}
+    if not all(math.isfinite(value) and value > 0.0 for value in (
+        observed, other_observed, aspect, aperture
+    )):
+        return False, {"reason": "local cross-section evidence is invalid"}
+    if aspect < 1.5:
+        return False, {
+            "reason": f"object aspect ratio {aspect:.2f} is not elongated enough "
+                      "for a subsection grasp",
+        }
+    # The two metric fits are from independent stationary/multi-view evidence.
+    # Keep at least the calibrated RGB-D quantisation allowance, then use their
+    # actual projected disagreement rather than a blanket whole-object margin.
+    uncertainty_mm = max(
+        float(np.clip(GRASP_OPEN_CLEARANCE_BOUNDARY_SLOP_MM, 0.0, 0.75)),
+        abs(observed - other_observed),
+    )
+    required_open_mm = observed + uncertainty_mm
+    safe = bool(required_open_mm <= aperture + 1e-6)
+    detail = {
+        "ok": safe,
+        "observed_width_mm": observed,
+        "registered_width_mm": observed,
+        "stationary_width_mm": other_observed,
+        "measured_uncertainty_mm": uncertainty_mm,
+        "required_open_mm": required_open_mm,
+        "max_aperture_mm": aperture,
+        "elongation_ratio": aspect,
+        "cross_section": primary,
+        "reason": (
+            f"registered/stationary local cross-sections agree within "
+            f"{uncertainty_mm:.2f}mm; {observed:.1f}+{uncertainty_mm:.2f}="
+            f"{required_open_mm:.2f}/{aperture:.1f}mm hard opening"
+        ),
+    }
+    return safe, detail
 
 
 def _geometry_with_projected_3d_width(
@@ -14862,6 +15171,7 @@ def _fixed_pick_and_place_attempt(
         geometry_trusted_for_reorientation = bool(recentre_detail.get("ok"))
         axis_refinement = None
         visual_subsection_authorized = False
+        registered_subsection_authorized = False
         if alignment_required or alignment_optional:
             if geometry_trusted_for_reorientation:
                 axis_refinement = _find_3d_axis_orientation_refinement(
@@ -14925,15 +15235,82 @@ def _fixed_pick_and_place_attempt(
                 # improvement that cannot be found is not a failure.
                 axis_refinement = None
             elif not axis_refinement.get("ok"):
-                visual_subsection = _stable_visual_subsection_fallback(
-                    plan_geometry, geometry_consensus, jaw_plan,
-                    jaw_axis_box_3d, full_projection_detail, recentre_detail,
-                    independent_metric_crosscheck=bool(
-                        object_geometry_mode == "hybrid"
-                        and isinstance(hybrid_object_box_3d, dict)
-                        and isinstance(stationary_object_box_3d, dict)
-                    ),
+                # A long body need not fit between the fingers.  First ask
+                # whether two independently measured 3D boxes agree on its
+                # actual local cross-section at this fixed wrist attitude.
+                # This is narrower and more repeatable than re-running an
+                # image silhouette selection, and remains unavailable to the
+                # normal marker path.
+                registered_subsection_ok, registered_subsection = \
+                    _registered_subsection_fits_aperture(
+                        full_object_box_3d, stationary_object_box_3d, J,
+                        max_aperture_mm,
+                    )
+                log(
+                    "stage=registered_subsection_aperture "
+                    f"ok={registered_subsection_ok} "
+                    f"detail={registered_subsection.get('reason')}"
                 )
+                steps.append((
+                    "registered_subsection_aperture",
+                    registered_subsection_ok,
+                    str(registered_subsection.get("reason")),
+                ))
+                if registered_subsection_ok:
+                    # The named target has already passed the stationary
+                    # identity/position checkpoint.  Use fresh frames only to
+                    # maintain that position later in the approach; they may
+                    # not resize this metric section.
+                    axis_refinement = None
+                    visual_subsection_authorized = True
+                    registered_subsection_authorized = True
+                    aligned_3d_width_detail = {
+                        **registered_subsection["cross_section"],
+                        "ok": True,
+                        "basis": "registered_multiview_local_cross_section",
+                        "registered_subsection_entry": registered_subsection,
+                        "reason": str(registered_subsection.get("reason")),
+                    }
+                    visual_subsection = {
+                        "ok": True,
+                        "reason": str(registered_subsection.get("reason")),
+                    }
+                else:
+                    # Keep the existing visual fallback only for the rarer
+                    # case where metric cross-section agreement is unavailable.
+                    subsection_geometry, subsection_consensus = \
+                        _capture_stable_visual_subsection(
+                            eye, object_name,
+                            tuple(float(value) for value in A.ee_rpy()),
+                            plan_geometry, log,
+                        )
+                    steps.append((
+                        "capture_stable_visual_subsection",
+                        subsection_geometry is not None,
+                        str(subsection_consensus.get("reason")),
+                    ))
+                    log(
+                        "stage=capture_stable_visual_subsection "
+                        f"ok={subsection_geometry is not None} "
+                        f"detail={subsection_consensus.get('reason')}"
+                    )
+                    visual_geometry = (
+                        subsection_geometry
+                        if subsection_geometry is not None else plan_geometry
+                    )
+                    visual_consensus = (
+                        subsection_consensus
+                        if subsection_geometry is not None else geometry_consensus
+                    )
+                    visual_subsection = _stable_visual_subsection_fallback(
+                        visual_geometry, visual_consensus, jaw_plan,
+                        jaw_axis_box_3d, full_projection_detail, recentre_detail,
+                        independent_metric_crosscheck=bool(
+                            object_geometry_mode == "hybrid"
+                            and isinstance(hybrid_object_box_3d, dict)
+                            and isinstance(stationary_object_box_3d, dict)
+                        ),
+                    )
                 steps.append((
                     "stable_visual_subsection_fallback",
                     bool(visual_subsection.get("ok")),
@@ -15230,7 +15607,10 @@ def _fixed_pick_and_place_attempt(
                 "observed_width_mm", silhouette_width_mm
             ))
         )
-        override_useful = bool(aligned_width_safe and width_reduction_mm >= 3.0)
+        override_useful = bool(
+            (aligned_width_safe and width_reduction_mm >= 3.0)
+            or registered_subsection_authorized
+        )
         aligned_3d_width_detail["silhouette_width_mm"] = silhouette_width_mm
         aligned_3d_width_detail["width_reduction_mm"] = width_reduction_mm
         aligned_3d_width_detail["override_applied"] = override_useful
@@ -15313,6 +15693,28 @@ def _fixed_pick_and_place_attempt(
             plan_geometry = _geometry_with_3d_jaw_width(
                 plan_geometry, aligned_3d_width_detail
             )
+            if registered_subsection_authorized:
+                grasp = plan_geometry.grasp_detection
+                assert grasp is not None
+                plan_geometry = replace(
+                    plan_geometry,
+                    grasp_detection=replace(
+                        grasp,
+                        info={
+                            **(getattr(grasp, "info", {}) or {}),
+                            "registered_subsection_entry": dict(
+                                aligned_3d_width_detail.get(
+                                    "registered_subsection_entry", {}
+                                )
+                            ),
+                        },
+                    ),
+                    reason=(
+                        f"{plan_geometry.reason}; registered local subsection "
+                        "uses repeatable 3D uncertainty instead of the broad "
+                        "whole-mask entry margin",
+                    ),
+                )
             geometry = plan_geometry
             det = plan_geometry.grasp_detection
             assert det is not None

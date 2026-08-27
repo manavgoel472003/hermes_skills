@@ -86,6 +86,17 @@ export REBOT_WRIST_SAVED_ROTATION_MAX_RPY_DELTA_DEG=22.5
 export REBOT_WRIST_PICK_OPEN_BEFORE_END_M=0.040
 export REBOT_WRIST_JAW_LONG_AXIS_CAMERA_DEG=-90
 export REBOT_WRIST_GRASP_MAX_YAW_DELTA_DEG=20
+# Some objects, especially a sponge resting at an arbitrary angle, cannot put
+# their narrow cross-section between the jaws with yaw alone.  This is an
+# opt-in bounded *search* for the sponge/general-object launcher, not a
+# relaxation of safety: each candidate and every intermediate orientation is
+# still checked with the full IK, workspace, self-collision and scene-collision
+# gates before it can move.  The ordinary code defaults remain conservative for
+# callers that do not use this launcher.
+export REBOT_3D_AXIS_REFINE_MAX_ROLL_DEG="${REBOT_3D_AXIS_REFINE_MAX_ROLL_DEG:-15}"
+export REBOT_3D_AXIS_REFINE_MAX_PITCH_DEG="${REBOT_3D_AXIS_REFINE_MAX_PITCH_DEG:-30}"
+export REBOT_3D_AXIS_REFINE_MAX_YAW_DEG="${REBOT_3D_AXIS_REFINE_MAX_YAW_DEG:-30}"
+export REBOT_3D_AXIS_REFINE_CAMERA_ENVELOPE_DEG="${REBOT_3D_AXIS_REFINE_CAMERA_ENVELOPE_DEG:-45}"
 # A marginal object-axis error may be absorbed without exceeding the physical
 # yaw command bound.  Grasp geometry projects the residual angle into a larger
 # required jaw span and refuses the pick if that span does not fit.
