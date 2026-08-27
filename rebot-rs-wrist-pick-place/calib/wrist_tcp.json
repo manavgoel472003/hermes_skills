@@ -1,0 +1,21 @@
+{
+  "tcp_camera_xyz_mm": [
+    3.6095055371659712,
+    3.965609397911862,
+    66.89999389648438
+  ],
+  "camera": "realsense",
+  "saved_at": "2026-07-29T12:33:17",
+  "detail": {
+    "method": "held_object",
+    "object": "blue marker",
+    "gripper_commanded": false,
+    "gripper_state_read": false,
+    "held_asserted_by_operator": true,
+    "uv": [
+      340.7373842325354,
+      268.8342953898253
+    ],
+    "detector": "color:blue"
+  }
+}

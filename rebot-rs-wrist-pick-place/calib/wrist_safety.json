@@ -1,0 +1,38 @@
+{
+  "table_z_m": 0.01196,
+  "table_measurement": {
+    "tool_position_m": [
+      0.279047,
+      -0.017351,
+      0.01196
+    ],
+    "tool_rpy_rad": [
+      -0.043412,
+      0.724799,
+      -0.080074
+    ],
+    "source": "free-drive joint readings with gripper tip on table"
+  },
+  "torque_feedback_verified": true,
+  "torque_test": {
+    "baseline_nm": [
+      1.203,
+      -0.082,
+      -0.026,
+      -0.862,
+      -0.213,
+      -0.315
+    ],
+    "loaded_nm": [
+      5.42,
+      0.114,
+      -0.601,
+      -0.871,
+      -0.181,
+      -0.23
+    ],
+    "max_change_nm": 4.217
+  },
+  "saved_at": "2026-07-29T12:45:00",
+  "note": "Recorded from supervised hardware checks; invalidate if joint zeroing or table setup changes."
+}

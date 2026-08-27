@@ -124,9 +124,22 @@ that dominate the failure modes, and how to read a run log.
 ## Source layout
 
 - `arm_agent/` — captured implementation.
-- `calib/wrist_gripper.json` — measured jaw calibration (mm-per-radian span).
-  Machine-specific; committed here so the branch is self-contained, and
-  overridable with `REBOT_WRIST_CALIB`.
+- `calib/` — the six measured calibrations `arm_agent` loads at startup
+  (`wrist_servo.py:465-469`, `gripper_model.py:34`). Machine-specific, and
+  committed here so the branch is self-contained; point `REBOT_WRIST_CALIB` at
+  another directory to override the whole set.
+
+  | file | what it fixes |
+  |---|---|
+  | `wrist_gripper.json` | jaw span, mm per radian — without it closures cannot be sized from the image |
+  | `wrist_tcp.json` | tool centre point in camera coordinates |
+  | `wrist_grasp_target.json` | calibrated open-jaw target the grasp servos to |
+  | `wrist_camera_rotation.json` | base-to-camera rotation of the rigid mount |
+  | `wrist_safety.json` | measured table plane and torque-feedback verification |
+  | `wrist_drop_zone.json` | taught release position |
+
+  These describe *this* arm and camera mount. A checkout on different hardware
+  must re-run its own calibration rather than inherit these numbers.
 - `tests/` — safety, calibration, detection, and workflow regression tests.
 - `SKILL.md` — Hermes operating contract and validated commands.
 - `CAN.md` — full CAN bring-up and verification.
