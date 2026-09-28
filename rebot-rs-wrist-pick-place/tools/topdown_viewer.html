@@ -1,0 +1,10 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Top-down Orbbec feed</title>
+<style>body{margin:0;background:#111;color:#eee;font:16px system-ui;text-align:center}img{max-width:100vw;max-height:94vh;display:block;margin:auto}</style>
+<p>Top-down Orbbec RGB-D overlay — refreshes four times per second</p>
+<img id="feed" src="latest.jpg" alt="Waiting for top-down frame">
+<script>
+const feed = document.getElementById('feed');
+setInterval(() => { feed.src = `latest.jpg?t=${Date.now()}`; }, 250);
+</script>
