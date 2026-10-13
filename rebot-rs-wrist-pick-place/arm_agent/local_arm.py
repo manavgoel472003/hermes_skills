@@ -37,6 +37,7 @@ from reBotArm_control_py.kinematics.inverse_kinematics import IKParams, solve_ik
 # on this gripper (close 22.92 deg, open 141.13 deg) in radians. Commands target
 # those angles directly; there is no percentage-of-travel abstraction.
 from . import gripper_model as _gm  # noqa: E402
+from . import mission_control as MC
 
 GRIPPER_CLOSE_RAD = _gm.CLOSE_RAD
 GRIPPER_OPEN_RAD = _gm.OPEN_RAD
@@ -1629,6 +1630,7 @@ class LocalArm:
         send_freq: float = 50.0,
     ) -> dict[str, Any]:
         """Revalidate a certified plan, then execute one minimum-jerk trajectory."""
+        MC.motion()
         with self._lock:
             arm, controller = self._require()
             version = int(plan.get("scene_version", -1))
@@ -1670,6 +1672,7 @@ class LocalArm:
                 total_s = max(float(duration), 1.875 * path_length / max(1e-6, _joint_vlim()), 0.25)
                 count = max(2, int(np.ceil(total_s * max(20.0, send_freq))))
                 for index in range(1, count + 1):
+                    MC.checkpoint()
                     t = index / count
                     distance = (10*t**3 - 15*t**4 + 6*t**5) * path_length
                     segment = min(len(lengths) - 1, int(
@@ -1681,12 +1684,13 @@ class LocalArm:
                     controller._q_target[:] = points[segment] + (
                         points[segment + 1] - points[segment]
                     ) * fraction
-                    time.sleep(total_s / count)
+                    MC.pause(total_s / count)
                 controller._q_target[:] = path[-1]
         deadline = time.monotonic() + 3.0
         state = self.state()
         target = path[-1]
         while time.monotonic() < deadline:
+            MC.checkpoint()
             joint_error = max(abs(a - b) for a, b in zip(
                 state["joints_rad"], target
             ))
@@ -1727,6 +1731,7 @@ class LocalArm:
         encoder_streak = 0
         state = self.state()
         while True:
+            MC.checkpoint()
             q = np.asarray(state.get("joints_rad", []), dtype=float)[:6]
             velocities = np.asarray(
                 state.get("joint_vel_rad_s", []), dtype=float
@@ -1791,7 +1796,7 @@ class LocalArm:
                     },
                 }
             previous_q = q.copy() if finite else None
-            time.sleep(max(0.01, float(sample_interval_s)))
+            MC.pause(max(0.01, float(sample_interval_s)))
             state = self.state()
 
     @staticmethod
@@ -1914,6 +1919,7 @@ class LocalArm:
         )
 
     def connect(self) -> None:
+        MC.motion()
         with self._lock:
             if self.connected:
                 return
@@ -2241,6 +2247,7 @@ class LocalArm:
 
     def move_pose(self, x: float, y: float, z: float, roll: float, pitch: float, yaw: float,
                   duration: float) -> dict[str, Any]:
+        MC.motion()
         solution = self.solve_ik(x, y, z, roll, pitch, yaw)
         with self._lock:
             arm, controller = self._require()
@@ -2252,6 +2259,7 @@ class LocalArm:
             )
             steps = max(12, int(max(0.8, duration) * 12))
             for i in range(1, steps + 1):
+                MC.checkpoint()
                 # Quintic minimum-jerk time scaling starts and ends each short
                 # Cartesian segment with zero target velocity and acceleration.
                 # This is materially smoother than the previous linear ramp,
@@ -2259,9 +2267,10 @@ class LocalArm:
                 t = i / steps
                 blend = 10.0 * t**3 - 15.0 * t**4 + 6.0 * t**5
                 controller._q_target = (start + (target - start) * blend).copy()
-                time.sleep(duration / steps)
+                MC.pause(duration / steps)
         deadline = time.monotonic() + max(3.0, duration)
         while time.monotonic() < deadline:
+            MC.checkpoint()
             state = self.state()
             if max(abs(a - b) for a, b in zip(state["joints_rad"], target)) < 0.02:
                 break
@@ -2281,6 +2290,7 @@ class LocalArm:
         minimum-jerk clock then advances through the dense joint-space polyline
         without stopping at each Cartesian waypoint.
         """
+        MC.motion()
         if not poses:
             return self.state()
         solutions = self.solve_ik_path(poses)
@@ -2319,6 +2329,7 @@ class LocalArm:
             interval = total_s / count
 
             for i in range(1, count + 1):
+                MC.checkpoint()
                 t = i / count
                 blend = 10.0 * t**3 - 15.0 * t**4 + 6.0 * t**5
                 distance = blend * path_length
@@ -2338,7 +2349,7 @@ class LocalArm:
                     points[segment]
                     + (points[segment + 1] - points[segment]) * local_fraction
                 )
-                time.sleep(interval)
+                MC.pause(interval)
             controller._q_target[:] = targets[-1]
 
         return self.wait_for_stationary_hold(
@@ -2358,6 +2369,7 @@ class LocalArm:
         be more conservative than the measured limits without imposing that on every
         other user of this backend. Omitted => the measured limits.
         """
+        MC.motion()
         if action not in {"open", "close"}:
             raise ValueError("gripper action must be open or close")
         with self._lock:
@@ -2441,9 +2453,10 @@ class LocalArm:
                 travel = abs(target - start)
                 n_steps = max(1, int(GRIPPER_MOVE_S / max(1e-3, GRIPPER_STEP_S)))
                 for i in range(1, n_steps + 1):
+                    MC.checkpoint()
                     command = start + (target - start) * i / n_steps
                     controller.set_gripper_target(command)
-                    time.sleep(GRIPPER_STEP_S)
+                    MC.pause(GRIPPER_STEP_S)
             finally:
                 if saved is not None and group is not None:
                     group._mit_kp[:], group._mit_kd[:] = saved
@@ -2462,6 +2475,7 @@ class LocalArm:
                 "contact_aware": False}
 
     def home(self) -> dict[str, Any]:
+        MC.motion()
         with self._lock:
             arm, controller = self._require()
             q_start, _, _ = arm.get_state()
@@ -2480,13 +2494,28 @@ class LocalArm:
             # 2*max_joint_error/max_vel. Its old fixed 15 s timeout was shorter
             # than a valid scan->home path at the deliberate 0.25 rad/s limit.
             trajectory_s = 2.0 * float(np.max(np.abs(q_start))) / max(1e-6, max_vel)
-            confirmed = controller.safe_home(
-                max_vel=max_vel,
-                timeout=max(15.0, trajectory_s + 5.0),
-            )
+            if MC.current() is None:
+                confirmed = controller.safe_home(
+                    max_vel=max_vel,
+                    timeout=max(15.0, trajectory_s + 5.0),
+                )
+            else:
+                # The vendor safe_home owns a blocking sender. Hybrid missions
+                # use the same validated joint return with an interruptible
+                # minimum-jerk loop; endpoint feedback below remains authoritative.
+                duration = max(0.25, trajectory_s)
+                count = max(2, int(math.ceil(duration * 50)))
+                for index in range(1, count + 1):
+                    MC.checkpoint()
+                    t = index / count
+                    blend = 10 * t**3 - 15 * t**4 + 6 * t**5
+                    controller._q_target = q_start * (1.0 - blend)
+                    MC.pause(duration / count)
+                confirmed = False
             settle_deadline = time.monotonic() + HOME_SETTLE_TIMEOUT_S
             state = self.state()
             while True:
+                MC.checkpoint()
                 joints = [float(v) for v in state.get("joints_rad", [])]
                 velocities = [abs(float(v)) for v in state.get("joint_vel_rad_s", [])]
                 max_error = max((abs(v) for v in joints), default=float("inf"))

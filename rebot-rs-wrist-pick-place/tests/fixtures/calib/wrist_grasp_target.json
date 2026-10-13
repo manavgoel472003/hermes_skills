@@ -1,0 +1,22 @@
+{
+  "object_camera_xyz_mm": [
+    3.8721111700771376,
+    31.681411911710438,
+    68.99999237060547
+  ],
+  "camera": "realsense",
+  "saved_at": "2026-07-30T15:50:41",
+  "detail": {
+    "method": "manual_open_jaw_slot",
+    "object": "blue marker",
+    "arm_commanded": false,
+    "gripper_commanded": false,
+    "uv": [
+      341.5900864397623,
+      426.24799657842607
+    ],
+    "detector": "color:blue",
+    "jaw_long_axis_camera_deg": -90.0,
+    "jaw_axis_note": "Persisted after repeated validated dry-run alignment; avoids relying on a per-command environment variable"
+  }
+}

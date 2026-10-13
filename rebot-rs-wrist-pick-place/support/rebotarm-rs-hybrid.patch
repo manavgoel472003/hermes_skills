@@ -1,0 +1,212 @@
+diff --git a/config/rebotarm.yaml b/config/rebotarm.yaml
+index a6dd4cb..0bc0977 100644
+--- a/config/rebotarm.yaml
++++ b/config/rebotarm.yaml
+@@ -4,4 +4,4 @@
+ # reBotArm global config
+ # Hardware config (motor type, comm params, PID, etc.)
+ 
+-hardware_yaml: "rebotarm_dm.yaml"
++hardware_yaml: "rebotarm_rs.yaml"
+diff --git a/config/rebotarm_rs.yaml b/config/rebotarm_rs.yaml
+index e92eed9..c6bc937 100644
+--- a/config/rebotarm_rs.yaml
++++ b/config/rebotarm_rs.yaml
+@@ -34,7 +34,7 @@ groups:
+ joints:
+   - name: joint1
+     motor_id: 0x01
+-    feedback_id: 0xFD
++    feedback_id: 0x11
+     model: "rs-06"
+     vendor: "robstride"
+     MIT:
+@@ -48,7 +48,7 @@ joints:
+ 
+   - name: joint2
+     motor_id: 0x02
+-    feedback_id: 0xFD
++    feedback_id: 0x12
+     model: "rs-06"
+     vendor: "robstride"
+     MIT:
+@@ -62,7 +62,7 @@ joints:
+ 
+   - name: joint3
+     motor_id: 0x03
+-    feedback_id: 0xFD
++    feedback_id: 0x13
+     model: "rs-06"
+     vendor: "robstride"
+     MIT:
+@@ -76,7 +76,7 @@ joints:
+ 
+   - name: joint4
+     motor_id: 0x04
+-    feedback_id: 0xFD
++    feedback_id: 0x14
+     model: "rs-00"
+     vendor: "robstride"
+     MIT:
+@@ -90,7 +90,7 @@ joints:
+ 
+   - name: joint5
+     motor_id: 0x05
+-    feedback_id: 0xFD
++    feedback_id: 0x15
+     model: "rs-00"
+     vendor: "robstride"
+     MIT:
+@@ -104,7 +104,7 @@ joints:
+ 
+   - name: joint6
+     motor_id: 0x06
+-    feedback_id: 0xFD
++    feedback_id: 0x16
+     model: "rs-00"
+     vendor: "robstride"
+     MIT:
+@@ -118,7 +118,7 @@ joints:
+ 
+   - name: gripper
+     motor_id: 0x07
+-    feedback_id: 0xFD
++    feedback_id: 0x17
+     model: "rs-00"
+     vendor: "robstride"
+     MIT:
+diff --git a/reBotArm_control_py/actuator/rebotarm.py b/reBotArm_control_py/actuator/rebotarm.py
+index b62a959..a06f3b2 100644
+--- a/reBotArm_control_py/actuator/rebotarm.py
++++ b/reBotArm_control_py/actuator/rebotarm.py
+@@ -229,16 +229,19 @@ class JointGroup:
+ 
+     # ── 使能 / 失能 ────────────────────────────────────────────────────
+ 
+-    def enable(self) -> None:
+-        by_vendor: Dict[str, List[str]] = {}
++    def enable(self) -> bool:
++        ok = True
++        by_vendor: Dict[str, List[str]] = {}
+         for jc in self._jcfgs:
+             by_vendor.setdefault(jc.vendor, []).append(jc.name)
+         for vendor in by_vendor:
+             try:
+                 self._cm[vendor].enable_all()
+-            except CallError as e:
+-                print(f"[{self.name}/enable] {e}")
+-            time.sleep(0.05)
++            except CallError as e:
++                print(f"[{self.name}/enable] {e}")
++                ok = False
++            time.sleep(0.05)
++        return ok
+ 
+     def disable(self) -> None:
+         by_vendor: Dict[str, List[str]] = {}
+@@ -583,11 +586,21 @@ class RebotArm:
+         for g in self._groups.values():
+             g.disable()
+ 
+-    # ── 零点 ────────────────────────────────────────────────────────────
+-
+-    def set_zero(self, poll_max: int = 200, poll_interval: float = 0.05) -> None:
+-        self.disable_all()
+-        time.sleep(0.3)
++    # ── 零点 ────────────────────────────────────────────────────────────
++
++    def set_zero(self, poll_max: int = 200, poll_interval: float = 0.05) -> None:
++        # RobStride drives do not reliably return feedback while disabled.  The
++        # legacy Damiao path deliberately disabled first, but that leaves an RS
++        # calibration loop polling silent motors and makes its zero requests
++        # appear to time out.  Enabling here sends no position target; it only
++        # makes the drives acknowledge and lets us verify their live state before
++        # recording the current pose as zero.
++        has_robstride = any(jc.vendor == "robstride" for jc in self._all_joints)
++        if has_robstride:
++            self.enable_all()
++        else:
++            self.disable_all()
++        time.sleep(0.3)
+         for jc in self._all_joints:
+             for _ in range(poll_max):
+                 for m in self._motor_map.values():
+diff --git a/reBotArm_control_py/controllers/rebotarm_endpose_controller.py b/reBotArm_control_py/controllers/rebotarm_endpose_controller.py
+index 601a574..5a8e869 100644
+--- a/reBotArm_control_py/controllers/rebotarm_endpose_controller.py
++++ b/reBotArm_control_py/controllers/rebotarm_endpose_controller.py
+@@ -128,16 +128,21 @@ class RebotArmEndPose:
+         self.rebotarm.connect()
+         if self._arm_group:
+             if self._arm_control_mode == "mit":
+-                self._arm_group.mode_mit(
++                mode_ok = self._arm_group.mode_mit(
+                     kp=self._arm_group._mit_kp,
+                     kd=self._arm_group._mit_kd,
+                 )
+             else:
+-                self._arm_group.mode_pos_vel()
+-            self._arm_group.enable()
++                mode_ok = self._arm_group.mode_pos_vel()
++            if not mode_ok:
++                raise RuntimeError("arm control-mode verification failed")
++            if not self._arm_group.enable():
++                raise RuntimeError("arm enable acknowledgement failed")
+         if self._has_gripper:
+-            self._gripper_group.mode_mit()
+-            self._gripper_group.enable()
++            if not self._gripper_group.mode_mit():
++                raise RuntimeError("gripper control-mode verification failed")
++            if not self._gripper_group.enable():
++                raise RuntimeError("gripper enable acknowledgement failed")
+         self.rebotarm.start_control_loop(self._loop_cb)
+         self._running = True
+ 
+@@ -176,9 +181,9 @@ class RebotArmEndPose:
+         send_freq: float = 50.0,
+         settle_thresh: float = 0.01,
+         timeout: float = 15.0,
+-    ) -> None:
++    ) -> bool:
+         if not self._running:
+-            return
++            return False
+ 
+         q_curr, _, _ = self.rebotarm.get_state()
+         q_curr = q_curr[: self._n]
+@@ -188,7 +193,7 @@ class RebotArmEndPose:
+         q_err = np.abs(home_pos - q_start)
+         max_err = float(np.max(q_err))
+         if max_err < 0.01:
+-            return
++            return True
+ 
+         t_ramp = max_err / max_vel
+         t_total = t_ramp * 2.0
+@@ -207,10 +212,12 @@ class RebotArmEndPose:
+ 
+         interval = t_total / num_steps if num_steps > 0 else dt_send
+         deadline = time.monotonic() + timeout
++        timed_out = False
+         self._vlim_override = np.full(self._n, max_vel, dtype=np.float64)
+         for i in range(num_steps):
+             if time.monotonic() > deadline:
+                 print("[safe_home] 轨迹发送超时")
++                timed_out = True
+                 break
+             self._q_target[:] = traj[i]
+             time.sleep(interval)
+@@ -223,6 +230,13 @@ class RebotArmEndPose:
+                 break
+             time.sleep(self._dt)
+         self._vlim_override = None
++        q_final, _, _ = self.rebotarm.get_state()
++        final_err = float(np.max(np.abs(q_final[: self._n])))
++        ok = final_err < settle_thresh
++        if not ok:
++            print(f"[safe_home] 未确认到位 max_err={final_err:.4f}rad"
++                  + (" (trajectory timeout)" if timed_out else ""))
++        return ok
+ 
+     def move_to_ik(
+         self,

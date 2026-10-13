@@ -1,0 +1,8 @@
+cd /home/manav/rebot_lerobot/lerobot
+PYTHONPATH=src python -m lerobot.scripts.lerobot_replay_retargeted_seeed \
+  --trajectory_path=/home/manav/rebot_lerobot/outputs/random_pickplace_benchmark/target_b601/task_035.npz \
+  --port=/dev/ttyACM0 \
+  --move_to_start_duration_s=8.0 \
+  --speed_multiplier=0.5 \
+  --max_relative_target=6.0 \
+  --pos_vel_velocity "[45,45,45,35,35,35,35]"

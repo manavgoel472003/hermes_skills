@@ -1,0 +1,13 @@
+{
+  "base_to_camera_rotation": [
+    [-0.016729715, 0.995612283, -0.092066811],
+    [0.287418424, 0.092981964, 0.953281178],
+    [-0.957659003, 0.010513575, 0.287712876]
+  ],
+  "calibrated_tool_rpy_rad": [0.0, 0.0, 0.0],
+  "camera": "realsense",
+  "method": "orthogonal_consensus_from_five_accepted_20mm_xyz_jog_calibrations",
+  "accepted_source_fit_errors": [0.049, 0.041, 0.076, 0.064, 0.132],
+  "saved_at": "2026-07-31T17:10:00",
+  "note": "Rigid camera-mount geometry; invalidate if the wrist camera mount or arm joint zero changes."
+}

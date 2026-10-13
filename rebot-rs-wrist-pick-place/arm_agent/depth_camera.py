@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -92,8 +93,35 @@ class RealSenseCamera:
         depth_sensor = profile.get_device().first_depth_sensor()
         self._depth_scale_mm = float(depth_sensor.get_depth_scale()) * 1000.0
         # Let auto exposure and the depth stream stabilize before the first frame.
-        for _ in range(10):
-            self._pipeline.wait_for_frames(timeout_ms=3000)
+        # A D405 can take longer than one frame timeout immediately after USB
+        # enumeration/reset even though the stream is otherwise sound.  Retrying
+        # here is camera-only startup; no caller can issue a robot command until
+        # this constructor has returned successfully.
+        try:
+            startup_timeout_ms = int(os.getenv(
+                "REBOT_REALSENSE_STARTUP_TIMEOUT_MS", "15000"
+            ))
+        except ValueError:
+            startup_timeout_ms = 15000
+        startup_timeout_ms = max(5000, startup_timeout_ms)
+        deadline = time.monotonic() + startup_timeout_ms / 1000.0
+        warmed_frames = 0
+        last_error: RuntimeError | None = None
+        while warmed_frames < 10:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                self.close()
+                detail = f" ({last_error})" if last_error else ""
+                raise RuntimeError(
+                    "RealSense did not stabilize within "
+                    f"{startup_timeout_ms} ms{detail}"
+                )
+            try:
+                self._pipeline.wait_for_frames(timeout_ms=min(3000, remaining_ms))
+                warmed_frames += 1
+            except RuntimeError as exc:
+                # The next wait often succeeds once the USB/UVC stream is ready.
+                last_error = exc
 
     def frame(self) -> tuple[np.ndarray, np.ndarray, Intrinsics]:
         frames = self._align.process(self._pipeline.wait_for_frames(timeout_ms=5000))

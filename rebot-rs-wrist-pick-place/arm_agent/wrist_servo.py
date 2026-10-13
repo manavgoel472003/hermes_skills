@@ -84,6 +84,7 @@ from arm_agent import object_geometry_3d as OG3
 from arm_agent import wrist_detect as WD
 from arm_agent import voxel_navigation as VN
 from arm_agent.depth_camera import open_depth_camera
+from arm_agent import mission_control as MC
 
 # ---- tunables (env-overridable) --------------------------------------------------
 CAMERA_KIND = os.getenv("REBOT_WRIST_CAMERA", "realsense")
@@ -218,6 +219,24 @@ def _object_geometry_mode() -> str | None:
     """Select the object-box pipeline without changing legacy defaults."""
     mode = os.getenv("REBOT_OBJECT_GEOMETRY_MODE", "legacy").strip().lower()
     return mode if mode in {"legacy", "hybrid"} else None
+
+
+def _claw_box_reflex_mode() -> str:
+    """Return the explicit box-reflex test mode with legacy bool support."""
+    raw = os.getenv("REBOT_CLAW_BOX_REFLEX_FALLBACK", "fallback").strip().lower()
+    aliases = {
+        "1": "fallback", "true": "fallback", "yes": "fallback", "on": "fallback",
+        "0": "off", "false": "off", "no": "off", "off": "off",
+    }
+    mode = aliases.get(raw, raw)
+    return mode if mode in {"off", "fallback", "force"} else "fallback"
+
+
+def _claw_direct_reflex_enabled() -> bool:
+    """Whether the post-OBB pick is the Claw-style frozen reflex phase."""
+    return os.getenv("REBOT_CLAW_DIRECT_REFLEX", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def _hybrid_box_selection_policy(
@@ -599,9 +618,10 @@ def set_viz(viz: Any) -> None:
 
 
 def make_viz(outdir: Path | str = DEBUG_DIR, *, mjpeg_port: int | None = None,
-             window: bool = False):
+             mjpeg_auto_open: bool = False, window: bool = False):
     from arm_agent.depth_servo import Viz
-    return Viz(outdir=Path(outdir), mjpeg_port=mjpeg_port, window=window,
+    return Viz(outdir=Path(outdir), mjpeg_port=mjpeg_port,
+               mjpeg_auto_open=mjpeg_auto_open, window=window,
                annotator=annotate, title="wrist_servo")
 
 
@@ -1748,6 +1768,7 @@ class WristEye:
         # RealSense wait_for_frames must have exactly one caller at a time. The
         # continuous browser feed and detector share this lock and this stream.
         with self._frame_lock:
+            MC.checkpoint()
             if self._camera is None:
                 self._camera = _CAMERA_FACTORY(self.camera_kind)
             return self._camera.frame()
@@ -2302,6 +2323,75 @@ def _approach_ready_lift(log: Callable[[str], None]):
     return A.safe_goto(current[0], current[1], target_z, cur=current)
 
 
+def _approach_working_posture(log: Callable[[str], None]):
+    """Move the wrist to the calibrated Hermes viewing posture at safe height.
+
+    The old approach-only probe preserved the almost-flat home wrist.  That is
+    intentionally conservative as a relative motion, but its near-table
+    endpoint is often outside this arm's reachable set.  The established wrist
+    pipeline instead observes and plans from ``WORK_PITCH``.  Transition by a
+    fully IK-validated RPY path at the already-lifted XYZ; it is a bounded
+    Claw-style ready preset, not an unchecked joint command.
+    """
+    xyz = tuple(float(value) for value in A.ee_pos())
+    current = np.asarray(A.ee_rpy(), dtype=float)
+    target = (0.0, float(WORK_PITCH), 0.0)
+    delta_deg = math.degrees(float(np.max(np.abs(
+        np.asarray(target, dtype=float) - current
+    ))))
+    if delta_deg <= 0.1:
+        return A.MoveResult(True, "already at calibrated working posture", xyz)
+    # The normal yaw/geometry limiter deliberately caps one rotation command
+    # at 16 degrees.  Hermes' camera posture is about 57 degrees from home, so
+    # treat it as a sequence of separately prevalidated preset stages.  Passing
+    # ``max_delta_deg`` uses the stricter full pose-clearance validation for
+    # every intermediate waypoint; no stage can evade the normal rotation cap.
+    stage_limit_deg = float(np.clip(GEOMETRY_MAX_YAW_DELTA_DEG, 1.0, 16.0))
+    stage_limit_rad = math.radians(stage_limit_deg)
+    target_array = np.asarray(target, dtype=float)
+    reasons: list[str] = []
+    for index in range(1, 9):
+        current = np.asarray(A.ee_rpy(), dtype=float)
+        remaining = target_array - current
+        maximum = float(np.max(np.abs(remaining)))
+        if maximum <= math.radians(0.1):
+            return A.MoveResult(
+                True,
+                f"calibrated working posture reached in {index - 1} bounded stages; "
+                + "; ".join(reasons),
+                xyz,
+            )
+        fraction = min(1.0, stage_limit_rad / maximum)
+        staged_target = current + fraction * remaining
+        waypoints, reason = _plan_rpy_trajectory(
+            tuple(float(value) for value in staged_target), xyz=xyz,
+            max_delta_deg=stage_limit_deg,
+        )
+        if waypoints is None:
+            return A.MoveResult(
+                False,
+                f"working_posture_stage_{index}_plan_failed {reason}",
+            )
+        log(
+            "stage=approach_working_posture "
+            f"stage={index} target_pitch_rad={staged_target[1]:.3f} "
+            f"remaining_deg={math.degrees(maximum):.1f} {reason}"
+        )
+        ok, execute_reason = _execute_rpy_trajectory(
+            waypoints, log, fixed_xyz=xyz
+        )
+        if not ok:
+            return A.MoveResult(
+                False,
+                f"working_posture_stage_{index}_execute_failed {execute_reason}",
+            )
+        reasons.append(f"stage {index}: {execute_reason}")
+    return A.MoveResult(
+        False,
+        "working_posture_stage_limit reached before the calibrated posture",
+    )
+
+
 def _highest_reachable_z(x: float, y: float, ceiling: float, floor: float) -> float | None:
     """Highest z at (x, y) the arm can ACTUALLY reach, by asking IK.
 
@@ -2398,6 +2488,9 @@ GRIPPER_KD = os.getenv("REBOT_GRIPPER_KD")
 GRIPPER_CLAMP_EXTRA_MM = float(np.clip(float(
     os.getenv("REBOT_GRIPPER_CLAMP_EXTRA_MM", "7")
 ), 0.0, 10.0))
+GRIPPER_CLOSE_SETTLE_RETRY = os.getenv(
+    "REBOT_GRIPPER_CLOSE_SETTLE_RETRY", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _gripper(action: str, target_rad: float | None = None) -> dict[str, Any]:
@@ -2406,6 +2499,7 @@ def _gripper(action: str, target_rad: float | None = None) -> dict[str, Any]:
     ``target_rad`` opens to a computed aperture instead of the fixed cap; the
     backend still hard-clamps it, so it can never exceed the travel limit.
     """
+    MC.checkpoint()
     assert action in ("open", "close")
     readback = getattr(A, "gripper_readback", None)
     if readback is not None:            # simulator
@@ -2637,8 +2731,36 @@ def _validate_object_gripper_fit(
         width_mm, major_mm, aperture_mm, preopen_mm
     )):
         return False, {"reason": "object or jaw dimensions are invalid"}
-    effective_clearance_mm, clearance_boundary_slop_mm = \
-        _effective_open_clearance_mm()
+    registered_subsection_entry = (getattr(grasp, "info", {}) or {}).get(
+        "registered_subsection_entry"
+    )
+    if isinstance(registered_subsection_entry, dict):
+        # This flag is installed only by ``_registered_subsection_fits_aperture``
+        # after registered and stationary RGB-D boxes agree.  It replaces the
+        # generic whole-mask entry margin with their measured disagreement; the
+        # physical jaw opening remains hard-clamped at ``aperture_mm``.
+        try:
+            effective_clearance_mm = float(
+                registered_subsection_entry["measured_uncertainty_mm"]
+            )
+            approved_width_mm = float(
+                registered_subsection_entry["observed_width_mm"]
+            )
+        except (KeyError, TypeError, ValueError):
+            return False, {"reason": "registered subsection entry evidence is invalid"}
+        if not (math.isfinite(effective_clearance_mm)
+                and effective_clearance_mm >= 0.0
+                and math.isfinite(approved_width_mm)
+                and abs(approved_width_mm - width_mm) <= 1.0):
+            return False, {
+                "reason": "registered subsection width no longer matches the jaw plan"
+            }
+        clearance_boundary_slop_mm = effective_clearance_mm
+        clearance_basis = "registered/stationary projected-width disagreement"
+    else:
+        effective_clearance_mm, clearance_boundary_slop_mm = \
+            _effective_open_clearance_mm()
+        clearance_basis = "configured generic entry clearance"
     required_open_mm = width_mm + effective_clearance_mm
     if required_open_mm > aperture_mm + 1e-6:
         return False, {
@@ -2657,6 +2779,7 @@ def _validate_object_gripper_fit(
             ),
             "effective_clearance_mm": effective_clearance_mm,
             "clearance_boundary_slop_mm": clearance_boundary_slop_mm,
+            "clearance_basis": clearance_basis,
         }
     if major_mm > max(1.0, GRASP_MAX_MAJOR_MM):
         return False, {
@@ -2706,6 +2829,7 @@ def _validate_object_gripper_fit(
         "configured_clearance_mm": max(0.0, GRASP_MIN_OPEN_CLEARANCE_MM),
         "effective_clearance_mm": effective_clearance_mm,
         "clearance_boundary_slop_mm": clearance_boundary_slop_mm,
+        "clearance_basis": clearance_basis,
         "end_clearance_mm": end_clearance_mm,
         "preopen_mm": preopen_mm,
     }
@@ -3388,6 +3512,219 @@ def _stable_visual_subsection_fallback(
         "max_aperture_mm": aperture_mm,
         "metric_projection_mm": projected_mm,
         "orientation_mode": orientation_mode,
+    }
+
+
+def _measure_locked_visual_slice(
+    frame: tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]],
+    feature: WD.Detection, expected_body: WD.Detection,
+) -> tuple[WD.Detection | None, dict[str, Any]]:
+    """Measure one fixed mask slice at a locked jaw-section image location.
+
+    Unlike ``_plan_scene_grasp_geometry``, this never asks the geometry planner
+    to pick a new best section.  That planner is correct for primary grasps but
+    is exactly what made successive sponge fallback frames select different
+    shoulders/edges.  We retain the locked section's image position and measure
+    only the mask width perpendicular to the current mask's long axis.
+    """
+    color, depth, intr = frame
+    diagnostics: dict[str, Any] = {"attempt": "locked_visual_slice"}
+    envelope = WD.segment_semantic_envelope(
+        color, depth, intr, feature, feature,
+        near_mm=WD.NEAR_MM, far_mm=WD.FAR_MM, diagnostics=diagnostics,
+    )
+    if envelope is None:
+        return None, {"reason": diagnostics.get(
+            "reason", "semantic RGB-D mask unavailable for locked slice"
+        )}
+    info = getattr(envelope, "info", {}) or {}
+    mask = np.asarray(info.get("mask_u8"), dtype=np.uint8)
+    if mask.shape != np.asarray(depth).shape or not np.any(mask > 0):
+        return None, {"reason": "locked slice semantic mask is invalid"}
+    try:
+        anchor_uv = np.asarray(expected_body.uv, dtype=float)
+        long_axis_deg = float(info["long_axis_deg"])
+    except (KeyError, TypeError, ValueError):
+        return None, {"reason": "locked slice anchor or mask axis is invalid"}
+    if anchor_uv.shape != (2,) or not np.all(np.isfinite(anchor_uv)):
+        return None, {"reason": "locked slice anchor is invalid"}
+    ys, xs = np.nonzero(mask > 0)
+    if xs.size < 20:
+        return None, {"reason": "locked slice has too few mask pixels"}
+    nearest = int(np.argmin((xs.astype(float) - anchor_uv[0]) ** 2 +
+                             (ys.astype(float) - anchor_uv[1]) ** 2))
+    centre_uv = (float(xs[nearest]), float(ys[nearest]))
+    valid_depth = (mask > 0) & np.isfinite(depth) & (depth > 0)
+    local_radius_px = 8.0
+    local = valid_depth & (
+        (np.indices(depth.shape)[1] - centre_uv[0]) ** 2 +
+        (np.indices(depth.shape)[0] - centre_uv[1]) ** 2 <= local_radius_px ** 2
+    )
+    values = np.asarray(depth[local], dtype=float)
+    if values.size < 8:
+        values = np.asarray(depth[valid_depth], dtype=float)
+    if values.size < 8:
+        return None, {"reason": "locked slice has insufficient valid depth"}
+    z_mm = float(np.median(values))
+    width_mm = WD.local_cross_section_width_mm(
+        mask, centre_uv, long_axis_deg, z_mm, intr,
+    )
+    if width_mm is None:
+        return None, {"reason": "locked slice width could not be measured"}
+    measured = replace(
+        expected_body,
+        uv=centre_uv,
+        z_mm=z_mm,
+        p_cam_mm=WD.deproject(centre_uv[0], centre_uv[1], z_mm, intr),
+        min_width_mm=float(width_mm),
+        info={
+            **(getattr(expected_body, "info", {}) or {}),
+            "position_basis": "locked_depth_gated_visual_slice",
+            "locked_slice_long_axis_deg": long_axis_deg,
+            "locked_slice_mask_pixels": int(np.count_nonzero(mask)),
+        },
+    )
+    return measured, {
+        "reason": "fixed depth-gated local mask slice measured",
+        "mask_pixels": int(np.count_nonzero(mask)),
+        "long_axis_deg": long_axis_deg,
+    }
+
+
+def _capture_stable_visual_subsection(
+    eye: "WristEye", description: str, current_rpy: tuple[float, float, float],
+    expected_geometry: GG.GraspGeometry, log: Callable[[str], None], *,
+    min_frames: int = 2, max_frames: int = 4,
+) -> tuple[GG.GraspGeometry | None, dict[str, Any]]:
+    """Re-observe one local grasp section without replacing locked 3D shape.
+
+    This is deliberately a late, narrow fallback for an elongated object whose
+    complete OBB projects too widely through the jaws.  The normal grasp path
+    (including marker grasps) never calls it.  It obtains repeated stationary
+    RGB-D measurements at the already verified metric grasp point, so a noisy
+    PCA attitude cannot turn a safely measured local section into a rejection.
+    The full registered box is *not* changed: it remains collision/payload
+    authority.  A fresh observation that wanders away from the locked body is
+    rejected rather than allowed to select a neighbouring object.
+    """
+    body = expected_geometry.grasp_detection
+    if body is None:
+        return None, {"reason": "locked grasp section is missing"}
+    try:
+        expected = np.asarray(body.p_cam_mm, dtype=float)
+    except (TypeError, ValueError):
+        return None, {"reason": "locked grasp section has invalid position"}
+    if expected.shape != (3,) or not np.all(np.isfinite(expected)):
+        return None, {"reason": "locked grasp section has invalid position"}
+    try:
+        max_offset_mm = float(os.getenv(
+            "REBOT_VISUAL_SUBSECTION_MAX_OFFSET_MM", "30"
+        ))
+    except (TypeError, ValueError):
+        max_offset_mm = 30.0
+    max_offset_mm = float(np.clip(max_offset_mm, 10.0, 60.0))
+    required = int(np.clip(min_frames, 2, 3))
+    total = int(np.clip(max_frames, required, 6))
+    samples: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for index in range(1, total + 1):
+        feature, frame, why = _observe(eye, description)
+        if feature is None or frame is None:
+            failures.append(str(why))
+            log(
+                "stage=visual_subsection_sample "
+                f"frame={index}/{total} ok=False detail={why}"
+            )
+            continue
+        candidate_body, slice_detail = _measure_locked_visual_slice(
+            frame, feature, body,
+        )
+        if candidate_body is None:
+            failures.append(str(slice_detail.get("reason")))
+            log(
+                "stage=visual_subsection_sample "
+                f"frame={index}/{total} ok=False detail={slice_detail.get('reason')}"
+            )
+            continue
+        position = np.asarray(candidate_body.p_cam_mm, dtype=float)
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            failures.append("local section position is invalid")
+            continue
+        offset_mm = float(np.linalg.norm(position - expected))
+        if offset_mm > max_offset_mm:
+            failures.append(
+                f"local section is {offset_mm:.1f}mm from the locked body"
+            )
+            log(
+                "stage=visual_subsection_sample "
+                f"frame={index}/{total} ok=False offset_mm={offset_mm:.1f} "
+                "detail=outside locked-body identity radius"
+            )
+            continue
+        width_mm = float(candidate_body.min_width_mm or 0.0)
+        if not math.isfinite(width_mm) or width_mm <= 0.0:
+            failures.append("local section width is invalid")
+            continue
+        samples.append({
+            "body_cam_mm": position.tolist(), "width_mm": width_mm,
+            "body": candidate_body,
+        })
+        log(
+            "stage=visual_subsection_sample "
+            f"frame={index}/{total} ok=True offset_mm={offset_mm:.1f} "
+            f"width_mm={width_mm:.1f}"
+        )
+        median, position_detail = _endpoint_body_pose_consensus(
+            samples, min_frames=required, max_spread_mm=5.0
+        )
+        if median is None:
+            continue
+        rejected = set(position_detail.get("rejected_frame_indices", []))
+        stable = [sample for sample_index, sample in enumerate(samples)
+                  if sample_index not in rejected]
+        widths = np.asarray([sample["width_mm"] for sample in stable], dtype=float)
+        median_width_mm = float(np.median(widths))
+        width_spread_mm = float(np.max(np.abs(widths - median_width_mm)))
+        width_limit_mm = max(3.0, 0.20 * max(1.0, median_width_mm))
+        if width_spread_mm > width_limit_mm:
+            failures.append(
+                f"local-section width spread {width_spread_mm:.1f}mm exceeds "
+                f"{width_limit_mm:.1f}mm"
+            )
+            continue
+        representative = min(stable, key=lambda sample: float(np.linalg.norm(
+            np.asarray(sample["body_cam_mm"], dtype=float) - median
+        )))
+        representative_body = representative["body"]
+        # Use the largest stable width for entry clearance.  The median body
+        # position avoids one noisy RGB-D frame moving the final target.
+        measured_body = replace(
+            representative_body,
+            p_cam_mm=tuple(float(value) for value in median),
+            min_width_mm=float(np.max(widths)),
+            info={
+                **(getattr(representative_body, "info", {}) or {}),
+                "position_basis": "stable_local_visual_subsection",
+                "stable_width_median_mm": median_width_mm,
+                "stable_width_max_mm": float(np.max(widths)),
+            },
+        )
+        return replace(expected_geometry, grasp_detection=measured_body), {
+            **position_detail,
+            "reason": (
+                f"{len(stable)} stable local RGB-D sections; width median "
+                f"{median_width_mm:.1f}mm, spread {width_spread_mm:.1f}mm"
+            ),
+            "valid_full_geometry_frames": len(stable),
+            "width_median_mm": median_width_mm,
+            "width_max_mm": float(np.max(widths)),
+            "width_spread_mm": width_spread_mm,
+            "failures": failures,
+        }
+    return None, {
+        "reason": f"no {required}-frame stable local RGB-D subsection",
+        "valid_full_geometry_frames": len(samples),
+        "failures": failures,
     }
 
 
@@ -4782,6 +5119,72 @@ def _projected_3d_span_fits_aperture(
     }
 
 
+def _registered_subsection_fits_aperture(
+    registered_box: dict[str, Any] | None,
+    stationary_box: dict[str, Any] | None,
+    camera_mapping: np.ndarray,
+    max_aperture_mm: float,
+) -> tuple[bool, dict[str, Any]]:
+    """Authorize an elongated local section from repeatable metric evidence.
+
+    This is not a general reduction of the entry margin.  It is available only
+    when two independently acquired metric boxes agree on the *same* projected
+    local cross-section.  In that case their disagreement is the relevant
+    uncertainty; applying the unrelated whole-mask 7.25 mm entry allowance a
+    second time is what falsely vetoes a sponge that already has physical room
+    inside a 50 mm opening.  The hard opening command remains 50 mm.
+    """
+    primary = _projected_3d_cross_section_span(registered_box, camera_mapping)
+    secondary = _projected_3d_cross_section_span(stationary_box, camera_mapping)
+    if not primary.get("ok") or not secondary.get("ok"):
+        return False, {
+            "reason": "registered and stationary local cross-sections are unavailable",
+            "registered": primary, "stationary": secondary,
+        }
+    try:
+        observed = float(primary["observed_width_mm"])
+        other_observed = float(secondary["observed_width_mm"])
+        aspect = float(primary["elongation_ratio"])
+        aperture = float(max_aperture_mm)
+    except (KeyError, TypeError, ValueError):
+        return False, {"reason": "local cross-section evidence is malformed"}
+    if not all(math.isfinite(value) and value > 0.0 for value in (
+        observed, other_observed, aspect, aperture
+    )):
+        return False, {"reason": "local cross-section evidence is invalid"}
+    if aspect < 1.5:
+        return False, {
+            "reason": f"object aspect ratio {aspect:.2f} is not elongated enough "
+                      "for a subsection grasp",
+        }
+    # The two metric fits are from independent stationary/multi-view evidence.
+    # Keep at least the calibrated RGB-D quantisation allowance, then use their
+    # actual projected disagreement rather than a blanket whole-object margin.
+    uncertainty_mm = max(
+        float(np.clip(GRASP_OPEN_CLEARANCE_BOUNDARY_SLOP_MM, 0.0, 0.75)),
+        abs(observed - other_observed),
+    )
+    required_open_mm = observed + uncertainty_mm
+    safe = bool(required_open_mm <= aperture + 1e-6)
+    detail = {
+        "ok": safe,
+        "observed_width_mm": observed,
+        "registered_width_mm": observed,
+        "stationary_width_mm": other_observed,
+        "measured_uncertainty_mm": uncertainty_mm,
+        "required_open_mm": required_open_mm,
+        "max_aperture_mm": aperture,
+        "elongation_ratio": aspect,
+        "cross_section": primary,
+        "reason": (
+            f"registered/stationary local cross-sections agree within "
+            f"{uncertainty_mm:.2f}mm; {observed:.1f}+{uncertainty_mm:.2f}="
+            f"{required_open_mm:.2f}/{aperture:.1f}mm hard opening"
+        ),
+    }
+    return safe, detail
+
+
 def _geometry_with_projected_3d_width(
     geometry: GG.GraspGeometry, width_detail: dict[str, Any],
 ) -> GG.GraspGeometry:
@@ -5128,6 +5531,8 @@ def _plan_collision_aware_grasp_pose(
     log: Callable[[str], None],
     *, allow_pitch_search: bool = True,
     require_alternate_section: bool = False,
+    collect_all: bool = False,
+    candidate_rank: int | None = None,
 ) -> dict[str, Any]:
     """Search measured grasp sections and jaw-slot slack after a blocked pose.
 
@@ -5240,6 +5645,11 @@ def _plan_collision_aware_grasp_pose(
         configured_max_candidates = 20
     max_candidates = int(np.clip(configured_max_candidates, 4, 40))
     attempts = 0
+    # Only the read-only candidate preview sets this. Ordinary pick execution
+    # retains its first-safe-candidate behavior.
+    accepted_ladder: list[dict[str, Any]] = []
+    accepted_results: list[dict[str, Any]] = []
+    first_accepted: dict[str, Any] | None = None
     failures: list[str] = []
     log(
         "stage=grasp_pose_search status=starting "
@@ -5412,7 +5822,7 @@ def _plan_collision_aware_grasp_pose(
                     f"attempt={orientation_attempt}/{len(pitch_offsets_deg)} "
                     f"pitch_offset_deg={pitch_offset_deg:+.1f}"
                 )
-                return {
+                candidate_result = {
                     "ok": True,
                     "reason": (
                         "collision-free terminal pitch selected from measured "
@@ -5440,6 +5850,20 @@ def _plan_collision_aware_grasp_pose(
                     "projected_jaw_span": width_detail,
                     "camera_mapping_detail": mapping_detail,
                 }
+                if not collect_all:
+                    return candidate_result
+                accepted_ladder.append({
+                    "kind": "pitch",
+                    "rank": len(accepted_ladder) + 1,
+                    "body": "selected",
+                    "slot_offset_mm": 0.0,
+                    "pitch_offset_deg": float(pitch_offset_deg),
+                    "jaw_close_mm": float(candidate_jaw.get("grasp_mm", 0.0)),
+                    "endpoint_m": nominal_endpoint.round(4).tolist(),
+                    "route_reason": str(route_reason),
+                })
+                accepted_results.append(candidate_result)
+                first_accepted = first_accepted or candidate_result
 
     # Offset-major ordering first tests every independently measured body
     # section at the calibrated jaw centre, then expands laterally by increasing
@@ -5507,7 +5931,7 @@ def _plan_collision_aware_grasp_pose(
                 f"attempt={attempts}/{max_candidates} body={body_name} "
                 f"slot_offset_mm={offset_mm:+.1f}"
             )
-            return {
+            candidate_result = {
                 "ok": True,
                 "reason": (
                     "collision-free grasp selected from measured object "
@@ -5528,8 +5952,42 @@ def _plan_collision_aware_grasp_pose(
                 "axis_fraction": _selected_axis_fraction(candidate_geometry),
                 "attempts": attempts,
             }
+            if not collect_all:
+                return candidate_result
+            accepted_ladder.append({
+                "kind": "section_slot",
+                "rank": len(accepted_ladder) + 1,
+                "body": body_name,
+                "axis_fraction": _selected_axis_fraction(candidate_geometry),
+                "slot_offset_mm": float(offset_mm),
+                "pitch_offset_deg": 0.0,
+                "jaw_close_mm": float(candidate_jaw.get("grasp_mm", 0.0)),
+                "endpoint_m": endpoint.round(4).tolist(),
+                "route_reason": str(route_reason),
+            })
+            accepted_results.append(candidate_result)
+            first_accepted = first_accepted or candidate_result
         if attempts >= max_candidates:
             break
+    if first_accepted is not None:
+        if candidate_rank is not None:
+            if candidate_rank < 1 or candidate_rank > len(accepted_results):
+                return {
+                    "ok": False,
+                    "reason": (
+                        f"requested reflex candidate {candidate_rank} is not "
+                        f"available; {len(accepted_results)} safe candidates "
+                        "were found"
+                    ),
+                    "candidate_ladder": accepted_ladder,
+                    "candidates_examined": attempts,
+                }
+            first_accepted = accepted_results[candidate_rank - 1]
+        return {
+            **first_accepted,
+            "candidate_ladder": accepted_ladder,
+            "candidates_examined": attempts,
+        }
     return {
         "ok": False,
         "reason": (
@@ -7428,6 +7886,15 @@ def _freeze_arm() -> dict[str, Any]:
 
 def _home_after_interrupt(*, open_gripper: bool = True) -> dict[str, Any]:
     """Freeze immediately, then open the gripper and home the arm."""
+    if MC.cancelled():
+        # Hybrid stop is hold-only, including stops raised inside the sender.
+        # Never convert cancellation into an automatic release or return path.
+        with MC.recovery():
+            frozen = ({"ok": True, "reason": "dry run; no hardware action"}
+                      if MC.current().dry_run else _freeze_arm())
+        return {"ok": False, "frozen": bool(frozen.get("ok")),
+                "homed": False, "gripper_opened": False, "freeze": frozen,
+                "reason": "mission cancelled; hold only; operator recovery required"}
     try:
         frozen = _freeze_arm()
     except BaseException as exc:
@@ -7612,12 +8079,11 @@ def _result(ok: bool, reason: str, steps: list[tuple[str, bool, str]],
 
 
 def _printer(verbose: bool) -> Callable[[str], None]:
-    if not verbose:
-        return lambda m: None
-
     def emit(message: str) -> None:
-        stamp = time.strftime("%H:%M:%S")
-        print(f"[wrist {stamp}] {message}", flush=True)
+        MC.checkpoint()
+        if verbose:
+            stamp = time.strftime("%H:%M:%S")
+            print(f"[wrist {stamp}] {message}", flush=True)
 
     return emit
 
@@ -7667,6 +8133,51 @@ def _observe(eye: WristEye, description: str, retries: int = LOST_RETRIES):
             f"consecutive failures={len(pending_frame_errors)}; "
             f"last error: {pending_frame_errors[-1]}"
         )
+    return None, None, last_why
+
+
+def _observe_exact_color_seeded(
+    eye: WristEye, description: str, retries: int = LOST_RETRIES,
+):
+    """Observe one explicitly named chromatic object without a VLM mask.
+
+    This is only the bounded reflex-sweep fallback. Exact colour pixels select
+    one connected, depth-complete component, which still has to pass the usual
+    geometry, aperture, IK, collision, and visual-hold gates.
+    """
+    colors = WD.colors_of(description)
+    if len(colors) != 1:
+        return None, None, {
+            "reason": "reflex color fallback needs exactly one named colour",
+            "colors": colors,
+        }
+    color_name = colors[0]
+    last_why: dict[str, Any] = {}
+    for attempt in range(max(1, int(retries))):
+        try:
+            color, depth, intr = eye.frame()
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - bounded camera retry below
+            last_why = {"reason": f"camera frame unavailable: {type(exc).__name__}: {exc}"}
+            if attempt + 1 < max(1, int(retries)):
+                time.sleep(0.15)
+            continue
+        det = WD.detect_color_seeded_instance(
+            color, depth, intr, color_name,
+            near_mm=WD.NEAR_MM, far_mm=WD.FAR_MM,
+        )
+        if det is not None:
+            return det, (color, depth, intr), {
+                "used": det.source,
+                "reflex": "exact_color_seeded_physical_component",
+                "color": color_name,
+            }
+        last_why = {
+            "reason": "no complete physical RGB-D component from exact colour seed",
+            "color": color_name,
+        }
+        time.sleep(0.1)
     return None, None, last_why
 
 
@@ -9115,6 +9626,7 @@ def _look_around_object(
     detection_accept: Callable[
         [Any, tuple[np.ndarray, np.ndarray, Any]], tuple[bool, str]
     ] | None = None,
+    observe: Callable[[WristEye, str, int], tuple[Any, Any, Any]] = _observe,
 ) -> tuple[Any | None, Any | None, GG.GraspGeometry | None, dict[str, Any]]:
     """Bounded elevated discovery sweep; never moves forward or descends.
 
@@ -9333,7 +9845,7 @@ def _look_around_object(
         # previously associated an old camera frame with a later sagged pose.
         capture_xyz = np.asarray(A.ee_pos(), dtype=float)
         capture_rpy = np.asarray(A.ee_rpy(), dtype=float)
-        det, frame, why = _observe(eye, description)
+        det, frame, why = observe(eye, description, LOST_RETRIES)
         after_xyz = np.asarray(A.ee_pos(), dtype=float)
         after_rpy = np.asarray(A.ee_rpy(), dtype=float)
         position_drift_mm = float(np.linalg.norm(after_xyz - capture_xyz) * 1000.0)
@@ -9441,7 +9953,9 @@ def _look_around_object(
             for sample_attempt in range(1, consensus_count + 1):
                 if len(consensus_points) >= consensus_required:
                     break
-                sample_det, sample_frame, sample_why = _observe(eye, description)
+                sample_det, sample_frame, sample_why = observe(
+                    eye, description, LOST_RETRIES
+                )
                 if sample_det is None or sample_frame is None:
                     sample_reason = f"not detected: {sample_why}"
                     consensus_rejections.append(sample_reason)
@@ -9806,6 +10320,7 @@ def _execute_fixed_approach_trajectory(
     fixed_rpy: tuple[float, float, float] | None = None,
 ):
     """Execute only the pre-planned waypoints; camera detections cannot steer it."""
+    MC.checkpoint()
     if isinstance(waypoints, dict) and waypoints.get("kind") == "certified_joint_plan":
         count = len(waypoints.get("joint_path", []))
         log(
@@ -9867,6 +10382,7 @@ def _execute_fixed_approach_trajectory(
         return move_segment(target, depth + 1)
 
     for index, waypoint in enumerate(waypoints, 1):
+        MC.checkpoint()
         ok, why = move_segment(waypoint)
         log(f"  [trajectory {index}/{len(waypoints)}] "
             f"target=({waypoint[0]:.4f},{waypoint[1]:.4f},{waypoint[2]:.4f}) "
@@ -12425,6 +12941,22 @@ def servo_approach(object_name: str, *, dry: bool = False, verbose: bool = False
                            recovery=recovery, gripper_commanded=False)
         _settle(eye, note="ready lift reached")
 
+        # Match the calibrated Hermes observation posture before learning the
+        # camera Jacobian.  The old flat-home posture made a visually valid
+        # near-table target fail local IK even though the same point is
+        # reachable from this established viewing configuration.
+        working = _approach_working_posture(log)
+        steps.append(("working_posture", working.ok, working.reason))
+        if not working.ok:
+            recovery = _home_after_interrupt(open_gripper=False)
+            return _result(
+                False,
+                f"could not enter calibrated working posture: {working.reason}",
+                steps, homed=bool(recovery.get("homed")), recovery=recovery,
+                gripper_commanded=False,
+            )
+        _settle(eye, note="calibrated working posture reached")
+
         det, frame, why = _observe(eye, object_name)
         if frame is not None:
             _show(*frame, tag="approach_detect", det=det, tcp_cam=tcp_cam,
@@ -12571,6 +13103,7 @@ def _fixed_pick_and_place_attempt(
     place_relation: str = "drop_zone",
     place_distance_m: float | None = None,
     grasp_attempt_index: int = 0,
+    preview_only: bool = False,
 ) -> dict[str, Any]:
     """Fixed-coordinate pick and high release with no contact inference.
 
@@ -12579,6 +13112,7 @@ def _fixed_pick_and_place_attempt(
     observations remains fixed and completely IK/collision-prevalidated; camera
     observations never steer a segment while it is executing.
     """
+    MC.stage("observe", attempt=grasp_attempt_index + 1)
     global _OBJECT_HELD, _FIXED_HELD_CONTEXT, _ACTIVE_SCENE_MAP
     _OBJECT_HELD = False
     _FIXED_HELD_CONTEXT = None
@@ -12684,8 +13218,11 @@ def _fixed_pick_and_place_attempt(
             "dynamic_jaw_model", True,
             (f"piecewise curve with {len(measured_points)} measured points"
              if has_curve else
-             "single 150deg span accepted as an uncertain initial estimate; "
-             "visual micro-lift controls bounded 5deg retries"),
+             ("single 150deg span accepted as an uncertain initial estimate; "
+              "visual micro-lift controls bounded 5deg retries"
+              if DYNAMIC_MAX_RETRIES > 0 else
+              "single 150deg span accepted as an uncertain initial estimate; "
+              "hybrid profile disables all tighter gripper retries")),
         ))
         dynamic_has_jaw_curve = has_curve
     else:
@@ -13377,8 +13914,9 @@ def _fixed_pick_and_place_attempt(
         if not geometry.ok or geometry.grasp_detection is None \
                 or geometry.rpy_rad is None:
             log(
-                "stage=geometry_view_sweep_trigger "
-                f"reason={geometry.reason} action=discover_and_export"
+                "stage=geometry_view_recovery_trigger "
+                f"reason={geometry.reason} "
+                "action=bounded_preset_view_search"
             )
             sweep_det, sweep_frame, sweep_geometry, sweep = \
                 _look_around_object(
@@ -13395,23 +13933,74 @@ def _fixed_pick_and_place_attempt(
             ))
             if sweep_det is None or sweep_frame is None \
                     or sweep_geometry is None:
-                discovery_cloud = sweep.get("discovery_cloud") or \
-                    _export_discovery_cloud(scene_discovery_views, log)
-                return recover(
-                    "no bounded viewpoint produced a safe grasp; the scene "
-                    "sweep was exported without weakening orientation limits: "
-                    f"{' | '.join(geometry_attempt_reasons)}",
-                    discovery=sweep,
-                    discovery_cloud=discovery_cloud,
-                    grasp_fit_diagnostics=grasp_fit_diagnostics,
-                    grasp_geometry=geometry.summary(),
-                    geometry_attempts=geometry_attempt_reasons,
+                # Semantic masks can conservatively include a neighbouring
+                # cup/table edge. Invoke Claw-style reflex only here: replay
+                # the same prevalidated yaw/pitch/retreat presets with the
+                # requested colour selecting a physical RGB-D component.
+                # Success hands off to the ordinary pick-and-place pipeline.
+                reflex_enabled = os.getenv(
+                    "REBOT_REFLEX_COLOR_GRASP_FALLBACK", "0"
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                reflex_colors = WD.colors_of(object_name)
+                reflex_detail: dict[str, Any] | None = None
+                if reflex_enabled and len(reflex_colors) == 1:
+                    log(
+                        "stage=reflex_color_grasp_trigger "
+                        f"reason={geometry.reason} color={reflex_colors[0]} "
+                        "action=bounded_preset_axis_sweep"
+                    )
+                    reflex_det, reflex_frame, reflex_geometry, reflex = \
+                        _look_around_object(
+                            eye, object_name, log, require_grasp=True,
+                            geometry_accept=grasp_view_entry_ok,
+                            geometry_rejected=record_grasp_fit_rejection,
+                            captured_views=scene_discovery_views,
+                            allow_edge_recenter=True,
+                            detection_accept=grasp_detection_authority,
+                            observe=_observe_exact_color_seeded,
+                        )
+                    reflex_detail = reflex
+                    steps.append((
+                        "reflex_color_grasp_fallback", bool(reflex.get("ok")),
+                        str(reflex.get("pose") or reflex.get("reason")),
+                    ))
+                    if reflex_det is not None and reflex_frame is not None \
+                            and reflex_geometry is not None:
+                        det, frame, geometry = (
+                            reflex_det, reflex_frame, reflex_geometry
+                        )
+                        log(
+                            "stage=reflex_color_grasp status=accepted "
+                            f"pose={reflex.get('pose')} "
+                            f"detail={geometry.reason} "
+                            "handoff=normal_pick_then_place"
+                        )
+                    else:
+                        log(
+                            "stage=reflex_color_grasp status=rejected "
+                            f"detail={reflex.get('reason')}"
+                        )
+                if not geometry.ok or geometry.grasp_detection is None \
+                        or geometry.rpy_rad is None:
+                    discovery_cloud = sweep.get("discovery_cloud") or \
+                        _export_discovery_cloud(scene_discovery_views, log)
+                    return recover(
+                        "no bounded viewpoint produced a safe grasp; the scene "
+                        "sweep was exported without weakening orientation limits: "
+                        f"{' | '.join(geometry_attempt_reasons)}",
+                        discovery=sweep,
+                        discovery_cloud=discovery_cloud,
+                        grasp_fit_diagnostics=grasp_fit_diagnostics,
+                        grasp_geometry=geometry.summary(),
+                        geometry_attempts=geometry_attempt_reasons,
+                        reflex_color_grasp=reflex_detail,
+                    )
+            else:
+                det, frame, geometry = sweep_det, sweep_frame, sweep_geometry
+                log(
+                    "stage=geometry_view_sweep status=accepted "
+                    f"pose={sweep.get('pose')} detail={geometry.reason}"
                 )
-            det, frame, geometry = sweep_det, sweep_frame, sweep_geometry
-            log(
-                "stage=geometry_view_sweep status=accepted "
-                f"pose={sweep.get('pose')} detail={geometry.reason}"
-            )
         initial_entry_ok, initial_entry_reason = grasp_view_entry_ok(geometry)
         if not initial_entry_ok:
             record_grasp_fit_rejection(
@@ -13941,6 +14530,7 @@ def _fixed_pick_and_place_attempt(
                 det, frame, geometry = (
                     restored_det, restored_frame, restored_geometry
                 )
+        MC.stage("plan_grasp")
         grasp_geometry_summary = geometry.summary()
         approach_rpy = tuple(float(v) for v in geometry.rpy_rad)
         live_rpy = np.asarray(A.ee_rpy(), dtype=float)
@@ -14860,9 +15450,28 @@ def _fixed_pick_and_place_attempt(
         # the table. Fall back to the small, long-standing yaw-only refinement,
         # and if that cannot solve it, fail closed rather than rotate blind.
         geometry_trusted_for_reorientation = bool(recentre_detail.get("ok"))
+        claw_box_reflex_mode = _claw_box_reflex_mode()
+        claw_box_reflex_enabled = claw_box_reflex_mode != "off"
+        claw_box_reflex_force = claw_box_reflex_mode == "force"
         axis_refinement = None
         visual_subsection_authorized = False
-        if alignment_required or alignment_optional:
+        registered_subsection_authorized = False
+        if alignment_required and not claw_box_reflex_enabled:
+            return recover(
+                "the nominal jaw axis does not fit the measured 3D object and "
+                "the Claw box-reflex fallback is disabled",
+                aligned_3d_jaw_width=aligned_3d_width_detail,
+                full_3d_jaw_projection=full_projection_detail,
+            )
+        if claw_box_reflex_enabled and (
+                alignment_required or alignment_optional or claw_box_reflex_force
+        ):
+            if claw_box_reflex_enabled:
+                log(
+                    "stage=claw_box_reflex_axis_search status=starting "
+                    f"trigger={'forced_test' if claw_box_reflex_force else ('aperture_or_alignment' if alignment_required else 'alignment_improvement')} "
+                    "input=validated_metric_3d_obb detector=none"
+                )
             if geometry_trusted_for_reorientation:
                 axis_refinement = _find_3d_axis_orientation_refinement(
                     jaw_axis_box_3d, A.ee_rpy(), max_aperture_mm
@@ -14913,6 +15522,13 @@ def _fixed_pick_and_place_attempt(
                 bool(axis_refinement.get("ok")),
                 str(axis_refinement.get("reason")),
             ))
+            if claw_box_reflex_enabled:
+                steps.append((
+                    "claw_box_reflex_axis_search",
+                    bool(axis_refinement.get("ok")),
+                    "used validated 3D OBB axes/dimensions and calibrated jaw "
+                    "mapping; no new VLM target query",
+                ))
             log(
                 "stage=3d_axis_orientation_refinement status=planned "
                 f"ok={axis_refinement.get('ok')} "
@@ -14925,15 +15541,82 @@ def _fixed_pick_and_place_attempt(
                 # improvement that cannot be found is not a failure.
                 axis_refinement = None
             elif not axis_refinement.get("ok"):
-                visual_subsection = _stable_visual_subsection_fallback(
-                    plan_geometry, geometry_consensus, jaw_plan,
-                    jaw_axis_box_3d, full_projection_detail, recentre_detail,
-                    independent_metric_crosscheck=bool(
-                        object_geometry_mode == "hybrid"
-                        and isinstance(hybrid_object_box_3d, dict)
-                        and isinstance(stationary_object_box_3d, dict)
-                    ),
+                # A long body need not fit between the fingers.  First ask
+                # whether two independently measured 3D boxes agree on its
+                # actual local cross-section at this fixed wrist attitude.
+                # This is narrower and more repeatable than re-running an
+                # image silhouette selection, and remains unavailable to the
+                # normal marker path.
+                registered_subsection_ok, registered_subsection = \
+                    _registered_subsection_fits_aperture(
+                        full_object_box_3d, stationary_object_box_3d, J,
+                        max_aperture_mm,
+                    )
+                log(
+                    "stage=registered_subsection_aperture "
+                    f"ok={registered_subsection_ok} "
+                    f"detail={registered_subsection.get('reason')}"
                 )
+                steps.append((
+                    "registered_subsection_aperture",
+                    registered_subsection_ok,
+                    str(registered_subsection.get("reason")),
+                ))
+                if registered_subsection_ok:
+                    # The named target has already passed the stationary
+                    # identity/position checkpoint.  Use fresh frames only to
+                    # maintain that position later in the approach; they may
+                    # not resize this metric section.
+                    axis_refinement = None
+                    visual_subsection_authorized = True
+                    registered_subsection_authorized = True
+                    aligned_3d_width_detail = {
+                        **registered_subsection["cross_section"],
+                        "ok": True,
+                        "basis": "registered_multiview_local_cross_section",
+                        "registered_subsection_entry": registered_subsection,
+                        "reason": str(registered_subsection.get("reason")),
+                    }
+                    visual_subsection = {
+                        "ok": True,
+                        "reason": str(registered_subsection.get("reason")),
+                    }
+                else:
+                    # Keep the existing visual fallback only for the rarer
+                    # case where metric cross-section agreement is unavailable.
+                    subsection_geometry, subsection_consensus = \
+                        _capture_stable_visual_subsection(
+                            eye, object_name,
+                            tuple(float(value) for value in A.ee_rpy()),
+                            plan_geometry, log,
+                        )
+                    steps.append((
+                        "capture_stable_visual_subsection",
+                        subsection_geometry is not None,
+                        str(subsection_consensus.get("reason")),
+                    ))
+                    log(
+                        "stage=capture_stable_visual_subsection "
+                        f"ok={subsection_geometry is not None} "
+                        f"detail={subsection_consensus.get('reason')}"
+                    )
+                    visual_geometry = (
+                        subsection_geometry
+                        if subsection_geometry is not None else plan_geometry
+                    )
+                    visual_consensus = (
+                        subsection_consensus
+                        if subsection_geometry is not None else geometry_consensus
+                    )
+                    visual_subsection = _stable_visual_subsection_fallback(
+                        visual_geometry, visual_consensus, jaw_plan,
+                        jaw_axis_box_3d, full_projection_detail, recentre_detail,
+                        independent_metric_crosscheck=bool(
+                            object_geometry_mode == "hybrid"
+                            and isinstance(hybrid_object_box_3d, dict)
+                            and isinstance(stationary_object_box_3d, dict)
+                        ),
+                    )
                 steps.append((
                     "stable_visual_subsection_fallback",
                     bool(visual_subsection.get("ok")),
@@ -15230,7 +15913,10 @@ def _fixed_pick_and_place_attempt(
                 "observed_width_mm", silhouette_width_mm
             ))
         )
-        override_useful = bool(aligned_width_safe and width_reduction_mm >= 3.0)
+        override_useful = bool(
+            (aligned_width_safe and width_reduction_mm >= 3.0)
+            or registered_subsection_authorized
+        )
         aligned_3d_width_detail["silhouette_width_mm"] = silhouette_width_mm
         aligned_3d_width_detail["width_reduction_mm"] = width_reduction_mm
         aligned_3d_width_detail["override_applied"] = override_useful
@@ -15313,6 +15999,28 @@ def _fixed_pick_and_place_attempt(
             plan_geometry = _geometry_with_3d_jaw_width(
                 plan_geometry, aligned_3d_width_detail
             )
+            if registered_subsection_authorized:
+                grasp = plan_geometry.grasp_detection
+                assert grasp is not None
+                plan_geometry = replace(
+                    plan_geometry,
+                    grasp_detection=replace(
+                        grasp,
+                        info={
+                            **(getattr(grasp, "info", {}) or {}),
+                            "registered_subsection_entry": dict(
+                                aligned_3d_width_detail.get(
+                                    "registered_subsection_entry", {}
+                                )
+                            ),
+                        },
+                    ),
+                    reason=(
+                        f"{plan_geometry.reason}; registered local subsection "
+                        "uses repeatable 3D uncertainty instead of the broad "
+                        "whole-mask entry margin",
+                    ),
+                )
             geometry = plan_geometry
             det = plan_geometry.grasp_detection
             assert det is not None
@@ -15922,25 +16630,72 @@ def _fixed_pick_and_place_attempt(
         # an otherwise valid marker grasp to jump 89 mm at the checkpoint. An
         # alternate remains available when the fresh primary is actually
         # unreachable or collision-blocked.
-        force_alternate_candidate = False
+        # ``force`` is exclusively a test selector: it requires an actual
+        # box-derived alternative instead of silently using the nominal route.
+        # It does not relax a single aperture, collision, or gripper gate.
+        force_alternate_candidate = claw_box_reflex_force
+        alternate: dict[str, Any] = {}
         if SIMPLE_GRASP_FLOW_ENABLED and grasp_attempt_index > 0:
             log(
                 "stage=simple_grasp_candidate strategy=fresh_primary_then_"
                 "alternate_if_blocked reason=second_complete_attempt"
             )
-        if force_alternate_candidate \
-                or not planned_target_qualified or waypoints is None:
+        if claw_box_reflex_enabled and (force_alternate_candidate \
+                or not planned_target_qualified or waypoints is None):
+            if claw_box_reflex_enabled:
+                log(
+                    "stage=claw_box_reflex_terminal_search status=starting "
+                    "input=validated_metric_3d_obb "
+                    "candidates=measured_sections_jaw_slots_bounded_pitch"
+                )
+            candidate_preview = os.getenv(
+                "REBOT_CLAW_BOX_REFLEX_CANDIDATE_PREVIEW", "0"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            candidate_rank_raw = os.getenv(
+                "REBOT_CLAW_BOX_REFLEX_CANDIDATE_RANK", ""
+            ).strip()
+            try:
+                candidate_rank = int(candidate_rank_raw) if candidate_rank_raw else None
+            except ValueError:
+                return recover(
+                    "REBOT_CLAW_BOX_REFLEX_CANDIDATE_RANK must be a positive integer"
+                )
+            if candidate_rank is not None and candidate_rank < 1:
+                return recover(
+                    "REBOT_CLAW_BOX_REFLEX_CANDIDATE_RANK must be a positive integer"
+                )
+            # The direct reflex is a candidate ladder, not a different
+            # terminal planner name. If a visually verified grasp attempt
+            # fails and recovery returns home, the bounded second attempt
+            # rebuilds the scene and advances to the next safe OBB candidate.
+            # An explicit rank remains an operator test selector.
+            direct_reflex_attempt = _claw_direct_reflex_enabled()
+            if direct_reflex_attempt and candidate_rank is None:
+                candidate_rank = grasp_attempt_index + 1
+                log(
+                    "stage=claw_direct_reflex_candidate "
+                    f"attempt={grasp_attempt_index + 1} "
+                    f"candidate_rank={candidate_rank} source=fresh_metric_obb"
+                )
             alternate = _plan_collision_aware_grasp_pose(
                 plan_geometry, plan_frame, J, requested_cam, approach_rpy,
                 jaw_plan, full_object_box_3d, log,
                 allow_pitch_search=not force_alternate_candidate,
                 require_alternate_section=force_alternate_candidate,
+                collect_all=candidate_preview or candidate_rank is not None,
+                candidate_rank=candidate_rank,
             )
             steps.append((
                 "measured_alternate_grasp_pose",
                 bool(alternate.get("ok")),
                 str(alternate.get("reason")),
             ))
+            if claw_box_reflex_enabled:
+                steps.append((
+                    "claw_box_reflex_terminal_search", bool(alternate.get("ok")),
+                    "selected only an OBB-derived cross-section/axis candidate "
+                    "with a fully prevalidated route",
+                ))
             if alternate.get("ok"):
                 plan_geometry = alternate["geometry"]
                 plan_det = alternate["body"]
@@ -15979,6 +16734,8 @@ def _fixed_pick_and_place_attempt(
                         "axis_fraction": selected_grasp_axis_fraction,
                         "jaw_slot_offset_mm": alternate["slot_offset_mm"],
                         "candidates_tested": alternate["attempts"],
+                        "candidate_rank": candidate_rank,
+                        "candidate_ladder": alternate.get("candidate_ladder", []),
                         "pitch_offset_deg": alternate.get(
                             "pitch_offset_deg", 0.0
                         ),
@@ -16041,13 +16798,75 @@ def _fixed_pick_and_place_attempt(
                 reachability=reachability,
                 rigid_camera_fit=rigid_detail,
             )
+        if preview_only:
+            # Explicit test boundary for the adapted Claw reflex. The bounded
+            # ready/view motions above establish the metric box, but this
+            # returns before final approach, pre-open, close, lift, or place.
+            log(
+                "stage=claw_box_reflex_preview status=complete "
+                "next=home gripper=untouched final_approach=disabled"
+            )
+            steps.append((
+                "claw_box_reflex_preview", True,
+                "validated metric OBB, grasp-axis candidates, jaw fit, scene "
+                "collision model, and complete terminal route; final approach "
+                "and gripper commands disabled",
+            ))
+            recovery = _home_after_interrupt(open_gripper=False)
+            if SCENE_COLLISION_ENABLED and recovery.get("homed"):
+                A.clear_collision_scene()
+            steps.append(("return_home", bool(recovery.get("homed")),
+                          str(recovery.get("reason"))))
+            return _result(
+                bool(recovery.get("homed")),
+                ("Claw box-reflex preview completed and arm returned home"
+                 if recovery.get("homed") else
+                 "Claw box-reflex preview completed but home was not verified"),
+                steps, homed=bool(recovery.get("homed")),
+                object_held=False, gripper_commanded=False,
+                recovery=recovery,
+                claw_box_reflex={
+                    "enabled": claw_box_reflex_enabled,
+                    "mode": claw_box_reflex_mode,
+                    "object_box_3d": full_object_box_3d,
+                    "jaw_axis_box_basis": jaw_axis_box_basis,
+                    "axis_refinement": axis_refinement,
+                    "candidate_ladder": alternate.get("candidate_ladder", []),
+                    "candidates_examined": alternate.get("candidates_examined"),
+                    "selected_endpoint_m": endpoint.round(4).tolist(),
+                    "route_reason": trajectory_reason,
+                    "jaw_plan": jaw_plan,
+                    "collision_scene": collision_detail,
+                },
+            )
         log(
             "stage=grasp_section_tracking mode="
             f"{'fixed_initial_scene' if FIXED_SCENE_TRAJECTORY else ('collision_selected_section_locked' if selected_grasp_section_locked else 'fresh_best_section_at_checkpoint')} "
             f"axis_fraction={selected_grasp_axis_fraction}"
         )
+        direct_reflex = _claw_direct_reflex_enabled()
+        if direct_reflex and not claw_box_reflex_force:
+            return recover(
+                "direct Claw reflex requires REBOT_CLAW_BOX_REFLEX_FALLBACK=force; "
+                "it will not silently use a nominal Hermes terminal path"
+            )
+        if direct_reflex and isinstance(waypoints, dict):
+            return recover(
+                "direct Claw reflex requires a fixed OBB-derived waypoint chain; "
+                "the selected candidate produced an arbitrary route"
+            )
         checkpoint_policy: dict[str, Any] | None = None
-        if FIXED_SCENE_TRAJECTORY and not isinstance(waypoints, dict):
+        # A true direct-reflex execution does not inherit the Hermes visible
+        # checkpoint split. It keeps the complete OBB-selected route frozen,
+        # opens only at the already prevalidated terminal distance, and makes
+        # no mid-route camera stop or geometry replacement.
+        if direct_reflex:
+            checkpoint_prefix = []
+            checkpoint_remaining = float(np.linalg.norm(
+                endpoint - np.asarray(A.ee_pos(), dtype=float)
+            ))
+            checkpoint_count = 0
+        elif FIXED_SCENE_TRAJECTORY and not isinstance(waypoints, dict):
             checkpoint_distance_m, checkpoint_policy = \
                 _dynamic_visible_checkpoint_m(
                     plan_geometry, plan_frame, requested_cam
@@ -16113,16 +16932,19 @@ def _fixed_pick_and_place_attempt(
                 f"waypoints={complete_count} checkpoint_waypoints="
                 f"{checkpoint_count} checkpoint_remaining_mm="
                 f"{checkpoint_remaining * 1000.0:.1f} "
-                "stationary_final_leg_replanning=enabled "
+                f"stationary_final_leg_replanning={'disabled_direct_reflex' if direct_reflex else 'enabled'} "
                 f"checkpoint_policy={checkpoint_policy}"
             )
             steps.append((
                 "freeze_complete_pick_trajectory", True,
-                "complete initial-scene trajectory passed IK/collision checks; "
-                "its macro prefix is frozen to a dynamically selected visible "
-                "checkpoint, where fresh stationary geometry may validate a "
-                "replacement final leg; the terminal suffix is never reused "
-                "from target identity alone",
+                "complete initial-scene trajectory passed IK/collision checks; " +
+                ("direct reflex will execute its frozen terminal suffix with "
+                 "no close-range semantic replan"
+                 if direct_reflex else
+                 "its macro prefix is frozen to a dynamically selected visible "
+                 "checkpoint, where fresh stationary geometry may validate a "
+                 "replacement final leg; the terminal suffix is never reused "
+                 "from target identity alone"),
             ))
         else:
             log("stage=visible_checkpoint_plan "
@@ -16135,20 +16957,24 @@ def _fixed_pick_and_place_attempt(
                 f"{checkpoint_remaining * 1000:.1f}mm",
             ))
         checkpoint_start_xyz = np.asarray(A.ee_pos(), dtype=float)
+        MC.stage("approach")
         if checkpoint_prefix:
             checkpoint_ok, checkpoint_reason = \
                 _execute_fixed_approach_trajectory(
                     checkpoint_prefix, log, fixed_rpy=approach_rpy
                 )
-            steps.append(("execute_visible_checkpoint",
+            steps.append(("execute_direct_reflex_macro" if direct_reflex
+                          else "execute_visible_checkpoint",
                           checkpoint_ok, checkpoint_reason))
             if not checkpoint_ok:
                 return recover(
                     f"visible checkpoint motion failed: {checkpoint_reason}"
                 )
         checkpoint_xyz = np.asarray(A.ee_pos(), dtype=float)
-        _settle(eye, target_cam=requested_cam,
-                note="visible pre-grasp checkpoint")
+        MC.stage("checkpoint")
+        if not direct_reflex:
+            _settle(eye, target_cam=requested_cam,
+                    note="visible pre-grasp checkpoint")
 
         def replan_from_visible_checkpoint(phase: str) -> dict[str, Any]:
             samples: list[dict[str, Any]] = []
@@ -16786,21 +17612,49 @@ def _fixed_pick_and_place_attempt(
                 "frame": representative["frame"],
             }
 
-        checkpoint_plan = replan_from_visible_checkpoint("initial")
-        steps.append((
-            (
-                "fixed_scene_macro_then_visible_checkpoint_replan"
-                if FIXED_SCENE_TRAJECTORY else
-                "visible_checkpoint_body_consensus_and_replan"
-            ),
-            bool(checkpoint_plan.get("ok")),
-            str(checkpoint_plan.get("reason")),
-        ))
-        log(
-            f"stage={'fixed_scene_checkpoint_replan' if FIXED_SCENE_TRAJECTORY else 'visible_checkpoint_replan'} "
-            f"phase=initial ok={checkpoint_plan.get('ok')} "
-            f"detail={checkpoint_plan.get('reason')}"
-        )
+        if direct_reflex:
+            checkpoint_plan = {
+                "ok": bool(frozen_checkpoint_suffix),
+                "reason": (
+                    "direct reflex uses the frozen OBB-derived terminal leg; "
+                    "no close-range semantic observation or endpoint replan"
+                ),
+                "endpoint_m": frozen_checkpoint_endpoint,
+                "waypoints": frozen_checkpoint_suffix,
+                "trajectory_reason": trajectory_reason,
+                "geometry": frozen_checkpoint_geometry,
+                "geometry_summary": frozen_checkpoint_geometry_summary,
+                "jaw_plan": frozen_checkpoint_jaw_plan,
+                "expected_feature_cam": frozen_checkpoint_expected_feature,
+                "feature_offset_cam": frozen_checkpoint_feature_offset,
+                "requested_cam_mm": frozen_checkpoint_requested_cam,
+                "section_locked": selected_grasp_section_locked,
+                "axis_fraction": selected_grasp_axis_fraction,
+                "checkpoint_collision_aware_grasp": None,
+                "frame": plan_frame,
+            }
+            steps.append((
+                "direct_reflex_frozen_terminal_leg",
+                bool(checkpoint_plan.get("ok")), str(checkpoint_plan.get("reason")),
+            ))
+            log("stage=direct_reflex_terminal status=accepted "
+                "source=initial_metric_obb no_checkpoint_replan=true")
+        else:
+            checkpoint_plan = replan_from_visible_checkpoint("initial")
+            steps.append((
+                (
+                    "fixed_scene_macro_then_visible_checkpoint_replan"
+                    if FIXED_SCENE_TRAJECTORY else
+                    "visible_checkpoint_body_consensus_and_replan"
+                ),
+                bool(checkpoint_plan.get("ok")),
+                str(checkpoint_plan.get("reason")),
+            ))
+            log(
+                f"stage={'fixed_scene_checkpoint_replan' if FIXED_SCENE_TRAJECTORY else 'visible_checkpoint_replan'} "
+                f"phase=initial ok={checkpoint_plan.get('ok')} "
+                f"detail={checkpoint_plan.get('reason')}"
+            )
         try:
             reacquire_retries = int(os.getenv(
                 "REBOT_VISIBLE_CHECKPOINT_REACQUIRE_RETRIES", "1"
@@ -16808,7 +17662,7 @@ def _fixed_pick_and_place_attempt(
         except (TypeError, ValueError):
             reacquire_retries = 1
         reacquire_retries = int(np.clip(reacquire_retries, 0, 2))
-        for retry_index in range(1, reacquire_retries + 1):
+        for retry_index in range(1, (0 if direct_reflex else reacquire_retries) + 1):
             if checkpoint_plan.get("ok"):
                 break
             log(
@@ -16919,7 +17773,8 @@ def _fixed_pick_and_place_attempt(
         final_residual_mm = 0.0
         reachability = {
             **reachability,
-            "visible_checkpoint_replanned": True,
+            "visible_checkpoint_replanned": not direct_reflex,
+            "direct_reflex_frozen_terminal": direct_reflex,
             "visible_checkpoint_m": checkpoint_xyz.round(4).tolist(),
             "predicted_endpoint_m": endpoint.round(4).tolist(),
             "residual_to_requested_target_mm": 0.0,
@@ -16951,10 +17806,22 @@ def _fixed_pick_and_place_attempt(
                 open_index = max(0, len(waypoints) - 1)
             closed_leg, final_leg = waypoints[:open_index], waypoints[open_index:]
         if closed_leg:
-            closed_ok, closed_reason = _execute_fixed_approach_trajectory(
-                closed_leg, log, fixed_rpy=approach_rpy
-            )
-            steps.append(("execute_replanned_before_open",
+            if direct_reflex:
+                preopen = np.asarray(closed_leg[-1], dtype=float)
+                direct = A.safe_certified_direct_move(
+                    *preopen.tolist(), roll=approach_rpy[0],
+                    pitch=approach_rpy[1], yaw=approach_rpy[2],
+                )
+                closed_ok, closed_reason = direct.ok, direct.reason
+                log("stage=claw_direct_pose_commit phase=preopen "
+                    f"target={preopen.round(4).tolist()} ok={direct.ok} "
+                    f"detail={direct.reason}")
+            else:
+                closed_ok, closed_reason = _execute_fixed_approach_trajectory(
+                    closed_leg, log, fixed_rpy=approach_rpy
+                )
+            steps.append(("execute_direct_reflex_preopen_route"
+                          if direct_reflex else "execute_replanned_before_open",
                           closed_ok, closed_reason))
             if not closed_ok:
                 return recover(
@@ -16972,15 +17839,26 @@ def _fixed_pick_and_place_attempt(
 
         final_start = np.asarray(A.ee_pos(), dtype=float)
         final_distance = float(np.linalg.norm(endpoint - final_start))
-        log("stage=execute_replanned_final_approach "
+        log(f"stage={'execute_direct_reflex_final_approach' if direct_reflex else 'execute_replanned_final_approach'} "
             f"distance_mm={final_distance * 1000:.1f} "
             f"waypoints="
             f"{(len(final_leg.get('joint_path', [])) if isinstance(final_leg, dict) else len(final_leg))} "
             "camera_steering=disabled")
-        ok, reason = _execute_fixed_approach_trajectory(
-            final_leg, log, fixed_rpy=approach_rpy
-        )
-        steps.append(("final_replanned_approach", ok, reason))
+        if direct_reflex:
+            direct = A.safe_certified_direct_move(
+                *endpoint.tolist(), roll=approach_rpy[0],
+                pitch=approach_rpy[1], yaw=approach_rpy[2],
+            )
+            ok, reason = direct.ok, direct.reason
+            log("stage=claw_direct_pose_commit phase=grasp "
+                f"target={endpoint.round(4).tolist()} ok={direct.ok} "
+                f"detail={direct.reason}")
+        else:
+            ok, reason = _execute_fixed_approach_trajectory(
+                final_leg, log, fixed_rpy=approach_rpy
+            )
+        steps.append(("direct_reflex_final_approach" if direct_reflex
+                      else "final_replanned_approach", ok, reason))
         if not ok:
             return recover(f"final replanned approach failed: {reason}")
 
@@ -17159,6 +18037,13 @@ def _fixed_pick_and_place_attempt(
                       "identifier feature against its planned offset from the "
                       "grasp region"))
         if not retry_eligible:
+            if direct_reflex:
+                return recover(
+                    "direct reflex endpoint witness is outside its bounded "
+                    f"{retry_envelope_mm:.1f}mm tolerance; refusing to "
+                    "replan or close on a stale terminal path",
+                    grasp_error_mm=round(grasp_error, 1),
+                )
             # Fixed-scene mode freezes the macro trajectory, not recovery from
             # expected open-finger occlusion at its endpoint. Retreat only to
             # the already visited visible checkpoint, obtain a fresh stationary
@@ -18256,6 +19141,7 @@ def _fixed_pick_and_place_attempt(
                 endpoint_geometry.grasp_detection.p_cam_mm, dtype=float
             )
 
+        MC.stage("grasp")
         grasp_rad = float(jaw_plan["grasp_rad"])
         log(f"stage=gripper_position_close target_mm={jaw_plan['grasp_mm']:.1f} "
             f"target_deg={math.degrees(grasp_rad):.1f} contact_inference=false")
@@ -18300,7 +19186,7 @@ def _fixed_pick_and_place_attempt(
         # Resend the exact same image-authorized, hard-clamped target once.  Do
         # not tighten beyond it and do not treat failure to reach it as contact.
         # This adds latency only when readback is more than two degrees short.
-        if close_shortfall is not None \
+        if GRIPPER_CLOSE_SETTLE_RETRY and close_shortfall is not None \
                 and close_shortfall > math.radians(2.0):
             log(
                 "stage=image_controlled_close_settle_retry "
@@ -18388,15 +19274,30 @@ def _fixed_pick_and_place_attempt(
             f"actual_deg={closed.get('position_deg', 'unavailable')} "
             f"delta_deg={closed.get('delta_deg', 'unavailable')}")
         _OBJECT_HELD = None
+        MC.stage("verify_pick")
         box_3d = payload_geometry.object_box_3d
+        # This capture is deliberately made *after* the close command, at the
+        # live tool pose.  A box-driven reflex may have approached from a
+        # side, end, or diagonal; its carried object must never be treated as
+        # the nominal top-down Hermes grasp during carry or placement.
+        payload_capture_ee_xyz = np.asarray(A.ee_pos(), dtype=float)
+        payload_capture_ee_rpy = np.asarray(A.ee_rpy(), dtype=float)
         payload_box_context, payload_context_detail = \
             _payload_box_context_from_object_box(
-                box_3d, A.ee_pos(), A.ee_rpy()
+                box_3d, payload_capture_ee_xyz, payload_capture_ee_rpy
             )
         if payload_box_context is not None:
+            payload_box_context["capture_ee_xyz_m"] = \
+                payload_capture_ee_xyz.round(6).tolist()
+            payload_box_context["capture_ee_rpy_rad"] = \
+                payload_capture_ee_rpy.round(6).tolist()
+            payload_box_context["capture_phase"] = "post_close_live_ee"
             log(
                 "stage=payload_geometry_handoff ok=True "
                 f"collision_enabled={SCENE_COLLISION_ENABLED} "
+                f"capture_rpy_rad={payload_capture_ee_rpy.round(4).tolist()} "
+                f"center_offset_ee_mm="
+                f"{payload_context_detail.get('center_offset_ee_mm')} "
                 f"detail={payload_context_detail.get('reason')}"
             )
         elif SCENE_COLLISION_ENABLED or scene_place:
@@ -19172,7 +20073,7 @@ def _fixed_pick_and_place_attempt(
                     f"remaining carry lift failed: {remaining_reason}"
                 )
 
-        if voxel_place_requested:
+        if voxel_place_requested or (MC.current() is not None and SCENE_COLLISION_ENABLED):
             scene_restored, scene_restore_reason = _activate_cached_scene_map()
             steps.append((
                 "restore_scene_after_pick_lift",
@@ -19255,9 +20156,18 @@ def _fixed_pick_and_place_attempt(
             "grasp_geometry": grasp_geometry_summary,
             "object_box_3d": full_object_box_3d,
             "payload_box": payload_box_context,
+            "grasp_executor": (
+                "claw_direct_reflex" if direct_reflex else "hermes_measured"
+            ),
+            # A direct reflex may leave a valid but non-nominal grasp.  Hermes
+            # therefore owns only verification/carry/place from this point;
+            # it must re-observe the destination and use this captured
+            # payload-to-EE transform rather than the pre-pick release pose.
+            "requires_live_place_replan": bool(direct_reflex),
             "reachability": reachability,
             "final_alignment_corrections": corrections,
         }
+        MC.stage("held", object=object_name, verified=True)
         if not place_after_pick:
             log("stage=fixed_pick_complete object_held=true "
                 "next_skill=wrist_place controller=kept_alive")
@@ -19274,17 +20184,33 @@ def _fixed_pick_and_place_attempt(
                 final_alignment_corrections=corrections,
             )
 
-        if scene_place:
+        if scene_place or MC.current() is not None:
             log(f"stage=scene_place_handoff relation={normalized_place_relation} "
                 f"reference={place_reference!r} same_camera=true")
             pick_context = dict(_FIXED_HELD_CONTEXT or {})
+            direct_handoff = bool(
+                pick_context.get("requires_live_place_replan")
+            )
+            if direct_handoff:
+                log(
+                    "stage=hermes_payload_handoff status=accepted "
+                    "source=claw_direct_reflex action=fresh_reference_and_"
+                    "payload_aware_place cached_pre_pick_release=false"
+                )
             placed = fixed_place(
                 reference=place_reference,
                 relation=str(normalized_place_relation),
                 distance_m=place_distance_m,
                 dry=False, verbose=verbose, eye=eye,
-                planned_release_endpoint=preplanned_scene_endpoint,
-                planned_placement=preplanned_scene_detail,
+                # Cached release geometry was made before the reflex grasp.
+                # It is safe only for the nominal grasp frame, so direct
+                # reflex always invokes Hermes placement with a fresh view.
+                planned_release_endpoint=(
+                    None if direct_handoff else preplanned_scene_endpoint
+                ),
+                planned_placement=(
+                    None if direct_handoff else preplanned_scene_detail
+                ),
             )
             placed["steps"] = [
                 {"step": label, "ok": bool(ok), "reason": reason}
@@ -19408,6 +20334,7 @@ def fixed_pick_and_place(
     place_reference: str | None = None,
     place_relation: str = "drop_zone",
     place_distance_m: float | None = None,
+    preview_only: bool = False,
 ) -> dict[str, Any]:
     """Run one deterministic grasp, with one bounded fresh retry if enabled.
 
@@ -19416,8 +20343,16 @@ def fixed_pick_and_place(
     scene and uses its fresh primary endpoint; measured alternate subsections
     are searched only if that endpoint is blocked or unreachable.
     """
+    primary_reflex = _claw_direct_reflex_enabled()
+    # Reflex receives two fresh, locked-scene commitments. Each failed attempt
+    # must release and home before the next one rebuilds its OBB; never reuse a
+    # box after a physical grasp attempt because the object may have shifted.
+    # After the second recovered reflex miss, Hermes owns the final fallback.
     attempt_limit = (
-        1 if dry or not SIMPLE_GRASP_FLOW_ENABLED else
+        (2 if primary_reflex else 1) if not dry and not preview_only and
+        SIMPLE_GRASP_FLOW_ENABLED else
+        1 if dry or preview_only or
+        not SIMPLE_GRASP_FLOW_ENABLED else
         int(np.clip(SIMPLE_GRASP_MAX_ATTEMPTS, 1, 2))
     )
     summaries: list[dict[str, Any]] = []
@@ -19426,8 +20361,9 @@ def fixed_pick_and_place(
     for attempt_index in range(attempt_limit):
         if attempt_index:
             log(
-                "stage=simple_grasp_retry attempt=2/2 "
-                "strategy=fresh_primary_then_alternate_if_blocked "
+                f"stage={'claw_direct_reflex_retry' if primary_reflex else 'simple_grasp_retry'} "
+                f"attempt={attempt_index + 1}/{attempt_limit} "
+                "strategy=fresh_scene_new_obb "
                 "state=previous_attempt_released_and_homed"
             )
         result = _fixed_pick_and_place_attempt(
@@ -19437,12 +20373,15 @@ def fixed_pick_and_place(
             place_relation=place_relation,
             place_distance_m=place_distance_m,
             grasp_attempt_index=attempt_index,
+            preview_only=preview_only,
         )
         summaries.append({
             "attempt": attempt_index + 1,
             "strategy": (
-                "primary_measured_section" if attempt_index == 0 else
+                "primary_claw_direct_reflex" if primary_reflex else
+                ("primary_measured_section" if attempt_index == 0 else
                 "fresh_primary_then_alternate_if_blocked"
+                )
             ),
             "ok": bool(result.get("ok")),
             "reason": str(result.get("reason")),
@@ -19456,11 +20395,74 @@ def fixed_pick_and_place(
         recovered = bool(
             result.get("homed") and result.get("object_held") is False
         )
+        if primary_reflex and recovered and attempt_index + 1 < attempt_limit:
+            continue
         if not retryable or not recovered or attempt_index + 1 >= attempt_limit:
             break
     assert result is not None
+    recovered = bool(result.get("homed") and result.get("object_held") is False)
+    if primary_reflex and not dry and not preview_only and recovered:
+        # The fallback starts only from a confirmed empty/home state and uses a
+        # new semantic/RGB-D scene. Temporarily disable the direct executor and
+        # its test rank; all other gripper/collision safeguards are unchanged.
+        saved = {
+            key: os.environ.get(key)
+            for key in ("REBOT_CLAW_DIRECT_REFLEX",
+                        "REBOT_CLAW_BOX_REFLEX_FALLBACK",
+                        "REBOT_CLAW_BOX_REFLEX_CANDIDATE_RANK")
+        }
+        try:
+            os.environ["REBOT_CLAW_DIRECT_REFLEX"] = "0"
+            os.environ["REBOT_CLAW_BOX_REFLEX_FALLBACK"] = "fallback"
+            os.environ.pop("REBOT_CLAW_BOX_REFLEX_CANDIDATE_RANK", None)
+            log("stage=hermes_fallback status=starting "
+                "reason=direct_reflex_released_and_homed scene=fresh")
+            fallback = _fixed_pick_and_place_attempt(
+                object_name, dry=False, verbose=verbose, eye=eye,
+                place_after_pick=place_after_pick,
+                place_reference=place_reference,
+                place_relation=place_relation,
+                place_distance_m=place_distance_m,
+                grasp_attempt_index=0, preview_only=False,
+            )
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        summaries.append({
+            "attempt": len(summaries) + 1,
+            "strategy": "hermes_fallback_fresh_scene",
+            "ok": bool(fallback.get("ok")),
+            "reason": str(fallback.get("reason")),
+            "homed": bool(fallback.get("homed")),
+            "object_held": fallback.get("object_held"),
+        })
+        fallback["primary_reflex"] = {
+            "ok": bool(result.get("ok")),
+            "reason": str(result.get("reason")),
+            "recovered_home_empty": recovered,
+        }
+        fallback["grasp_attempts"] = summaries
+        return fallback
     result["grasp_attempts"] = summaries
     return result
+
+
+def claw_box_reflex_preview(
+    object_name: str, *, verbose: bool = False, eye: WristEye | None = None,
+) -> dict[str, Any]:
+    """Build and validate a live box-driven reflex plan without grasping.
+
+    The arm may perform the bounded ready/view motions needed for metric RGB-D
+    geometry, then returns home. It never enters the final grasp trajectory or
+    sends a gripper command.
+    """
+    return fixed_pick_and_place(
+        object_name, dry=False, verbose=verbose, eye=eye,
+        place_after_pick=False, preview_only=True,
+    )
 
 
 def fixed_pick(object_name: str, *, dry: bool = False,
@@ -19864,7 +20866,7 @@ def _stack_reference_detection_quality(
 
 
 def _colour_only_reference(
-    rejected: Any, frame: Any, reference: str,
+    rejected: Any, frame: Any, reference: str, *, strict_stack: bool = True,
 ) -> tuple[Any | None, str]:
     """Re-detect a stack reference with open-vocabulary grounding disabled.
 
@@ -19887,9 +20889,15 @@ def _colour_only_reference(
         return None, f"colour re-detection failed: {type(exc).__name__}: {exc}"
     if found is None:
         return None, "colour re-detection found no reference"
-    ok, reason = _stack_reference_detection_quality(found, frame)
-    if not ok:
-        return None, f"colour re-detection is also unusable: {reason}"
+    if strict_stack:
+        ok, reason = _stack_reference_detection_quality(found, frame)
+        if not ok:
+            return None, f"colour re-detection is also unusable: {reason}"
+    else:
+        partial = _detection_partial(found, frame)
+        if partial is not None:
+            return None, f"colour re-detection is incomplete: {partial}"
+        reason = "complete depth-gated RGB-D colour component"
     previous = max(
         float(getattr(rejected, "min_width_mm", 0.0) or 0.0),
         float(getattr(rejected, "max_width_mm", 0.0) or 0.0),
@@ -19921,14 +20929,39 @@ def _scene_reference_consensus(
     latest = None
     latest_frame = None
     reasons: list[Any] = []
+    # A simulation can declare a uniquely coloured reference object. This stays
+    # opt-in because colour alone cannot establish a semantic noun on hardware.
+    # It still uses camera RGB-D components and the usual edge/consensus gates;
+    # no simulator pose is provided to the planner.
+    allow_colour_reference = os.getenv(
+        "REBOT_SCENE_REFERENCE_COLOR_FALLBACK", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    def recover_colour_reference(det: Any, frame: Any, partial: str | None):
+        if not allow_colour_reference or frame is None or partial is None:
+            return det, partial, None
+        fallback, fallback_reason = _colour_only_reference(
+            det, frame, reference, strict_stack=strict_stack
+        )
+        if fallback is None:
+            return det, partial, fallback_reason
+        return fallback, _detection_partial(fallback, frame), fallback_reason
+
     count = int(np.clip(SCENE_PLACE_CONSENSUS_FRAMES, 3, 7))
     required = max(2, count - 1)
     for index in range(count) if not force_look else ():
         det, frame, why = _observe(eye, reference)
         if det is None:
-            reasons.append(why)
-            continue
-        partial = _detection_partial(det, frame)
+            det, partial, fallback_reason = recover_colour_reference(
+                det, frame, "semantic reference unavailable"
+            )
+            if det is None:
+                reasons.append({"semantic": why, "colour_fallback": fallback_reason})
+                continue
+            log("stage=place_reference_colour_fallback accepted="
+                f"{partial is None} frame={index + 1}/{count} detail={fallback_reason}")
+        else:
+            partial = _detection_partial(det, frame)
         if partial is None and strict_stack:
             quality_ok, quality_reason = _stack_reference_detection_quality(
                 det, frame
@@ -19964,6 +20997,10 @@ def _scene_reference_consensus(
                         "stage=stack_reference_colour_fallback accepted=false "
                         f"frame={index + 1}/{count} detail={fallback_reason}"
                     )
+        det, partial, fallback_reason = recover_colour_reference(det, frame, partial)
+        if fallback_reason is not None:
+            log("stage=place_reference_colour_fallback accepted="
+                f"{partial is None} frame={index + 1}/{count} detail={fallback_reason}")
         if partial is not None:
             reasons.append(partial)
             continue
@@ -20163,6 +21200,39 @@ def _scene_reference_consensus(
         # details are returned/JSON-serialized.
         **({"_reference_frame": latest_frame} if strict_stack else {}),
     }
+
+
+def _mission_carry_waypoints(endpoint, fixed_rpy):
+    """Instantiate a taught Cartesian corridor with a freshly measured endpoint.
+
+    Calibration binding is enforced by the mission runner; here each segment is
+    regenerated from the live start and validated against current IK and payload.
+    Legacy callers have no mission context and retain their original routing.
+    """
+    mission = MC.current()
+    if mission is None or not mission.carry_via_m:
+        return None, "no taught corridor selected"
+    MC.checkpoint()
+    start = np.asarray(A.ee_pos(), dtype=float)
+    combined = []
+    for target in (*mission.carry_via_m, endpoint):
+        MC.checkpoint()
+        target = np.asarray(target, dtype=float)
+        if target.shape != (3,) or not np.all(np.isfinite(target)):
+            return None, "invalid taught corridor point"
+        if float(np.linalg.norm(target - start)) < 1e-7:
+            continue
+        leg, reason = _plan_fixed_approach_trajectory(
+            target, start_m=start, fixed_rpy=fixed_rpy, validate_ik=False,
+        )
+        if leg is None:
+            return None, f"taught corridor refused: {reason}"
+        combined.extend(leg)
+        start = target
+    if not combined:
+        return None, "empty taught corridor"
+    ok, reason = _validate_fixed_waypoints(combined, fixed_rpy)
+    return (combined if ok else None), f"taught corridor: {reason}"
 
 
 def _high_release_waypoints(
@@ -21317,6 +22387,7 @@ def fixed_place(*, reference: str | None = None,
     This deliberately accepts no caller-supplied ``held=True`` override.  Only a
     successful fixed pick in this controller process authorizes the traverse.
     """
+    MC.stage("plan_place")
     global _OBJECT_HELD, _FIXED_HELD_CONTEXT
     log = _printer(verbose)
     steps: list[tuple[str, bool, str]] = []
@@ -21420,11 +22491,50 @@ def fixed_place(*, reference: str | None = None,
         "requested_relation": normalized_relation,
         "reference": reference,
     }
+    payload = context.get("payload_box")
+    reflex_handoff = bool(context.get("requires_live_place_replan"))
+    if isinstance(payload, dict):
+        try:
+            center_ee = np.asarray(payload["center_offset_ee_m"], dtype=float)
+            axes_ee = np.asarray(payload["full_axes_ee"], dtype=float)
+            valid_payload_transform = (
+                center_ee.shape == (3,) and axes_ee.shape == (3, 3)
+                and np.all(np.isfinite(center_ee))
+                and np.all(np.isfinite(axes_ee))
+            )
+        except (KeyError, TypeError, ValueError):
+            valid_payload_transform = False
+    else:
+        center_ee = None
+        valid_payload_transform = False
+    steps.append((
+        "payload_orientation_handoff", valid_payload_transform,
+        (
+            "post-close live object-to-EE transform retained; placement "
+            "will preserve the current grasp orientation"
+            if valid_payload_transform else
+            "held-object object-to-EE transform is unavailable"
+        ),
+    ))
+    log(
+        "stage=payload_orientation_handoff "
+        f"ok={valid_payload_transform} "
+        f"source={payload.get('capture_phase') if isinstance(payload, dict) else None} "
+        f"executor={context.get('grasp_executor')} "
+        f"reflex_fresh_place={reflex_handoff} "
+        f"center_offset_ee_mm="
+        f"{(center_ee * 1000.0).round(1).tolist() if center_ee is not None else None}"
+    )
+    if reflex_handoff and not valid_payload_transform:
+        return recover(
+            "direct-reflex handoff has no valid measured object-to-EE "
+            "transform; refusing a nominal-orientation placement"
+        )
     scene_waypoints: list[tuple[float, float, float]] | None = None
     own_eye = False
     try:
         if normalized_relation in _SCENE_RELATIONS:
-            if planned_release_endpoint is not None:
+            if planned_release_endpoint is not None and not reflex_handoff:
                 release_endpoint = np.asarray(
                     planned_release_endpoint, dtype=float
                 )
@@ -21439,6 +22549,13 @@ def fixed_place(*, reference: str | None = None,
                     f"endpoint={release_endpoint.round(4).tolist()} "
                     "carry_redetection=false")
             else:
+                if reflex_handoff:
+                    log(
+                        "stage=hermes_payload_handoff_place "
+                        "reference_redetection=true "
+                        "cached_pre_pick_release_rejected=true "
+                        "orientation_policy=preserve_live_reflex_grasp"
+                    )
                 own_eye = eye is None
                 eye = eye or WristEye()
                 assert reference is not None
@@ -21955,9 +23072,17 @@ def fixed_place(*, reference: str | None = None,
                     )
         steps.append(("prevalidate_drop_trajectory", drop_waypoints is not None,
                       drop_plan_reason))
+        # A taught corridor is only a candidate. It must end at the current
+        # geometry-derived release pose and pass the same full path checks.
+        preset_path, preset_reason = _mission_carry_waypoints(release_endpoint, drop_fixed_rpy)
+        if MC.current() is not None and MC.current().carry_via_m:
+            MC.stage("carry_preset", accepted=preset_path is not None, reason=preset_reason)
+        if preset_path is not None:
+            drop_waypoints, drop_plan_reason = preset_path, preset_reason
         if drop_waypoints is None:
             return recover(f"drop trajectory is unsafe: {drop_plan_reason}")
 
+        MC.stage("carry", object=context.get("object_name"))
         route_count = (
             len(drop_waypoints.get("joint_path", []))
             if isinstance(drop_waypoints, dict) else len(drop_waypoints)
@@ -21974,9 +23099,10 @@ def fixed_place(*, reference: str | None = None,
         if not drop_ok:
             return recover(f"drop traverse failed: {drop_reason}")
 
+        MC.stage("release")
         log("stage=drop_release opening_gripper=true")
         released_cmd = _gripper("open")
-        time.sleep(0.5)
+        MC.pause(0.5)
         released = _verify_release(released_cmd)
         steps.append(("release", released is True,
                       "open position reached" if released is True else
@@ -22025,6 +23151,7 @@ def fixed_place(*, reference: str | None = None,
                     f"{retreat_reason}"
                 )
 
+        MC.stage("return_home", release_verified=released is True)
         recovery = _home_after_interrupt(open_gripper=False)
         if SCENE_COLLISION_ENABLED and recovery.get("homed"):
             A.clear_collision_scene()
@@ -22839,6 +23966,126 @@ def snapshot(object_name: str | None = None) -> dict[str, Any]:
         eye.close()
 
 
+def scene_preview(object_name: str | None = None) -> dict[str, Any]:
+    """Export a stationary, calibrated RGB-D point cloud without motion.
+
+    This is deliberately diagnostic-only: it reads the current encoder pose and
+    wrist frames, but never calls a position, gripper, or collision-scene
+    command.  A full scene-place mission separately builds its safety map after
+    live geometry checkpoints; this preview makes the same base-frame dense
+    cloud inspectable before a pick is authorized.
+    """
+    steps: list[tuple[str, bool, str]] = []
+    eye = WristEye()
+    try:
+        pf = A.preflight(connect=True)
+        steps.append(("read_only_arm_state", pf.ok, pf.reason))
+        if not pf.ok:
+            return _result(False, "arm feedback is unavailable", steps,
+                           homed=False, arm_commanded=False,
+                           gripper_commanded=False)
+        rpy = tuple(float(value) for value in A.ee_rpy())
+        mapping, mapping_detail = load_saved_camera_jacobian(
+            rpy, maximum_orientation_delta_deg=45.0
+        )
+        steps.append(("camera_calibration", mapping is not None,
+                      str(mapping_detail.get("reason"))))
+        if mapping is None:
+            return _result(False, "camera calibration is unavailable", steps,
+                           homed=False, arm_commanded=False,
+                           gripper_commanded=False)
+        tool_camera = load_tcp()
+        safety = load_safety_calibration()
+        table_z = safety.get("table_z_m")
+        if tool_camera is None or table_z is None:
+            steps.append(("scene_calibration", False,
+                          "TCP camera anchor or table height is missing"))
+            return _result(False, "scene calibration is unavailable", steps,
+                           homed=False, arm_commanded=False,
+                           gripper_commanded=False)
+
+        frames: list[tuple[np.ndarray, np.ndarray, Any]] = []
+        for _ in range(3):
+            frames.append(eye.frame())
+            time.sleep(0.05)
+        color, depth, intr = frames[0]
+        det, why = (eye.object(object_name, color, depth, intr)
+                    if object_name else (None, {}))
+        _show(color, depth, intr, tag="scene_preview", det=det,
+              title="read-only base-frame point-cloud preview",
+              note=object_name or "scene preview")
+        steps.append(("camera_frames", True,
+                      f"3 stationary RGB-D frames; valid_depth="
+                      f"{int(np.count_nonzero(depth > 0))}"))
+        steps.append(("target_identifier", det is not None,
+                      f"{det.source} at {det.z_mm:.0f}mm" if det else str(why)))
+
+        ee_xyz = np.asarray(A.ee_pos(), dtype=float)
+        clouds = [SC.build_dense_view_cloud(
+            view_color, view_depth, view_intr,
+            ee_xyz_m=ee_xyz, camera_mapping_mm_per_m=mapping,
+            jaw_target_cam_mm=tool_camera,
+            workspace_lo_m=(A.X_MIN, A.Y_MIN, A.Z_MIN),
+            workspace_hi_m=(A.X_MAX, A.Y_MAX, A.Z_MAX),
+            table_z_m=None, near_mm=float(WD.NEAR_MM), far_mm=float(WD.FAR_MM),
+            stride_px=1, voxel_m=0.0015, bounds_margin_m=0.08,
+            minimum_neighbor_support=2, crop_to_workspace=True,
+            crop_below_table=False,
+        ) for view_color, view_depth, view_intr in frames]
+        clouds = SC.crop_dense_view_clouds(
+            clouds, table_z_m=float(table_z),
+            workspace_lo_m=(A.X_MIN, A.Y_MIN, A.Z_MIN),
+            workspace_hi_m=(A.X_MAX, A.Y_MAX, A.Z_MAX),
+            bounds_margin_m=0.08, crop_below_table=True,
+        )
+        registered, registration = SC.register_dense_view_clouds(
+            clouds, table_z_m=float(table_z),
+            max_translation_m=SCENE_DENSE_REGISTRATION_MAX_TRANSLATION_M,
+            minimum_overlap=SCENE_DENSE_REGISTRATION_MIN_OVERLAP,
+        )
+        fused = [cloud for cloud, report in zip(registered, registration)
+                 if bool(report.get("valid_for_fusion", False))]
+        points, colors = SC.fuse_dense_view_clouds(fused, voxel_m=0.0015)
+        if not len(points):
+            steps.append(("cloud_fusion", False,
+                          "stationary RGB-D frames produced no base-frame points"))
+            return _result(False, "point-cloud fusion failed", steps,
+                           homed=False, arm_commanded=False,
+                           gripper_commanded=False, registration=registration)
+        # Preview boxes are visual context only. This function never installs
+        # them in the motion gate, unlike _install_scene_collision_map.
+        scene = SC.build_scene_map(
+            depth, intr, ee_xyz_m=ee_xyz,
+            camera_mapping_mm_per_m=mapping, jaw_target_cam_mm=tool_camera,
+            table_z_m=float(table_z),
+            workspace_lo_m=(A.X_MIN, A.Y_MIN, A.Z_MIN),
+            workspace_hi_m=(A.X_MAX, A.Y_MAX, A.Z_MAX),
+            near_mm=max(100.0, float(WD.NEAR_MM)), far_mm=float(WD.FAR_MM),
+            stride_px=SCENE_COLLISION_STRIDE_PX,
+            voxel_m=SCENE_COLLISION_VOXEL_M,
+            inflation_m=SCENE_COLLISION_INFLATION_M,
+        )
+        output = ROOT / "outputs" / "scene_preview" / time.strftime("%Y%m%d_%H%M%S")
+        artifacts = SC.save_scene_artifacts(
+            scene, output, stem="scene_preview", view_points_m=points,
+            view_colors_rgb=colors,
+        )
+        steps.append(("cloud_fusion", True,
+                      f"{len(points)} fused base-frame points"))
+        return _result(True, "read-only point-cloud preview exported", steps,
+                       homed=False, arm_commanded=False,
+                       gripper_commanded=False, output=str(output),
+                       artifacts=artifacts, registration=registration,
+                       collision_boxes=len(scene.boxes),
+                       target_detected=det is not None)
+    except Exception as exc:  # noqa: BLE001 - hardware absence is a normal refusal
+        return _result(False, f"scene preview failed: {type(exc).__name__}: {exc}",
+                       steps, homed=False, arm_commanded=False,
+                       gripper_commanded=False)
+    finally:
+        eye.close()
+
+
 def grasp_preview(object_name: str) -> dict[str, Any]:
     """Camera-only ranked body cross-sections; never touches arm or gripper."""
     eye = WristEye()
@@ -22970,6 +24217,11 @@ def main() -> None:
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--sim", action="store_true", help="full loop against the offline simulator")
     mode.add_argument("--snapshot", action="store_true", help="one annotated wrist frame (no motion)")
+    mode.add_argument("--scene-preview", metavar="OBJECT", help="capture and export a read-only calibrated RGB-D point cloud")
+    mode.add_argument("--claw-box-preview", metavar="OBJECT",
+                      help="live bounded camera/arm preview of the 3D-box-driven "
+                           "Claw reflex; returns home before final approach or "
+                           "any gripper command")
     mode.add_argument("--grasp-preview", metavar="OBJECT",
                       help="camera-only: rank graspable body cross-sections; "
                            "never connects to the arm or gripper")
@@ -23070,8 +24322,11 @@ def main() -> None:
     if args.run and args.look:
         p.error("scan-pose motion is temporarily disabled; use --watch for a "
                 "camera-only view or --approach OBJECT for current-view IK motion")
+    if args.claw_box_preview and not args.run:
+        p.error("--claw-box-preview moves the arm for metric RGB-D views; pass --run")
     _INTERRUPT_HOME_ENABLED = bool(args.run and (
         args.approach or args.fixed_pick or args.fixed_pick_place
+        or args.claw_box_preview
         or args.pick or args.place
         or args.pick_place or args.look or args.home
         or args.gripper in {"open", "close"}
@@ -23085,7 +24340,9 @@ def main() -> None:
         GRIPPER_KD = str(args.gripper_kd)
     port = args.mjpeg or (8731 if args.live else None)
     if args.view or port:
-        set_viz(make_viz(mjpeg_port=port))
+        # ``--live`` is the intentional desktop-viewer mode; unlike explicit
+        # ``--mjpeg`` it opens the local browser automatically when possible.
+        set_viz(make_viz(mjpeg_port=port, mjpeg_auto_open=bool(args.live)))
         print(f"[viz] frames -> {DEBUG_DIR}")
         if port:
             print(f"[viz] LIVE wrist feed -> http://127.0.0.1:{port}/   (open in a browser)")
@@ -23108,6 +24365,10 @@ def main() -> None:
                "camera": CAMERA_KIND, "gripper": _gm.describe()}
     elif args.snapshot:
         out = snapshot(args.object)
+    elif args.scene_preview:
+        out = scene_preview(args.scene_preview)
+    elif args.claw_box_preview:
+        out = claw_box_reflex_preview(args.claw_box_preview, verbose=verbose)
     elif args.grasp_preview:
         out = grasp_preview(args.grasp_preview)
     elif args.watch:
@@ -23290,6 +24551,7 @@ def main() -> None:
 
     print(json.dumps(out, indent=2, default=str))
     if args.run and (args.approach or args.fixed_pick
+                     or args.claw_box_preview
                      or args.fixed_pick_place) and not out.get("homed"):
         _hold_unparked_controller(str(out.get("reason", "fixed operation did not park")))
 

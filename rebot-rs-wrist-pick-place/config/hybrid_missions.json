@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "routines": {
+    "taught_drop": {
+      "description": "Checkpointed wrist pick, verified lift, calibrated drop zone, retreat and home.",
+      "relations": ["drop_zone"],
+      "carry_via_m": []
+    },
+    "scene_place": {
+      "description": "Checkpointed wrist pick and placement relative to a visible reference using RGB-D scene and payload geometry.",
+      "relations": ["left", "right", "front", "behind", "next_to", "stack"],
+      "carry_via_m": []
+    }
+  }
+}

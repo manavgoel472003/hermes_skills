@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "camera": "orbbec_topdown",
+  "description": "purple marker",
+  "gripper_reference_to_open_jaw_slot_camera_mm": [
+    34.41843445420818,
+    -18.558789845244615,
+    -18.0
+  ],
+  "spread_mm": 1.0919204766660326,
+  "samples": 5,
+  "model": "/home/manav/rebot_lerobot/runs/gripper_segmentation/topdown_yolo11n_orbbec_regularized_100/weights/best.pt",
+  "arm_connected": false,
+  "gripper_commanded": false
+}

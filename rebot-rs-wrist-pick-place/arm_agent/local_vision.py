@@ -615,6 +615,15 @@ class Sam31TextSegmenter:
                 raise RuntimeError("SAM 3.1 wrist backend requires CUDA")
             from sam3.model_builder import build_sam3_predictor
 
+            # The native SAM 3.1 builder calls ``hf_hub_download`` internally
+            # and does not accept its token as an argument.  Unlike the
+            # Transformers backend below, it therefore cannot use the local
+            # .env token unless it is made available to Hugging Face for this
+            # process.  Keep the token local and deliberately never log it.
+            token = _hf_token()
+            if token:
+                os.environ.setdefault("HF_TOKEN", token)
+
             print(
                 "[vision] loading SAM 3.1 multiplex checkpoint; the first "
                 "load can take about 45 seconds on this machine...",

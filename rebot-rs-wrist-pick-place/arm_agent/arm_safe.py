@@ -554,6 +554,49 @@ def safe_move(x, y, z, *, roll: float | None = None, pitch: float | None = None,
     return MoveResult(off < 0.01, "arrived" if off < 0.01 else f"arrived_off {off*1000:.0f}mm", reached)
 
 
+def safe_certified_direct_move(
+    x: float, y: float, z: float, *, roll: float, pitch: float, yaw: float,
+    duration: float | None = None,
+) -> MoveResult:
+    """One direct pose commit with full swept joint-collision certification.
+
+    This intentionally differs from :func:`safe_move`: it does not impose the
+    small Cartesian step cap.  The local backend samples the complete joint
+    interpolation at 0.035rad resolution for collision before transmitting the
+    move, which makes it suitable for the bounded Claw-reflex commits after a
+    separately validated scene/OBB plan exists.
+    """
+    if not in_bounds(x, y, z):
+        return MoveResult(False, f"direct endpoint out_of_bounds ({x:.3f},{y:.3f},{z:.3f})")
+    try:
+        current = tuple(float(v) for v in ee_pos())
+        current_rpy = tuple(float(v) for v in ee_rpy())
+    except Exception as exc:
+        return MoveResult(False, f"direct state_read_failed {exc}")
+    local = _local_arm()
+    if local is None:
+        return MoveResult(False, "direct pose commits require local collision backend")
+    dx, dy, dz = x - current[0], y - current[1], z - current[2]
+    angular_change = max(abs(roll - current_rpy[0]), abs(pitch - current_rpy[1]),
+                         abs(yaw - current_rpy[2]))
+    dur = duration if duration is not None else max(
+        _move_duration(dx, dy, dz),
+        angular_change / max(1e-6, TOOL_ANGULAR_SPEED_RAD_S),
+    )
+    try:
+        # ``move_pose`` rejects the entire command if the swept joint chord
+        # contacts the URDF, table, or installed RGB-D obstacle boxes.
+        state = local.move_pose(x, y, z, roll, pitch, yaw, dur)
+    except Exception as exc:
+        return MoveResult(False, f"direct_collision_or_motion_refused {exc}")
+    reached = tuple(state["end_effector"]["position_m"])
+    off = max(abs(reached[0] - x), abs(reached[1] - y), abs(reached[2] - z))
+    return MoveResult(off < 0.01,
+                      "direct_pose_arrived" if off < 0.01 else
+                      f"direct_pose_arrived_off {off * 1000:.1f}mm",
+                      reached)
+
+
 def safe_move_path(
     waypoints: list[tuple[float, float, float]],
     *,

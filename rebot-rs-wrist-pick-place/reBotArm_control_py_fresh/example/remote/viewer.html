@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B601 remote teleop</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, sans-serif;
+    background: #101216; color: #e8eaed;
+    display: flex; flex-direction: column; min-height: 100vh;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px; background: #181b20; border-bottom: 1px solid #262a30;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .room { color: #9aa0a6; font-size: 14px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #d33; transition: background .3s; }
+  .dot.live { background: #2ecc71; }
+  main { flex: 1; display: flex; align-items: center; justify-content: center; padding: 12px; }
+  .stage { position: relative; max-width: 100%; }
+  img { max-width: 100%; max-height: 82vh; border-radius: 8px; display: block; background: #000; }
+  .hint { color: #9aa0a6; font-size: 13px; text-align: center; padding: 8px 16px 16px; }
+  .offline { position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+             font-size: 15px; color: #9aa0a6; }
+  .offline.show { display: flex; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>B601 remote teleop</h1>
+  <span class="room" id="room"></span>
+</header>
+<main>
+  <div class="stage">
+    <img id="video" alt="waiting for the arm node to stream…">
+    <div class="offline" id="offline">Waiting for the arm node to connect…</div>
+  </div>
+</main>
+<p class="hint">Live view. Status (target / end-effector / engaged) is overlaid on the video by the arm node.</p>
+<script>
+  const params = new URLSearchParams(location.search);
+  const room = params.get("room") || "b601";
+  document.getElementById("room").textContent = "room: " + room;
+  const img = document.getElementById("video");
+  const dot = document.getElementById("dot");
+  const offline = document.getElementById("offline");
+
+  function connect() {
+    // cache-buster forces a fresh multipart stream on each (re)connect
+    img.src = "/stream?room=" + encodeURIComponent(room) + "&t=" + Date.now();
+  }
+  img.addEventListener("load", () => { dot.classList.add("live"); offline.classList.remove("show"); });
+  img.addEventListener("error", () => {
+    dot.classList.remove("live"); offline.classList.add("show");
+    setTimeout(connect, 1500);   // relay/arm not up yet → retry
+  });
+  // The MJPEG stream keeps a single connection open; if it drops, reconnect.
+  window.addEventListener("online", connect);
+  connect();
+</script>
+</body>
+</html>

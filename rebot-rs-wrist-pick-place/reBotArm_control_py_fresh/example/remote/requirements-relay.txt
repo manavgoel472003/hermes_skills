@@ -1,0 +1,3 @@
+# Relay server only (run this on the public cloud VM).
+# It has no robot/camera/vision deps — just the async web server.
+aiohttp>=3.9

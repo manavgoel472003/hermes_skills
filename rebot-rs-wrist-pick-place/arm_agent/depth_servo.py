@@ -67,6 +67,7 @@ import os
 import sys
 import threading
 import time
+import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -211,7 +212,7 @@ def annotate(color, depth=None, intr=None, *, tip_uv=None, obj_box=None, obj_uv=
 class _MjpegStream:
     """Minimal single-client-friendly MJPEG server for the latest annotated frame."""
 
-    def __init__(self, port: int):
+    def __init__(self, port: int, *, auto_open: bool = False):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         self._jpg: bytes | None = None
         self._lock = threading.Lock()
@@ -240,7 +241,21 @@ class _MjpegStream:
 
         self._srv = ThreadingHTTPServer(("0.0.0.0", port), H)
         threading.Thread(target=self._srv.serve_forever, daemon=True).start()
-        print(f"[viz] MJPEG stream -> http://127.0.0.1:{port}/  (open in a browser)")
+        url = f"http://127.0.0.1:{port}/"
+        print(f"[viz] MJPEG stream -> {url}  (open in a browser)")
+        if auto_open:
+            # ``webbrowser`` delegates to the desktop's registered browser.  Run
+            # it off-thread: a missing GUI/browser must never delay the camera
+            # stream or the safety-critical motion path.
+            def open_browser() -> None:
+                try:
+                    opened = webbrowser.open(url, new=2, autoraise=True)
+                    if not opened:
+                        print(f"[viz] could not auto-open browser; use {url}")
+                except Exception as exc:  # desktop integration is optional
+                    print(f"[viz] browser auto-open unavailable: {exc}; use {url}")
+            threading.Thread(target=open_browser, daemon=True,
+                             name="mjpeg-browser-open").start()
 
     def update(self, vis) -> None:
         ok, buf = cv2.imencode(".jpg", vis)
@@ -254,6 +269,7 @@ class Viz:
     outdir: Path = DEBUG_DIR
     window: bool = False
     mjpeg_port: int | None = None
+    mjpeg_auto_open: bool = False
     # Sibling servos (e.g. the eye-in-hand wrist_servo) draw a different overlay
     # but want this file/MJPEG plumbing; leave unset for the overhead annotation.
     annotator: Any = None
@@ -265,7 +281,9 @@ class Viz:
         self.outdir = Path(self.outdir)
         self.outdir.mkdir(parents=True, exist_ok=True)
         if self.mjpeg_port:
-            self._stream = _MjpegStream(self.mjpeg_port)
+            self._stream = _MjpegStream(
+                self.mjpeg_port, auto_open=self.mjpeg_auto_open
+            )
 
     def show(self, color, depth=None, intr=None, *, tag="frame", save=True, **kw):
         """Annotate a frame; write it to disk unless save=False.

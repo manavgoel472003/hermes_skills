@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "camera": "orbbec_topdown",
+  "model": "/home/manav/rebot_lerobot/runs/gripper_segmentation/topdown_yolo11n/weights/best.pt",
+  "rotation_camera_to_base": [
+    [
+      0.9938285281120164,
+      0.09246555288223172,
+      -0.061277877255059385
+    ],
+    [
+      0.11016836601648995,
+      -0.7582502811416224,
+      0.6425880813381983
+    ],
+    [
+      0.012953294560058061,
+      -0.6453732506688156,
+      -0.7637575397213479
+    ]
+  ],
+  "translation_base_m": [
+    0.5721997931599662,
+    -0.33865322598750036,
+    0.620589398162533
+  ],
+  "rmse_mm": 3.6944237889479976,
+  "samples": 6,
+  "gripper_commanded": false
+}

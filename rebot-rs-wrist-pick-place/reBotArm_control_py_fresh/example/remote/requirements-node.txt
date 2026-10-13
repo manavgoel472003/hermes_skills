@@ -1,0 +1,8 @@
+# Extra deps for the arm node and the operator node (on top of what the fresh
+# repo .venv already has: opencv-python, numpy, mediapipe, and — for the arm
+# node — the reBotArm_control_py CAN stack).
+#
+# Install into the repo's uv venv, e.g.:
+#     cd ~/rebot_lerobot/reBotArm_control_py_fresh
+#     VIRTUAL_ENV=.venv uv pip install -r example/remote/requirements-node.txt
+websocket-client>=1.7

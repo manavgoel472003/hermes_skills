@@ -1,5 +1,11 @@
 # reBot RS wrist-camera pick/place
 
+For the current OBB-driven Claw-reflex + Hermes integration, use the
+`hybrid-claw-reflex-2026-10-13` branch and start with
+[RUN_HYBRID.md](RUN_HYBRID.md). It contains the reproducible controller
+bootstrap, direct-reflex preview, hybrid commands, tests, and the policy for
+calibration and secrets.
+
 This is the known-good source snapshot for the fixed, preplanned RS wrist-camera
 pick/place workflow, refreshed from the hardware-tested workspace on 2026-08-11.
 
